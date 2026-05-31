@@ -1,5 +1,6 @@
 # Secrets & local config
 config/.env
+config/.env.risk
 .env
 *.env.local
 config/kis_devlp.yaml

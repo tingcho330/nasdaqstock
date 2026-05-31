@@ -29,6 +29,30 @@ _MST_URLS = {
 }
 
 _MST_PARSE_VERSION = "v4"
+_US_MST_PARSE_VERSION = "v1"
+
+# 해외주식 종목정보파일 (KIS 공식: overseas_stock_code.py)
+_OVERSEAS_COD_URLS = {
+    "NAS": ("https://new.real.download.dws.co.kr/common/master/nasmst.cod.zip", "nasmst.cod"),
+    "NYS": ("https://new.real.download.dws.co.kr/common/master/nysmst.cod.zip", "nysmst.cod"),
+    "AMS": ("https://new.real.download.dws.co.kr/common/master/amsmst.cod.zip", "amsmst.cod"),
+}
+_FRGN_MST_URL = (
+    "https://new.real.download.dws.co.kr/common/master/frgn_code.mst.zip",
+    "frgn_code.mst",
+)
+
+_NASMST_COLUMNS = [
+    "National code", "Exchange id", "Exchange code", "Exchange name", "Symbol",
+    "realtime symbol", "Korea name", "English name",
+    "Security type(1:Index,2:Stock,3:ETP(ETF),4:Warrant)", "currency",
+    "float position", "data type", "base price", "Bid order size", "Ask order size",
+    "market start time(HHMM)", "market end time(HHMM)", "DR 여부(Y/N)", "DR 국가코드",
+    "업종분류코드", "지수구성종목 존재 여부(0:구성종목없음,1:구성종목있음)",
+    "Tick size Type",
+    "구분코드(001:ETF,002:ETN,003:ETC,004:Others,005:VIX Underlying ETF,006:VIX Underlying ETN)",
+    "Tick size type 상세",
+]
 
 
 def _filter_out_etf_etn_spac_from_mst_df(df: pd.DataFrame) -> pd.DataFrame:
@@ -78,33 +102,191 @@ def _download_zip(url: str, out_zip_path: Path, timeout_sec: int = 30) -> bool:
         return False
 
 
-def _extract_mst_from_zip(zip_path: Path, mst_filename: str, out_dir: Path) -> Optional[Path]:
+def _extract_file_from_zip(zip_path: Path, inner_name: str, out_dir: Path) -> Optional[Path]:
     try:
         out_dir.mkdir(parents=True, exist_ok=True)
         with zipfile.ZipFile(str(zip_path), "r") as zf:
             # zip 내부 파일명이 상이할 수 있어 안전 검색
             names = zf.namelist()
             target = None
+            inner_lower = inner_name.lower()
             for n in names:
-                if n.lower().endswith(mst_filename.lower()):
+                base = Path(n).name.lower()
+                if base == inner_lower or base.endswith(inner_lower):
                     target = n
                     break
             if target is None and names:
-                # fallback: 첫 번째 파일
                 target = names[0]
             if target is None:
                 return None
             zf.extract(target, path=str(out_dir))
             p = out_dir / target
-            # extract 시 서브디렉토리 포함 가능 → 최종 경로 정규화
             if p.exists():
                 return p
-            # 못 찾으면 out_dir 하위 재탐색(최소한의 로직)
-            for cand in out_dir.rglob("*.mst"):
-                return cand
+            for cand in out_dir.rglob("*"):
+                if cand.is_file() and cand.name.lower().endswith(inner_name.lower().split(".")[-1]):
+                    return cand
             return None
     except Exception:
         return None
+
+
+_extract_mst_from_zip = _extract_file_from_zip
+
+
+def _parse_nasmst_cod(cod_path: Path) -> pd.DataFrame:
+    """나스닥 해외종목 마스터 (탭 구분)."""
+    df = pd.read_table(cod_path, sep="\t", encoding="cp949", header=None)
+    ncol = min(len(_NASMST_COLUMNS), df.shape[1])
+    df = df.iloc[:, :ncol]
+    df.columns = _NASMST_COLUMNS[:ncol]
+    return df
+
+
+def _parse_frgn_code_mst(mst_path: Path) -> pd.DataFrame:
+    """해외주식지수정보 frgn_code.mst — 나스닥100 편입 플래그 (공식 overseas_index_code.py 이식)."""
+    part2_len = 14
+    tmp1 = mst_path.with_suffix(".frgn_part1.tmp")
+    tmp2 = mst_path.with_suffix(".frgn_part2.tmp")
+    with open(tmp1, "w", encoding="cp949") as wf1, open(tmp2, "w", encoding="cp949") as wf2:
+        with open(mst_path, "r", encoding="cp949", errors="ignore") as f:
+            for row in f:
+                row = row.rstrip("\n")
+                if len(row) < part2_len + 20:
+                    continue
+                if row[0:1] == "X":
+                    rf1 = row[0 : len(row) - part2_len]
+                    rf1_1 = rf1[0:1]
+                    rf1_2 = rf1[1:11]
+                    rf1_3 = rf1[11:40].replace(",", "")
+                    rf1_4 = rf1[40:80].replace(",", "").strip()
+                    wf1.write(f"{rf1_1},{rf1_2},{rf1_3},{rf1_4}\n")
+                    wf2.write(row[-part2_len:] + "\n")
+                    continue
+                rf1 = row[0 : len(row) - part2_len]
+                rf1_1 = rf1[0:1]
+                rf1_2 = rf1[1:11]
+                rf1_3 = rf1[11:50].replace(",", "")
+                rf1_4 = row[50:75].replace(",", "").strip()
+                wf1.write(f"{rf1_1},{rf1_2},{rf1_3},{rf1_4}\n")
+                wf2.write(row[-part2_len:] + "\n")
+    part1_columns = ["구분코드", "심볼", "영문명", "한글명"]
+    df1 = pd.read_csv(str(tmp1), header=None, names=part1_columns, encoding="cp949")
+    field_specs = [4, 1, 1, 1, 4, 3]
+    part2_columns = [
+        "종목업종코드", "다우30 편입종목여부", "나스닥100 편입종목여부",
+        "S&P 500 편입종목여부", "거래소코드", "국가구분코드",
+    ]
+    df2 = pd.read_fwf(str(tmp2), widths=field_specs, names=part2_columns, encoding="cp949")
+    for col in ["다우30 편입종목여부", "나스닥100 편입종목여부", "S&P 500 편입종목여부"]:
+        if col in df2.columns:
+            df2[col] = df2[col].astype(str).str.replace(r"[^0-1]+", "", regex=True)
+    df = pd.concat([df1, df2], axis=1)
+    try:
+        tmp1.unlink(missing_ok=True)
+        tmp2.unlink(missing_ok=True)
+    except Exception:
+        pass
+    return df
+
+
+def _download_overseas_cod(val: str, cache_key: str) -> Optional[Path]:
+    val_key = (val or "NAS").upper()
+    if val_key not in _OVERSEAS_COD_URLS:
+        return None
+    url, cod_name = _OVERSEAS_COD_URLS[val_key]
+    zip_path = CACHE_DIR / f"{val_key.lower()}mst_{cache_key}.zip"
+    out_dir = CACHE_DIR / "kis_master_raw" / cache_key / val_key.lower()
+    if not _download_zip(url, zip_path):
+        return None
+    cod_path = _extract_file_from_zip(zip_path, cod_name, out_dir)
+    try:
+        zip_path.unlink(missing_ok=True)
+    except Exception:
+        pass
+    return cod_path
+
+
+def _download_frgn_mst(cache_key: str) -> Optional[Path]:
+    url, mst_name = _FRGN_MST_URL
+    zip_path = CACHE_DIR / f"frgn_code_{cache_key}.zip"
+    out_dir = CACHE_DIR / "kis_master_raw" / cache_key / "frgn"
+    if not _download_zip(url, zip_path):
+        return None
+    mst_path = _extract_file_from_zip(zip_path, mst_name, out_dir)
+    try:
+        zip_path.unlink(missing_ok=True)
+    except Exception:
+        pass
+    return mst_path
+
+
+def _standardize_nasmst_df(df: pd.DataFrame) -> pd.DataFrame:
+    """nasmst.cod → screener 표준 스키마."""
+    if df is None or df.empty:
+        return pd.DataFrame()
+    work = df.copy()
+    sec_col = "Security type(1:Index,2:Stock,3:ETP(ETF),4:Warrant)"
+    if sec_col in work.columns:
+        work = work.loc[work[sec_col].astype(str).str.strip().isin(["2", "2.0"])].copy()
+    sym_col = "Symbol" if "Symbol" in work.columns else work.columns[4]
+    out = pd.DataFrame()
+    out["Code"] = work[sym_col].astype(str).str.strip().str.upper()
+    name_col = "English name" if "English name" in work.columns else "Korea name"
+    out["Name"] = work.get(name_col, out["Code"]).astype(str)
+    if "Korea name" in work.columns:
+        kr = work["Korea name"].astype(str).str.strip()
+        out["Name"] = out["Name"].where(out["Name"].str.len() > 1, kr)
+    out["Close"] = pd.to_numeric(work.get("base price", 0), errors="coerce").fillna(0)
+    out["ListedShares"] = 0.0
+    sector_col = "업종분류코드"
+    if sector_col in work.columns:
+        out["Sector"] = work[sector_col].astype(str).str.strip()
+        out["Sector"] = out["Sector"].where(out["Sector"].ne("") & out["Sector"].ne("nan"), "N/A")
+    else:
+        out["Sector"] = "N/A"
+    out["SectorSource"] = "mst"
+    out["EXCD"] = "NAS"
+    out["OvrsExcg"] = "NASD"
+    out["Marcap"] = out["Close"] * out["ListedShares"]
+    out = out[out["Code"].astype(str).str.len() >= 1]
+    out = out.drop_duplicates(subset=["Code"]).set_index("Code")
+    out.index.name = "Code"
+    return out
+
+
+def _load_nasdaq100_master(cache_key: str, force_refresh: bool = False) -> pd.DataFrame:
+    """frgn_code(나스닥100=1) ∩ nasmst.cod(주식)."""
+    cache_id = f"NASDAQ100_{cache_key}_{_US_MST_PARSE_VERSION}"
+    if not force_refresh:
+        cached = cache_load("kis_master", cache_id)
+        if isinstance(cached, pd.DataFrame) and not cached.empty:
+            return cached
+
+    frgn_path = _download_frgn_mst(cache_key)
+    nas_path = _download_overseas_cod("NAS", cache_key)
+    if frgn_path is None or nas_path is None:
+        return pd.DataFrame()
+
+    try:
+        frgn = _parse_frgn_code_mst(frgn_path)
+        nas_raw = _parse_nasmst_cod(nas_path)
+        nas = _standardize_nasmst_df(nas_raw)
+    except Exception:
+        return pd.DataFrame()
+
+    if frgn.empty or nas.empty:
+        return pd.DataFrame()
+
+    sym = frgn["심볼"].astype(str).str.strip().str.upper()
+    ndx_flag = frgn.get("나스닥100 편입종목여부", pd.Series(dtype=str)).astype(str).str.strip()
+    ndx_symbols = set(sym[ndx_flag == "1"].tolist())
+    out = nas[nas.index.isin(ndx_symbols)].copy()
+    if out.empty:
+        return pd.DataFrame()
+
+    cache_save("kis_master", cache_id, out)
+    return out
 
 
 def _parse_kospi_kosdaq_mst(mst_path: Path, market: str) -> pd.DataFrame:
@@ -243,6 +425,9 @@ def load_kis_master(market: str, cache_key: Optional[str] = None, force_refresh:
     """
     market = (market or "").upper()
     ck = cache_key or datetime_now_yyyymmdd()
+
+    if market in ("NASDAQ100", "NDX100"):
+        return _load_nasdaq100_master(ck, force_refresh=force_refresh)
 
     cache_id = f"{market}_{ck}_{_MST_PARSE_VERSION}"
     cached = None if force_refresh else cache_load("kis_master", cache_id)

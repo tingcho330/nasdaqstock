@@ -9,15 +9,13 @@ x-common: &common
     - ./config/.env
   volumes:
     - ./src:/app/src
+    - ./config:/app/config
+    - ./output:/app/output
 
 services:
   integrated_manager:
     <<: *common
     container_name: my_trading_bot_integrated
-    volumes:
-      - ./src:/app/src
-      - ./config:/app/config
-      - ./output:/app/output
     command: python /app/run_integrated_manager.py
     deploy:
       resources:
@@ -29,10 +27,9 @@ services:
   background_risk_manager:
     <<: *common
     container_name: my_trading_bot_risk_manager
-    volumes:
-      - ./src:/app/src
-      - ./config:/app/config
-      - ./output:/app/output
+    env_file:
+      - ./config/.env
+      - ./config/.env.risk
     command: python /app/run_background_risk_manager.py
     deploy:
       resources:

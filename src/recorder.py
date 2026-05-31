@@ -33,6 +33,10 @@ try:
 except Exception:  # pragma: no cover
     pd = None
 
+from utils import normalize_ticker_6
+
+_MARKET = lambda: os.getenv("MARKET", "NASDAQ100")
+
 @dataclass
 class TradeRecord:
     """거래 기록"""
@@ -592,7 +596,7 @@ class DataRecorder:
         반환: 업데이트된 행 수.
         """
         try:
-            ticker = str(ticker).zfill(6)
+            ticker = normalize_ticker_6(ticker, _MARKET())
             if target_date is None:
                 target_date = datetime.now()
             date_str = target_date.strftime("%Y-%m-%d")
@@ -1039,7 +1043,7 @@ class DataRecorder:
             저장 성공 여부
         """
         try:
-            ticker_str = str(ticker).zfill(6)
+            ticker_str = normalize_ticker_6(ticker, _MARKET())
             timestamp = datetime.now().isoformat()
             
             with sqlite3.connect(self.db_path) as conn:
@@ -1068,7 +1072,7 @@ class DataRecorder:
             RSI 이력 리스트 (최신순)
         """
         try:
-            ticker_str = str(ticker).zfill(6)
+            ticker_str = normalize_ticker_6(ticker, _MARKET())
             cutoff_date = (datetime.now() - timedelta(days=days)).isoformat()
             
             with sqlite3.connect(self.db_path) as conn:
@@ -1122,7 +1126,7 @@ def record_trade(trade_data: Dict[str, Any]) -> bool:
             _db_dbg_skip("record_trade.SKIP", reason="qty<=0", ticker=trade_data.get("ticker"), qty=quantity)
             return False
         
-        ticker = _normalize_ticker_6(trade_data.get("ticker", ""))
+        ticker = normalize_ticker_6(trade_data.get("ticker", ""), _MARKET())
         action = trade_data.get("side", "").upper()
         price = float(trade_data.get("price", 0))
         
@@ -1268,15 +1272,6 @@ def record_trade(trade_data: Dict[str, Any]) -> bool:
         _db_dbg_log("record_trade.EXCEPTION", error=str(e), caller=_db_dbg_caller(2))
         return False
 
-def _normalize_ticker_6(ticker: str) -> str:
-    """종목코드 6자리 표준 형식 (recorder 전용, utils 의존 없음)."""
-    s = str(ticker).strip()
-    try:
-        return format(int(s), "06d")
-    except (ValueError, TypeError):
-        return s.zfill(6) if len(s) <= 6 else s
-
-
 def fetch_trades_by_tickers(tickers: List[str]) -> Dict[str, List[Dict[str, Any]]]:
     """티커별 거래 기록 조회 (하위 호환성)"""
     try:
@@ -1284,7 +1279,7 @@ def fetch_trades_by_tickers(tickers: List[str]) -> Dict[str, List[Dict[str, Any]
         result = {}
         
         for ticker in tickers:
-            ticker_str = _normalize_ticker_6(ticker)
+            ticker_str = normalize_ticker_6(ticker, _MARKET())
             trades = recorder.get_trade_records(ticker=ticker_str)
             
             # TradeRecord를 딕셔너리로 변환

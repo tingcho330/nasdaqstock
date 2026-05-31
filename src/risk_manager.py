@@ -14,11 +14,12 @@ from utils import (
     KST,
     OUTPUT_DIR,
     extract_cash_from_summary,
-    setup_logging,          # ← 공통 로깅 초기화
-    in_time_windows,        # ← 시간창 판별 (고정)
-    get_account_snapshot_cached,  # ← 읽기는 utils 캐시 사용
-    check_min_holding_period,  # Phase 1: 최소 보유기간 체크 통합 함수
-    check_min_holding_hours,   # Phase 1: 최소 보유시간 체크 (당일 매도 방지)
+    setup_logging,
+    in_time_windows,
+    normalize_ticker_6,
+    get_account_snapshot_cached,
+    check_min_holding_period,
+    check_min_holding_hours,
 )
 from notifier import (
     DiscordLogHandler,
@@ -131,7 +132,7 @@ def _notify_sell_embed(holding: Dict, reason: str, decision_type: str = "SELL",
     """매도 판단 시 하이라이트된 Discord embed 메시지 전송 (쿨다운 적용)."""
     try:
         now = pytime.time()
-        ticker = str(holding.get("pdno", "")).zfill(6)
+        ticker = normalize_ticker_6(holding.get("pdno", ""), os.getenv("MARKET", "NASDAQ100"))
         unique_key = f"{key}_{ticker}"
         
         if unique_key not in _last_sent or now - _last_sent[unique_key] >= cooldown_sec:
@@ -581,7 +582,7 @@ class RiskManager:
         - entry_price: 진입가가 없다면 현재가를 그대로 넣어도 됨
         인터페이스 보장: 항상 {'손절가','목표가','RSI','Price','source'} 포함.
         """
-        t = str(ticker).zfill(6)
+        t = normalize_ticker_6(ticker, os.getenv("MARKET", "NASDAQ100"))
         ep = float(entry_price)
         risk_params = self.config.get("risk_params", {}) or {}
         strategy_params = self.config.get("strategy_params", {}) or {}  # Phase 1: strategy_params 추가
@@ -787,7 +788,7 @@ class RiskManager:
 
     # ── [NEW] 전일 종가 조회(세션 캐시) ───────────────────────────────
     def _get_prev_close(self, ticker: str) -> Optional[int]:
-        t = str(ticker).zfill(6)
+        t = normalize_ticker_6(ticker, os.getenv("MARKET", "NASDAQ100"))
         if t in self._prev_close_cache:
             return self._prev_close_cache[t]
         try:
@@ -842,7 +843,10 @@ class RiskManager:
             balance_pattern="balance_*.json",
             ttl_sec=5,  # 즉시 재로딩 유도(파일 mtime 변화 감지)
         )
-        cash_map = extract_cash_from_summary(summary_dict)
+        cash_map = extract_cash_from_summary(
+            summary_dict,
+            market=os.getenv("MARKET", "NASDAQ100"),
+        )
         return (
             cash_map,
             balance_list,
@@ -928,7 +932,7 @@ class RiskManager:
         1. 기본 규칙 (안전장치) - 손절가/목표가/RSI/전일종가 이탈/보유일수/부분 익절
         2. 고급 전략 (strategies.py) - 가중치 조합 전략
         """
-        ticker = str(holding.get("pdno", "")).zfill(6)
+        ticker = normalize_ticker_6(holding.get("pdno", ""), os.getenv("MARKET", "NASDAQ100"))
         name = holding.get("prdt_name", "N/A")
         qty = _to_int(holding.get("hldg_qty", 0))
         cur_price = _to_int(holding.get("prpr", 0))  # 현재가
@@ -984,7 +988,7 @@ class RiskManager:
 
     def _check_basic_rules(self, holding: Dict, stock_info: Dict) -> Tuple[str, str, Dict]:
         """Phase 1: 당일 매도 방지 체크 추가"""
-        ticker = str(holding.get("pdno", "")).zfill(6)
+        ticker = normalize_ticker_6(holding.get("pdno", ""), os.getenv("MARKET", "NASDAQ100"))
         
         # Phase 1.4: 당일 매도 방지 체크
         trading_params = self.config.get("trading_params", {})
@@ -1010,7 +1014,7 @@ class RiskManager:
         
         # 기존 로직 계속
         """기본 매도 규칙 체크 (기존 로직)"""
-        ticker = str(holding.get("pdno", "")).zfill(6)
+        ticker = normalize_ticker_6(holding.get("pdno", ""), os.getenv("MARKET", "NASDAQ100"))
         name = holding.get("prdt_name", "N/A")
         qty = _to_int(holding.get("hldg_qty", 0))
         cur_price = _to_int(holding.get("prpr", 0))
@@ -1504,7 +1508,7 @@ class RiskManager:
 
     def _check_advanced_strategies(self, holding: Dict, stock_info: Dict) -> Tuple[str, str, Dict]:
         """고급 전략 체크 (strategies.py 사용)"""
-        ticker = str(holding.get("pdno", "")).zfill(6)
+        ticker = normalize_ticker_6(holding.get("pdno", ""), os.getenv("MARKET", "NASDAQ100"))
         name = holding.get("prdt_name", "N/A")
         cur_price = _to_int(holding.get("prpr", 0))
         avg_price = _to_float(holding.get("pchs_avg_pric"), 0.0)
@@ -1671,7 +1675,7 @@ class RiskManager:
         Returns:
             (충족된 조건 개수, 충족된 조건 목록)
         """
-        ticker = str(holding.get("pdno", "")).zfill(6)
+        ticker = normalize_ticker_6(holding.get("pdno", ""), os.getenv("MARKET", "NASDAQ100"))
         current_rsi = stock_info.get("RSI", 50.0)
         satisfied_conditions = []
         
@@ -1716,7 +1720,7 @@ class RiskManager:
         Returns:
             (판단 결과, 이유, 컨텍스트)
         """
-        ticker = str(holding.get("pdno", "")).zfill(6)
+        ticker = normalize_ticker_6(holding.get("pdno", ""), os.getenv("MARKET", "NASDAQ100"))
         name = holding.get("prdt_name", "N/A")
         rsi = _to_float(stock_info.get("RSI"), 50.0)
         cur_price = _to_int(holding.get("prpr", 0))
@@ -1895,7 +1899,7 @@ def _run_cycle(rm: RiskManager, *, notify_summary: bool = True) -> None:
         
         if skipped_count > 0:
             skipped_tickers = [
-                f"{h.get('prdt_name', 'N/A')}({str(h.get('pdno', '')).zfill(6)})"
+                f"{h.get('prdt_name', 'N/A')}({normalize_ticker_6(h.get('pdno', ''), os.getenv('MARKET', 'NASDAQ100'))})"
                 for h in holds
                 if _to_int(h.get("hldg_qty", 0)) <= 0
             ]
@@ -1907,7 +1911,7 @@ def _run_cycle(rm: RiskManager, *, notify_summary: bool = True) -> None:
             for h in holds:
                 qty = _to_int(h.get("hldg_qty", 0))
                 if qty <= 0:
-                    ticker = str(h.get("pdno", "")).zfill(6)
+                    ticker = normalize_ticker_6(h.get("pdno", ""), os.getenv("MARKET", "NASDAQ100"))
                     name = h.get("prdt_name", "N/A")
                     eval_amt = _to_int(h.get("evlu_amt", 0))
                     if eval_amt > 0:
@@ -1919,7 +1923,7 @@ def _run_cycle(rm: RiskManager, *, notify_summary: bool = True) -> None:
         if valid_holdings:
             logger.info(f"[리스크체크] 보유 종목 {len(valid_holdings)}개 모니터링 시작")
             for idx, h in enumerate(valid_holdings, 1):
-                ticker = str(h.get("pdno", "")).zfill(6)
+                ticker = normalize_ticker_6(h.get("pdno", ""), os.getenv("MARKET", "NASDAQ100"))
                 name = h.get("prdt_name", "N/A")
                 qty = _to_int(h.get("hldg_qty", 0))
                 cur_price = _to_float(h.get("prpr"), 0.0)

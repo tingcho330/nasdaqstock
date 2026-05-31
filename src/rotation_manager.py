@@ -11,12 +11,13 @@
 """
 
 import logging
+import os
 import time
 from typing import Dict, List, Tuple, Optional, Any
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
-from utils import KST, _to_int, _to_float, check_min_holding_period
+from utils import normalize_ticker_6, KST, _to_int, _to_float, check_min_holding_period
 from screener_core import MarketAnalyzer, MarketState
 
 logger = logging.getLogger(__name__)
@@ -151,7 +152,7 @@ class RotationManager:
         
         holding_list = []
         for h in holdings:
-            ticker = str(h.get("pdno", "")).zfill(6)
+            ticker = normalize_ticker_6(h.get("pdno", ""), os.getenv("MARKET", "NASDAQ100"))
             name = h.get("prdt_name", "N/A")
             quantity = _to_int(h.get("hldg_qty", 0))
             price = _to_int(h.get("prpr", 0))
@@ -181,7 +182,7 @@ class RotationManager:
         
         candidate_list = []
         for c in candidates:
-            ticker = str(c.get("Ticker", "")).zfill(6)
+            ticker = normalize_ticker_6(c.get("Ticker", ""), os.getenv("MARKET", "NASDAQ100"))
             name = c.get("Name", "N/A")
             price = _to_int(c.get("Price", 0))
             score = _to_float(c.get("Score", scores_map.get(ticker, 0.0)), 0.0)

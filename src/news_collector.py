@@ -7,7 +7,10 @@ from pathlib import Path
 import time
 import re
 import os
+import xml.etree.ElementTree as ET
+from email.utils import parsedate_to_datetime
 from typing import Dict, List, Tuple, Optional
+from urllib.parse import quote_plus
 import difflib
 
 import requests
@@ -20,6 +23,8 @@ from utils import (
     setup_logging,
     OUTPUT_DIR,
     find_latest_file,
+    is_us_market,
+    norm_ticker,
 )
 
 # ───────────────── 로깅 설정 ─────────────────
@@ -142,19 +147,93 @@ def _parse_pubdate(pub: str) -> datetime:
     dt = datetime.strptime(pub, "%a, %d %b %Y %H:%M:%S %z")
     return dt.astimezone(timezone.utc)
 
+def _market_tag() -> str:
+    return os.getenv("MARKET", "NASDAQ100")
+
+
 def _normalize_stock_dict(d: Dict) -> Dict:
     out = dict(d)
+    mkt = _market_tag()
     if not out.get("Ticker"):
         if out.get("Code"):
-            out["Ticker"] = str(out["Code"]).zfill(6)
+            out["Ticker"] = norm_ticker(out["Code"], mkt)
         elif out.get("ticker"):
-            out["Ticker"] = str(out["ticker"]).zfill(6)
+            out["Ticker"] = norm_ticker(out["ticker"], mkt)
+    else:
+        out["Ticker"] = norm_ticker(out["Ticker"], mkt)
     if not out.get("Name"):
         for k in ["Name", "종목명", "name"]:
             if d.get(k):
                 out["Name"] = str(d[k])
                 break
     return out
+
+def _fetch_google_news_rss(ticker: str, limit: int = 20) -> List[Dict]:
+    """Google News RSS (US)."""
+    q = quote_plus(f"{ticker} stock")
+    url = f"https://news.google.com/rss/search?q={q}&hl=en-US&gl=US&ceid=US:en"
+    try:
+        r = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code != 200:
+            return []
+        root = ET.fromstring(r.content)
+        items = []
+        for item in root.findall(".//item")[:limit]:
+            title = (item.findtext("title") or "").strip()
+            link = (item.findtext("link") or "").strip()
+            pub = (item.findtext("pubDate") or "").strip()
+            desc = (item.findtext("description") or "").strip()
+            items.append({"title": title, "link": link, "pubDate": pub, "description": desc})
+        return items
+    except Exception as e:
+        logger.warning("Google RSS 실패(%s): %s", ticker, e)
+        return []
+
+
+def _parse_rss_pubdate(pub: str) -> Optional[datetime]:
+    if not pub:
+        return None
+    try:
+        return parsedate_to_datetime(pub).astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _fetch_news_for_single_stock_us(
+    stock: Dict, cutoff_utc: datetime, num_articles: int
+) -> Tuple[str, str]:
+    stock = _normalize_stock_dict(stock)
+    name, ticker = stock.get("Name"), stock.get("Ticker")
+    if not ticker:
+        return "", "[NO_NEWS] 종목 정보 누락"
+    try:
+        items = _fetch_google_news_rss(str(ticker), limit=100)
+        if not items:
+            return str(ticker), "[NO_NEWS] Google RSS 결과 없음"
+        recent = []
+        for it in items:
+            pub = _parse_rss_pubdate(it.get("pubDate", ""))
+            if pub is None or pub >= cutoff_utc:
+                recent.append(it)
+        if not recent:
+            return str(ticker), "[NO_NEWS] 최근 기간 내 뉴스 없음"
+        articles = []
+        for it in recent[:num_articles]:
+            title = _clean_text(it.get("title", ""))
+            desc = _clean_text(it.get("description", ""))
+            link = it.get("link", "")
+            parts = [f"Title: {title}"]
+            if desc:
+                parts.append(f"Summary: {desc}")
+            parts.append(f"Link: {link or 'N/A'}")
+            articles.append("\n".join(parts))
+        if not articles:
+            return str(ticker), "[NO_NEWS] 기사 수집 실패"
+        return str(ticker), "\n\n---\n\n".join(articles)
+    except Exception as e:
+        logger.error("US 뉴스 수집 오류 %s: %s", ticker, e)
+        return str(ticker), "[ERROR] 뉴스 수집 중 오류 발생"
+
 
 # ───────────────── 뉴스 수집 코어 ─────────────────
 def _fetch_news_for_single_stock(
@@ -236,9 +315,10 @@ def fetch_news_for_stocks(
     # 기본값: 모두 NO_NEWS로 초기화
     base_map: Dict[str, str] = {}
     norm_list: List[Dict] = []
+    mkt = _market_tag()
     for stock in stocks:
         s = _normalize_stock_dict(stock)
-        t = str(s.get("Ticker", "")).zfill(6)
+        t = norm_ticker(s.get("Ticker", ""), mkt)
         if t and s.get("Name"):
             base_map[t] = "[NO_NEWS] 데이터 부족(수집 0건)"
             norm_list.append({"Name": s["Name"], "Ticker": t})
@@ -249,9 +329,10 @@ def fetch_news_for_stocks(
     if not norm_list:
         return news_cache
 
+    fetch_fn = _fetch_news_for_single_stock_us if is_us_market(mkt) else _fetch_news_for_single_stock
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         futures = {
-            ex.submit(_fetch_news_for_single_stock, stock, cutoff_utc, num_articles_per_stock): str(stock.get("Name", ""))
+            ex.submit(fetch_fn, stock, cutoff_utc, num_articles_per_stock): str(stock.get("Name", ""))
             for stock in norm_list
         }
         for fut in as_completed(futures):
@@ -324,7 +405,10 @@ def run_news_collection_from_results_file(
     for s in screened_stocks:
         norm = _normalize_stock_dict(s)
         if norm.get("Ticker") and norm.get("Name"):
-            stocks_for_news.append({"Name": norm["Name"], "Ticker": str(norm["Ticker"]).zfill(6)})
+            stocks_for_news.append({
+                "Name": norm["Name"],
+                "Ticker": norm_ticker(norm["Ticker"], market),
+            })
 
     if not stocks_for_news:
         logger.warning("Ticker/Name이 유효한 종목이 없습니다.")

@@ -1,20 +1,23 @@
 {
   "trading_environment": "prod",
   "kis_limits": {
-    "max_rps": 3,
-    "max_concurrency": 2
+    "max_rps": 2,
+    "max_concurrency": 1
   },
   "screener_params": {
     "min_market_cap": 50000000000,
-    "min_trading_value_5d_avg": 200000000000,
-    "top_n": 10,
+    "min_market_cap_us": 5000000000,
+    "max_market_cap": 50000000000000,
+    "max_market_cap_us": 5000000000000,
+    "min_trading_value_5d_avg": 100000000000,
+    "min_trading_value_5d_avg_us": 1000000000,
+    "top_n": 8,
     "fin_weight": 0.25,
     "tech_weight": 0.35,
     "mkt_weight": 0.1,
     "sector_weight": 0.1,
     "sector_cap": 0.35,
-    "sector_source_priority": ["kis", "pykrx"],
-    "max_market_cap": 50000000000000,
+    "sector_source_priority": ["kis", "mst"],
     "vol_kki_weight": 0.05,
     "pos_52w_weight": 0.05,
     "exclude_newly_listed_days": 20,
@@ -34,7 +37,7 @@
     "atr_k_stop": 2.0,
     "reward_risk": 3.0,
     "max_daily_loss_pct": 0.02,
-    "max_daily_loss_amount": 500000,
+    "max_daily_loss_amount": 5000,
     "stop_trading_on_consecutive_losses": 2,
     "stop_pct": 0.03,
     "cooldown_fail_threshold": 2,
@@ -71,9 +74,15 @@
     "openai_model": "gpt-4o-mini",
     "budget_guard": true,
     "max_entry_price_ratio": 0.2,
+    "initial_filter": {
+      "min_score_pass": 0.52,
+      "min_score_no_news": 0.52,
+      "heuristic_min_score": 0.52,
+      "min_news_chars": 200
+    },
     "analysis_expansion": {
       "enabled": true,
-      "max_primary_candidates": 10,
+      "max_primary_candidates": 8,
       "max_total_analysis": 15
     }
   },
@@ -99,11 +108,11 @@
     "partial_sell_flag_ttl_days": 7,
     "per_ticker_max_weight": 0.12,
     "min_holding_hours": 72,
-    "min_order_cash": 50000,
+    "min_order_cash": 100,
     "rebuy_atr_k": 0.5,
     "rebuy_rsi_ceiling": 72.0,
     "cash_buffer_ratio": 0.02,
-    "min_cash_reserve": 0,
+    "min_cash_reserve": 500,
     "dynamic_cash_management": {
       "enabled": true,
       "market_regime_adjustment": {
@@ -115,8 +124,8 @@
       "volatility_threshold": 0.25,
       "rebalance_frequency_hours": 6
     },
-    "buy_time_windows": ["09:10-13:00"],
-    "sell_time_windows": ["09:05-15:10"],
+    "buy_time_windows": ["23:20-05:45"],
+    "sell_time_windows": ["23:15-06:00"],
     "split_buy": {
       "enabled": false,
       "slices": 5,
@@ -124,17 +133,17 @@
       "ladder_ticks": [0, 1, 2, 3, 4],
       "interval_sec": 0.3,
       "jitter_sec": 0.1,
-      "min_qty": 200,
-      "min_cash_per_slice": 30000
+      "min_qty": 1,
+      "min_cash_per_slice": 100
     },
     "fee_buffer_pct": 0.003,
     "retry_on_reject": true,
     "max_retries": 2,
     "retry_delay_ms": 400,
     "slippage_bps": 10,
-    "commission_rate": 0.00015,
-    "securities_tax_rate": 0.0023,
-    "agricultural_tax_rate": 0.0015,
+    "commission_rate": 0.001,
+    "securities_tax_rate": 0,
+    "agricultural_tax_rate": 0,
     "slippage_rate": 0.001,
     "order_execution": {
       "execution_timeout_sec": 45,
@@ -158,7 +167,7 @@
   },
   "trading_guards": {
     "auto_shrink_slots": true,
-    "min_total_cash_to_trade": 100000,
+    "min_total_cash_to_trade": 1000,
     "skip_when_low_funds": true,
     "enforce_per_ticker_limit": true
   },
@@ -176,13 +185,13 @@
   },
   "daily_summary": {
     "enabled": true,
-    "balance_open_time": "09:00",
-    "balance_close_time": "15:30",
-    "summary_send_time": "15:35"
+    "balance_open_time": "23:25",
+    "balance_close_time": "06:00",
+    "summary_send_time": "06:15"
   },
   "schedule_times": {
-    "screener_time": "09:10",
-    "pipeline_time": "10:15"
+    "screener_time": "22:30",
+    "pipeline_time": "23:40"
   },
   "monthly_maintenance": {
     "day": 1,
@@ -202,11 +211,11 @@
   },
   "rebalance_params": {
     "use_gpt_analysis": true,
-    "screener_top_n": 10,
-    "min_score_threshold": 0.7
+    "screener_top_n": 8,
+    "min_score_threshold": 0.52
   },
   "batch_execution_check": {
     "enabled": true,
-    "check_time": "15:20"
+    "check_time": "06:05"
   }
 }

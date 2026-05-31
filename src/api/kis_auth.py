@@ -10,6 +10,7 @@ from typing import Optional, Dict, Any, Tuple
 
 from env_loader import load_project_env
 from .domestic_stock.domestic_stock_functions import DomesticStock
+from .overseas_stock.overseas_stock_functions import OverseasStock
 
 # 토큰을 저장할 파일 경로 설정
 TOKEN_FILE = Path(os.getenv("KIS_TOKEN_FILE", "/app/output/cache/kis_token.json"))
@@ -68,7 +69,7 @@ def load_kis_config() -> dict:
     return config
 
 
-class KIS(DomesticStock):
+class KIS(DomesticStock, OverseasStock):
     """
     개선 사항
     1) 토큰 캐시: /app/output/cache/kis_token.json
@@ -330,3 +331,27 @@ class KIS(DomesticStock):
     def get_current_time(self) -> datetime:
         """서버시간과 로컬시간의 차이를 반영한 현재시간을 반환"""
         return datetime.utcnow() + timedelta(seconds=self.get_time_diff_ratio())
+
+    def order_cash(self, ord_dv: str, pdno: str, ord_dvsn: str, ord_qty: int, ord_unpr: int, market=None):
+        """
+        국내/해외 주문 라우팅.
+        - KR: DomesticStock.order_cash (ord_dv 01=매도, 02=매수)
+        - US: overseas_order (NASD 등)
+        """
+        import os
+        from utils import is_us_market, us_ovrs_excg_cd, norm_ticker
+
+        mkt = market or os.getenv("MARKET", "NASDAQ100")
+        if is_us_market(mkt):
+            sym = norm_ticker(pdno, mkt)
+            if not sym:
+                raise ValueError(f"invalid US ticker: {pdno!r}")
+            return self.overseas_order(
+                ord_dv=ord_dv,
+                pdno=sym,
+                ord_dvsn=ord_dvsn,
+                ord_qty=int(ord_qty),
+                ord_unpr=int(ord_unpr),
+                ovrs_excg_cd=us_ovrs_excg_cd(mkt),
+            )
+        return DomesticStock.order_cash(self, ord_dv, pdno, ord_dvsn, ord_qty, ord_unpr)

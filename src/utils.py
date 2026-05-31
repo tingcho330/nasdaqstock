@@ -48,6 +48,15 @@ __all__ = [
     "check_min_holding_hours",
     "validate_config_consistency",
     "extract_broker_order_id",
+    # US/KR dual market
+    "is_us_market",
+    "norm_ticker",
+    "normalize_ticker_6",
+    "norm_ticker_series",
+    "us_excd",
+    "us_ovrs_excg_cd",
+    "min_trading_value_5d_avg",
+    "fmt_money",
 ]
 
 # ────────────────────────────────
@@ -271,7 +280,81 @@ _date_patterns = [
     re.compile(r"(?P<date>\d{8})[._-]?(?P<hms>\d{6})?"),  # 20250904 or 20250904-134000
     re.compile(r"(?P<date>\d{8})"),                       # 20250904
 ]
-_market_pattern = re.compile(r"(KOSPI|KOSDAQ|KONEX|NYSE|NASDAQ|AMEX|SPX|NIKKEI|HKEX)", re.IGNORECASE)
+_market_pattern = re.compile(
+    r"(KOSPI|KOSDAQ|KONEX|NASDAQ100|NYSE|NASDAQ|AMEX|SPX|NIKKEI|HKEX)",
+    re.IGNORECASE,
+)
+
+_US_MARKETS = frozenset({
+    "NASDAQ100", "NDX100", "NASDAQ", "NASD", "NYSE", "AMEX", "US",
+})
+_US_EXCD_MAP = {
+    "NASDAQ100": "NAS",
+    "NDX100": "NAS",
+    "NASDAQ": "NAS",
+    "NASD": "NAS",
+    "NYSE": "NYS",
+    "AMEX": "AMS",
+    "US": "NAS",
+}
+_US_OVRS_EXCG_MAP = {
+    "NASDAQ100": "NASD",
+    "NDX100": "NASD",
+    "NASDAQ": "NASD",
+    "NASD": "NASD",
+    "NYSE": "NYSE",
+    "AMEX": "AMEX",
+    "US": "NASD",
+}
+
+
+def is_us_market(market: Optional[str] = None) -> bool:
+    m = (market or os.getenv("MARKET", "")).upper().strip()
+    return m in _US_MARKETS
+
+
+def norm_ticker(ticker: str, market: Optional[str] = None) -> str:
+    """KR: 6자리 숫자 코드 / US: 심볼 보존 (AAPL)."""
+    s = str(ticker or "").strip().upper()
+    if not s:
+        return s
+    if is_us_market(market):
+        return re.sub(r"[^A-Z0-9.^-]", "", s)
+    try:
+        return format(int(re.sub(r"\D", "", s) or "0"), "06d")
+    except (ValueError, TypeError):
+        return s.zfill(6) if len(s) <= 6 else s
+
+
+def norm_ticker_series(series: pd.Series, market: Optional[str] = None) -> pd.Index:
+    return pd.Index([norm_ticker(x, market) for x in series.astype(str)], name="Code")
+
+
+def us_excd(market: Optional[str] = None) -> str:
+    m = (market or os.getenv("MARKET", "NASDAQ100")).upper().strip()
+    return _US_EXCD_MAP.get(m, "NAS")
+
+
+def us_ovrs_excg_cd(market: Optional[str] = None) -> str:
+    m = (market or os.getenv("MARKET", "NASDAQ100")).upper().strip()
+    return _US_OVRS_EXCG_MAP.get(m, "NASD")
+
+
+def min_trading_value_5d_avg(cfg: Dict[str, Any], market: Optional[str] = None) -> float:
+    sp = cfg or {}
+    if is_us_market(market):
+        return float(sp.get("min_trading_value_5d_avg_us", 30_000_000))
+    return float(sp.get("min_trading_value_5d_avg", 0))
+
+
+def fmt_money(amount: float, market: Optional[str] = None) -> str:
+    try:
+        val = float(amount)
+    except (TypeError, ValueError):
+        val = 0.0
+    if is_us_market(market):
+        return f"${val:,.2f} USD"
+    return f"{val:,.0f}원"
 
 def _extract_meta_from_name(name: str) -> Dict[str, Any]:
     meta: Dict[str, Any] = {"date": None, "hms": None, "market": None}
@@ -517,19 +600,43 @@ def load_account_files_with_retry(
         logger.warning("요약 파일을 찾지 못했거나 파싱 실패 (pattern=%s)", summary_pattern)
     return parsed_summary, parsed_balance, summary_path, balance_path
 
-def extract_cash_from_summary(summary_dict: Dict[str, str]) -> Dict[str, int]:
+def extract_cash_from_summary(
+    summary_dict: Dict[str, str],
+    market: Optional[str] = None,
+) -> Dict[str, int]:
     """
     summary.json에서 현금 관련 키를 추출하고 주문 가능 금액을 계산합니다.
-      - prvs_rcdl_excc_amt: D+2 예수금 (가장 보수적)
-      - nxdy_excc_amt: D+1 예수금
-      - dnca_tot_amt: 총 예수금
+    KR: prvs_rcdl_excc_amt(D+2) > nxdy_excc_amt > dnca_tot_amt
+    US: ord_psbl_frcr_amt / available_cash (USD)
     """
     if not summary_dict:
         return {"available_cash": 0}
 
-    cash_map = {k: _to_int_krw(v) for k, v in summary_dict.items() if isinstance(k, str) and "amt" in k}
+    mkt = market or os.getenv("MARKET", "NASDAQ100")
+    us_mode = is_us_market(mkt) or str(summary_dict.get("currency", "")).upper() == "USD"
 
-    # 주문 가능 금액 우선순위: D+2 > D+1 > 총 예수금
+    def _amt_keys(k: str) -> bool:
+        if not isinstance(k, str):
+            return False
+        return ("amt" in k) or k.endswith("_cash") or "ord_psbl" in k
+
+    cash_map = {k: _to_int_krw(v) for k, v in summary_dict.items() if _amt_keys(k)}
+
+    if us_mode:
+        for key in (
+            "available_cash",
+            "ord_psbl_frcr_amt",
+            "prvs_rcdl_excc_amt",
+            "frcr_buy_amt",
+            "dnca_tot_amt",
+        ):
+            val = cash_map.get(key) or _to_int_krw(summary_dict.get(key, 0))
+            if val > 0:
+                cash_map["available_cash"] = val
+                return cash_map
+        cash_map["available_cash"] = 0
+        return cash_map
+
     if cash_map.get("prvs_rcdl_excc_amt", 0) > 0:
         available = cash_map["prvs_rcdl_excc_amt"]
     elif cash_map.get("nxdy_excc_amt", 0) > 0:
@@ -695,7 +802,7 @@ def convert_screener_data_to_trader_format(screener_data: Dict) -> Dict:
     Returns:
         trader.py가 기대하는 all_stock_data 형식의 딕셔너리
     """
-    ticker = str(screener_data.get('ticker', '')).zfill(6)
+    ticker = normalize_ticker_6(screener_data.get('ticker', ''))
     if not ticker or ticker == "000000":
         return {}
     
@@ -803,11 +910,13 @@ def extract_broker_order_id(data: Any, primary_key: str = "ODNO") -> str:
     return ""
 
 
-def normalize_ticker_6(ticker: str) -> str:
+def normalize_ticker_6(ticker: str, market: Optional[str] = None) -> str:
     """
     종목코드를 6자리 표준 형식으로 통일 (당일 매도 방지 등 DB 조회 시 형식 불일치 방지).
-    '0280360'과 '280360'이 동일하게 '280360'으로 매칭되도록 함.
+    US 시장이면 norm_ticker()로 심볼을 보존한다.
     """
+    if is_us_market(market):
+        return norm_ticker(ticker, market)
     s = str(ticker).strip()
     try:
         return format(int(s), "06d")

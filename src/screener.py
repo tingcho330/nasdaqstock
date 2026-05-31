@@ -35,6 +35,11 @@ from utils import (
     compute_kki_metrics,
     count_consecutive_up,
     is_newly_listed,
+    is_us_market,
+    norm_ticker,
+    norm_ticker_series,
+    us_excd,
+    min_trading_value_5d_avg,
 )
 
 # 시장 분석 모듈 (screener_core에서 통합)
@@ -310,6 +315,32 @@ def _kis_inquire_price_safe(kis: KIS, code: str, retries: int = 4) -> Optional[p
             return None
 
 
+def _kis_overseas_daily_price_safe(
+    kis: KIS,
+    symb: str,
+    date_str: str,
+    market: str,
+    *,
+    retries: int = 4,
+) -> pd.DataFrame:
+    """해외주식 기간별시세(HHDFS76240000) — Amount5D용."""
+    symb = norm_ticker(symb, market)
+    excd = us_excd(market)
+    for attempt in range(max(1, retries)):
+        try:
+            if _KIS_RATE_LIMITER:
+                _KIS_RATE_LIMITER.wait()
+            return kis.overseas_daily_price(excd, symb, bymd=date_str, gubn="0", modp="0")
+        except Exception as e:
+            if _is_kis_ratelimit_error(e) and attempt < retries - 1:
+                backoff = min(1.5 * (2 ** attempt), 8.0) + random.uniform(0, 0.3)
+                time.sleep(backoff)
+                continue
+            logger.debug("KIS overseas dailyprice 실패(%s): %s", symb, str(e))
+            return pd.DataFrame()
+    return pd.DataFrame()
+
+
 def _kis_period_price_safe(
     kis: KIS,
     code: str,
@@ -317,10 +348,13 @@ def _kis_period_price_safe(
     end_date: str,
     *,
     market_div: str = "J",
+    market: Optional[str] = None,
     retries: int = 3,
 ) -> pd.DataFrame:
     """KIS 기간별시세(FHKST03010100) 안전 래퍼 (레이트리밋/백오프)."""
-    code = str(code).zfill(6)
+    if is_us_market(market):
+        return _kis_overseas_daily_price_safe(kis, code, end_date, market or "NASDAQ100", retries=retries)
+    code = norm_ticker(code, market)
     for attempt in range(max(1, retries)):
         try:
             if _KIS_RATE_LIMITER:
@@ -659,16 +693,21 @@ def get_fundamentals(
         if kis is None:
             return pd.DataFrame()
 
-        uniq = [str(t).zfill(6) for t in pd.unique(pd.Series(tickers)) if t]
+        uniq = [norm_ticker(t, market) for t in pd.unique(pd.Series(tickers)) if t]
         rows = []
+        excd = us_excd(market) if is_us_market(market) else None
         for code in uniq:
-            df = _kis_inquire_price_safe(kis, code, retries=3)
+            if is_us_market(market):
+                if _KIS_RATE_LIMITER:
+                    _KIS_RATE_LIMITER.wait()
+                df = kis.overseas_price_detail(excd, code)
+            else:
+                df = _kis_inquire_price_safe(kis, code, retries=3)
             if df is None or df.empty:
                 continue
             row = df.iloc[0].to_dict()
-            # 가능한 키 후보들(문서/응답 변동 대비)
-            per = row.get("per") or row.get("PER") or row.get("stck_per") or row.get("prst_per")
-            pbr = row.get("pbr") or row.get("PBR") or row.get("stck_pbr") or row.get("prst_pbr")
+            per = row.get("per") or row.get("PER") or row.get("perx") or row.get("stck_per")
+            pbr = row.get("pbr") or row.get("PBR") or row.get("pbrx") or row.get("stck_pbr")
             rows.append({"Code": code, "PER": per, "PBR": pbr})
         if not rows:
             return pd.DataFrame()
@@ -1162,7 +1201,7 @@ def _get_trading_value_5d_avg(
     거래대금 5일 평균(Amount5D)을 KIS 기간별 시세로 계산.
     - 전체 종목을 긁지 않고, tickers(관심종목)에 대해서만 호출.
     - 기준일(date_str, 당일)은 장중 누적 거래대금이라 제외하고 직전 5거래일만 사용.
-    - 반환: index=Code(6자리), name="Amount5D"
+    - 반환: index=Code (KR 6자리 / US 심볼), name="Amount5D"
     """
     if not tickers:
         return pd.Series(dtype="float64", name="Amount5D")
@@ -1170,79 +1209,32 @@ def _get_trading_value_5d_avg(
     if kis is None:
         return pd.Series(dtype="float64", name="Amount5D")
 
-    # 최근 5영업일을 얻기 위해 달력 기준으로 넉넉히 30일 조회
     try:
-        end_dt = datetime.strptime(date_str, "%Y%m%d")
+        datetime.strptime(date_str, "%Y%m%d")
     except Exception:
         return pd.Series(dtype="float64", name="Amount5D")
-    start_dt = (end_dt - timedelta(days=30)).strftime("%Y%m%d")
 
-    uniq = [str(t).zfill(6) for t in pd.unique(pd.Series(tickers)) if t]
+    us_mode = is_us_market(market)
+    start_dt = (datetime.strptime(date_str, "%Y%m%d") - timedelta(days=30)).strftime("%Y%m%d")
+    uniq = [norm_ticker(t, market) for t in pd.unique(pd.Series(tickers)) if t]
 
-    # Amount5D가 0으로 떨어지는 원인을 빠르게 찾기 위한 샘플 디버그 수집
-    # - 너무 많은 로그/파일쓰기를 막기 위해 env로 상한을 둠
     debug_limit = int(os.getenv("SCREENER_AMOUNT5D_DEBUG_LIMIT", "30"))
     debug_entries: List[Dict[str, Any]] = []
     debug_lock = threading.Lock()
 
-    def _one(code: str) -> Tuple[str, float]:
-        df = _kis_period_price_safe(kis, code, start_dt, date_str, market_div="J", retries=3)
+    def _avg_from_df(code: str, df: pd.DataFrame) -> float:
         if df is None or df.empty:
-            with debug_lock:
-                if len(debug_entries) < debug_limit:
-                    debug_entries.append(
-                        {
-                            "ticker": code,
-                            "stage": "period_price_empty_df",
-                            "cols": [],
-                        }
-                    )
-            return code, 0.0
-        # 날짜/거래대금 컬럼 후보
-        date_col = None
-        for c in ["stck_bsop_date", "bsop_date", "date", "Date"]:
-            if c in df.columns:
-                date_col = c
-                break
-        tv_col = None
-        for c in ["acml_tr_pbmn", "acml_tr_pbmn_amt", "acml_tr_pbmn", "stck_tr_pbmn", "trade_value", "거래대금"]:
-            if c in df.columns:
-                tv_col = c
-                break
+            return 0.0
+        date_candidates = ["xymd", "stck_bsop_date", "bsop_date", "date", "Date"]
+        tv_candidates = ["tamt", "acml_tr_pbmn", "acml_tr_pbmn_amt", "stck_tr_pbmn", "trade_value", "거래대금"]
+        date_col = next((c for c in date_candidates if c in df.columns), None)
+        tv_col = next((c for c in tv_candidates if c in df.columns), None)
         if tv_col is None:
-            # 일부 응답은 거래대금을 제공하지 않을 수 있음
             with debug_lock:
                 if len(debug_entries) < debug_limit:
-                    debug_entries.append(
-                        {
-                            "ticker": code,
-                            "stage": "tv_col_not_found",
-                            "date_col": date_col,
-                            "cols": list(df.columns),
-                        }
-                    )
-            return code, 0.0
-        s = pd.to_numeric(df[tv_col], errors="coerce").dropna()
-        if s.empty:
-            with debug_lock:
-                if len(debug_entries) < debug_limit:
-                    debug_entries.append(
-                        {
-                            "ticker": code,
-                            "stage": "tv_col_all_nan_after_parse",
-                            "tv_col": tv_col,
-                            "date_col": date_col,
-                            "non_null_count": int(pd.to_numeric(df[tv_col], errors="coerce").notna().sum())
-                            if tv_col in df.columns
-                            else 0,
-                            "cols": list(df.columns),
-                        }
-                    )
-            return code, 0.0
-        # 최근 5개 평균 (일자 정렬이 보장되지 않을 수 있어 date_col이 있으면 정렬)
-        # 기준일(당일) 바는 장중 누적 거래대금이라 일일 거래대금이 미완성 상태이므로
-        # 5일 평균이 왜곡되지 않도록 제외하고 직전 5거래일만 사용한다.
-        if date_col and date_col in df.columns:
+                    debug_entries.append({"ticker": code, "stage": "tv_col_not_found", "cols": list(df.columns)})
+            return 0.0
+        if date_col:
             try:
                 tmp = df[[date_col, tv_col]].copy()
                 tmp[date_col] = tmp[date_col].astype(str).str.replace(r"[^0-9]", "", regex=True)
@@ -1250,22 +1242,40 @@ def _get_trading_value_5d_avg(
                 tmp = tmp.dropna(subset=[tv_col]).sort_values(date_col)
                 tmp = tmp[tmp[date_col] != str(date_str)]
                 s2 = tmp[tv_col].tail(5)
-                return code, float(s2.mean()) if len(s2) else 0.0
+                return float(s2.mean()) if len(s2) else 0.0
             except Exception:
                 pass
-        return code, float(s.tail(5).mean()) if len(s) else 0.0
+        s = pd.to_numeric(df[tv_col], errors="coerce").dropna()
+        return float(s.tail(5).mean()) if len(s) else 0.0
+
+    def _one(code: str) -> Tuple[str, float]:
+        if us_mode:
+            df = _kis_overseas_daily_price_safe(kis, code, date_str, market, retries=4)
+        else:
+            df = _kis_period_price_safe(
+                kis, code, start_dt, date_str, market_div="J", market=market, retries=3
+            )
+        if df is None or df.empty:
+            with debug_lock:
+                if len(debug_entries) < debug_limit:
+                    debug_entries.append({"ticker": code, "stage": "period_price_empty_df", "cols": []})
+            return code, 0.0
+        return code, _avg_from_df(code, df)
 
     results: Dict[str, float] = {}
-    # 동시성은 KIS 내부 제한을 따름(레이트리밋은 wait로 직렬화)
-    workers = max(1, min(int(os.getenv("KIS_SCREEN_WORKERS", "4")), _KIS_MAX_CONCURRENCY))
+    default_workers = "1" if us_mode else "4"
+    workers = max(1, min(int(os.getenv("KIS_SCREEN_WORKERS", default_workers)), _KIS_MAX_CONCURRENCY))
     with ThreadPoolExecutor(max_workers=workers) as ex:
         futs = {ex.submit(_one, c): c for c in uniq}
         for fut in as_completed(futs):
             code, val = fut.result()
-            results[code] = val
+            results[norm_ticker(code, market)] = val
 
     out = pd.Series(results, name="Amount5D", dtype="float64")
-    out.index = out.index.astype(str).str.replace(r"[^0-9]", "", regex=True).str.zfill(6)
+    if us_mode:
+        out.index = norm_ticker_series(out.index, market)
+    else:
+        out.index = out.index.astype(str).str.replace(r"[^0-9]", "", regex=True).str.zfill(6)
 
     # 0이 너무 많이 나오는지 요약 로그 + 디버그 샘플 저장
     try:
@@ -1471,7 +1481,7 @@ def update_holdings_scores(holdings: List[Dict[str, Any]], date_str: str, market
     # 보유 종목 정보를 DataFrame으로 변환
     holdings_data = []
     for holding in holdings:
-        ticker = str(holding.get("pdno", "")).zfill(6)
+        ticker = norm_ticker(holding.get("pdno", ""), market)
         name = holding.get("prdt_name", "")
         price = int(holding.get("prpr", 0))
         
@@ -1689,10 +1699,18 @@ def _filter_initial_stocks(
     _describe_series("Marcap", df_pre["Marcap"])
 
     # 필터링
-    min_mc = float(cfg.get("min_market_cap", 0))
-    max_mc = float(cfg.get("max_market_cap", 1e13))
-    min_amt = float(cfg.get("min_trading_value_5d_avg", 0))
-    mask_mc = (df_pre["Marcap"] >= min_mc) & (df_pre["Marcap"] <= max_mc)
+    if is_us_market(market):
+        min_mc = float(cfg.get("min_market_cap_us", 0))
+        max_mc = float(cfg.get("max_market_cap_us", cfg.get("max_market_cap", 1e15)))
+    else:
+        min_mc = float(cfg.get("min_market_cap", 0))
+        max_mc = float(cfg.get("max_market_cap", 1e13))
+    min_amt = min_trading_value_5d_avg(cfg, market)
+    if is_us_market(market) and float(df_pre["Marcap"].max() or 0) <= 0:
+        mask_mc = pd.Series(True, index=df_pre.index)
+        logger.info("US Marcap 미제공(마스터) → 1차 시총 필터 스킵")
+    else:
+        mask_mc = (df_pre["Marcap"] >= min_mc) & (df_pre["Marcap"] <= max_mc)
     n0 = len(df_pre)
     n1 = int(mask_mc.sum())
     logger.info("단계별 생존 수: 시작=%d → Marcap(≥%s, ≤%s)=%d", n0, f"{int(min_mc):,}", f"{int(max_mc):,}", n1)
@@ -1735,8 +1753,8 @@ def _filter_initial_stocks(
     n_fund = len(df_filtered)
 
     # 화이트/블랙리스트
-    bl = {str(x).zfill(6) for x in risk.get("blacklist_tickers", []) if x}
-    wl = {str(x).zfill(6) for x in risk.get("whitelist_tickers", []) if x}
+    bl = {norm_ticker(x, market) for x in risk.get("blacklist_tickers", []) if x}
+    wl = {norm_ticker(x, market) for x in risk.get("whitelist_tickers", []) if x}
     if wl:
         before = len(df_filtered)
         _before_idx = df_filtered.index
@@ -1751,8 +1769,9 @@ def _filter_initial_stocks(
         _log_dropped("1차:블랙리스트", _before_idx, df_filtered.index)
     n_list = len(df_filtered)
 
-    # 빈/무효 티커 제거 (인덱스가 NaN이거나 4자 미만인 행 제외)
-    valid_idx = df_filtered.index.notna() & (df_filtered.index.astype(str).str.strip().str.len() >= 4)
+    # 빈/무효 티커 제거 (KR: 4자 이상 / US: 1자 이상)
+    _min_len = 1 if is_us_market(market) else 4
+    valid_idx = df_filtered.index.notna() & (df_filtered.index.astype(str).str.strip().str.len() >= _min_len)
     if not valid_idx.all():
         dropped = int((~valid_idx).sum())
         _before_idx = df_filtered.index
@@ -2529,7 +2548,8 @@ def run_screener(date_str: str, market: str, config_path: Optional[str], workers
 
     with stage("상세 분석(스코어링)", notify_key="screener_scoring"):
         # 빈/무효 티커 제거 (All attempts failed for "" 방지)
-        _valid_idx = df_filtered.index.notna() & (df_filtered.index.astype(str).str.strip().str.len() >= 4)
+        _min_len = 1 if is_us_market(market) else 4
+        _valid_idx = df_filtered.index.notna() & (df_filtered.index.astype(str).str.strip().str.len() >= _min_len)
         if not _valid_idx.all():
             dropped = (~_valid_idx).sum()
             logger.warning("무효 티커(빈/짧은 인덱스) 제외: %d건 → 스코어링 대상 %d건", int(dropped), int(_valid_idx.sum()))
@@ -2669,12 +2689,12 @@ def run_screener(date_str: str, market: str, config_path: Optional[str], workers
             .reset_index()
             .rename(columns={"index": "Ticker"})
         )
-        # Ticker에 KRX 6자리 Code 값 부여 (Code 컬럼이 있으면 통일 후 제거)
+        # Ticker: KR 6자리 / US 심볼 (Code 컬럼이 있으면 통일 후 제거)
         if "Code" in df_final.columns:
-            df_final["Ticker"] = (
-                df_final["Code"].astype(str).str.replace(r"\D", "", regex=True).str.zfill(6)
-            )
+            df_final["Ticker"] = norm_ticker_series(df_final["Code"], market)
             df_final = df_final.drop(columns=["Code"], errors="ignore")
+        elif "Ticker" in df_final.columns:
+            df_final["Ticker"] = norm_ticker_series(df_final["Ticker"], market)
 
         # 정렬: 제외사유 없는 것 우선, 그 다음 점수 높은 순
         df_final["exclude_reasons_len"] = df_final["exclude_reasons"].apply(len)
@@ -2849,16 +2869,13 @@ def run_screener(date_str: str, market: str, config_path: Optional[str], workers
         keep = [c for c in cols if c in final_candidates.columns]
         final_candidates = final_candidates[keep + [c for c in final_candidates.columns if c not in keep]]
 
-        # Ticker 정규화: 항상 6자리 문자열 (하류 trader/GPT 호환)
+        # Ticker 정규화: KR 6자리 / US 심볼 (하류 trader/GPT 호환)
         if "Ticker" in final_candidates.columns:
-            final_candidates["Ticker"] = (
-                final_candidates["Ticker"]
-                .astype(str)
-                .str.replace(r"\D", "", regex=True)
-                .str.zfill(6)
+            final_candidates["Ticker"] = norm_ticker_series(final_candidates["Ticker"], market)
+            _min_ticker_len = 1 if is_us_market(market) else 4
+            empty_ticker = (final_candidates["Ticker"] == "") | (
+                final_candidates["Ticker"].str.len() < _min_ticker_len
             )
-            # 빈 문자열이면 NaN → 제거하거나 유지 (0으로 채우지 않음)
-            empty_ticker = (final_candidates["Ticker"] == "") | (final_candidates["Ticker"].str.len() < 4)
             if empty_ticker.any():
                 logger.warning("Ticker 비정상 %d건 제외", empty_ticker.sum())
                 final_candidates = final_candidates[~empty_ticker]
@@ -2958,7 +2975,7 @@ def run_screener(date_str: str, market: str, config_path: Optional[str], workers
                     tp = int(r["목표가"]) if pd.notna(r["목표가"]) else 0
                     sl = int(r["손절가"]) if pd.notna(r["손절가"]) else 0
                     lines.append(
-                        f"- {r.get('Name','')}({str(r['Ticker']).zfill(6)}), "
+                        f"- {r.get('Name','')}({norm_ticker(r['Ticker'], market)}), "
                         f"Sec:{r.get('Sector','N/A')}, Px:{px:,}, "
                         f"TP:{tp:,}, SL:{sl:,}, S:{float(r['Score']):.3f}"
                     )
@@ -2970,7 +2987,11 @@ def run_screener(date_str: str, market: str, config_path: Optional[str], workers
 def parse_args():
     parser = argparse.ArgumentParser(description="KOSPI/KOSDAQ/KONEX 스크리너")
     parser.add_argument("--date", default=datetime.now().strftime("%Y%m%d"))
-    parser.add_argument("--market", default=os.getenv("MARKET", "KOSPI"), choices=["KOSPI", "KOSDAQ", "KONEX"])
+    parser.add_argument(
+        "--market",
+        default=os.getenv("MARKET", "NASDAQ100"),
+        choices=["KOSPI", "KOSDAQ", "KONEX", "NASDAQ100"],
+    )
     parser.add_argument("--config", help="추가/오버레이할 config.json 파일 경로")
     parser.add_argument("--workers", type=int, default=int(os.getenv("WORKERS", "4")))
     parser.add_argument("--debug", action="store_true")

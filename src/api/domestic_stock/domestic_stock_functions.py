@@ -1,3 +1,5 @@
+import os
+from utils import normalize_ticker_6
 import requests
 import json
 import pandas as pd
@@ -346,7 +348,7 @@ class DomesticStock:
         
         for _, order in pending_orders.iterrows():
             # 특정 종목 필터링
-            if ticker and str(order.get('pdno', '')).zfill(6) != str(ticker).zfill(6):
+            if ticker and normalize_ticker_6(order.get('pdno', ''), os.getenv('MARKET', 'KOSPI')) != normalize_ticker_6(ticker, os.getenv('MARKET', 'KOSPI')):
                 continue
                 
             try:

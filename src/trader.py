@@ -34,14 +34,16 @@ from utils import (
     find_latest_file,
     OUTPUT_DIR,
     extract_cash_from_summary,
+    normalize_ticker_6,
+    is_us_market,
     KST,
-    in_time_windows,                 # 시간대 필터
-    get_account_snapshot_cached,     # 계좌 스냅샷 캐시 리더
-    get_tick_size,                   # 호가단위
-    round_to_tick,                   # 호가 반올림(여기서는 mode="down"/"up" 사용)
-    convert_screener_data_to_trader_format,  # 공통 변환 함수
-    check_min_holding_period,        # Phase 1: 최소 보유기간 체크 통합 함수
-    check_min_holding_hours,         # Phase 1: 최소 보유시간 체크 (당일 매도 방지)
+    in_time_windows,
+    get_account_snapshot_cached,
+    get_tick_size,
+    round_to_tick,
+    convert_screener_data_to_trader_format,
+    check_min_holding_period,
+    check_min_holding_hours,
     extract_broker_order_id,
 )
 from api.kis_auth import KIS
@@ -233,6 +235,7 @@ class Trader:
         self.max_legs_per_ticker = int(self.trading_params.get("max_legs_per_ticker", 1))
         self.per_ticker_max_weight = float(self.trading_params.get("per_ticker_max_weight", 1.0))
         self.min_order_cash = int(self.trading_params.get("min_order_cash", 0))
+        self.market = os.getenv("MARKET", "NASDAQ100")
         self.rebuy_atr_k = float(self.trading_params.get("rebuy_atr_k", 0.0))
         self.rebuy_rsi_ceiling = float(self.trading_params.get("rebuy_rsi_ceiling", 100.0))
         self.min_cash_reserve = int(self.trading_params.get("min_cash_reserve", 0))
@@ -334,6 +337,10 @@ class Trader:
             key=f"phase:init:{self.run_id}", cooldown=60
         )
 
+    def _t(self, ticker) -> str:
+        """종목코드 정규화 (KR 6자리 / US 심볼)."""
+        return normalize_ticker_6(ticker, self.market)
+
     def _load_latest_market_state(self) -> Optional[Dict[str, Any]]:
         """
         screener가 output/market_state_YYYYMMDD_MARKET.json 로 저장한 시장 상태를 로드한다.
@@ -422,7 +429,7 @@ class Trader:
                     
                 else:
                     # 기존 screener_candidates_*.json 형태
-                    t = str(stock.get('Ticker', '')).zfill(6)
+                    t = self._t(stock.get('Ticker', ''))
                     if not t or t == "000000":
                         continue
                     
@@ -508,7 +515,7 @@ class Trader:
             balance_pattern="balance_*.json",
             ttl_sec=None,
         )
-        cash_map = extract_cash_from_summary(summary_dict)
+        cash_map = extract_cash_from_summary(summary_dict, market=self.market)
         available_cash = cash_map.get("available_cash", 0)
         holdings: List[Dict] = []
         if balance_list:
@@ -534,7 +541,7 @@ class Trader:
     @staticmethod
     def _get_qty(holdings: List[Dict], ticker: str) -> int:
         for h in holdings:
-            if str(h.get("pdno", "")).zfill(6) == ticker:
+            if self._t(h.get("pdno", "")) == ticker:
                 return _to_int(h.get("hldg_qty", 0))
         return 0
 
@@ -543,7 +550,7 @@ class Trader:
         avg_price: Dict[str, float] = {}
         pv = 0.0
         for h in holdings:
-            t = str(h.get("pdno", "")).zfill(6)
+            t = self._t(h.get("pdno", ""))
             qty = _to_int(h.get("hldg_qty", 0))
             prpr = _to_float(h.get("prpr"), 0.0)
             avgp = _to_float(h.get("pchs_avg_pric"), 0.0) or prpr
@@ -559,7 +566,7 @@ class Trader:
         }
 
     def _legs_count_for_ticker(self, holdings: List[Dict], ticker: str) -> int:
-        return 1 if any(str(h.get("pdno", "")).zfill(6) == ticker and _to_int(h.get("hldg_qty", 0)) > 0 for h in holdings) else 0
+        return 1 if any(self._t(h.get("pdno", "")) == ticker and _to_int(h.get("hldg_qty", 0)) > 0 for h in holdings) else 0
 
     def _can_rebuy(self, ticker: str, info: Dict[str, Any], holdings: List[Dict], available_cash: int) -> Tuple[bool, str]:
         if self._legs_count_for_ticker(holdings, ticker) >= self.max_legs_per_ticker:
@@ -629,7 +636,9 @@ class Trader:
                 kwargs['pdno'] = kwargs.pop('ticker')
             valid_params = ['ord_dv', 'pdno', 'ord_dvsn', 'ord_qty', 'ord_unpr']
             filtered_kwargs = {k: v for k, v in kwargs.items() if k in valid_params}
-            res = self.kis.order_cash(**filtered_kwargs)
+            if filtered_kwargs.get("pdno"):
+                filtered_kwargs["pdno"] = self._t(filtered_kwargs["pdno"])
+            res = self.kis.order_cash(**filtered_kwargs, market=self.market)
             # 1) DataFrame 성공 경로
             if hasattr(res, "empty"):
                 if res is None or res.empty:
@@ -863,7 +872,7 @@ class Trader:
             if confirmed_only:
                 try:
                     pending_df = self.kis.get_pending_orders()
-                    has_pending = (pending_df is not None and not pending_df.empty and any(str(p).zfill(6) == ticker for p in pending_df.get('pdno', [])))
+                    has_pending = (pending_df is not None and not pending_df.empty and any(self._t(p) == ticker for p in pending_df.get('pdno', [])))
                 except Exception:
                     has_pending = False
             else:
@@ -1221,7 +1230,7 @@ class Trader:
                             executed_qty = int(pd.to_numeric(row.get('tot_ccld_qty', 0), errors='coerce') or 0)
                             orders.append({
                                 'order_id': str(row.get('odno', '')),
-                                'ticker': str(row.get('pdno', '')).zfill(6),
+                                'ticker': self._t(row.get('pdno', '')),
                                 'side': 'buy' if str(row.get('sll_buy_dvsn_cd', '')) == '02' else 'sell',
                                 'quantity': int(pd.to_numeric(row.get('ord_qty', 0), errors='coerce') or 0),
                                 'executed_qty': executed_qty,
@@ -1715,7 +1724,7 @@ class Trader:
                 return {}, None
             m: Dict[str, float] = {}
             for row in arr:
-                t = str(row.get("ticker", "")).zfill(6)
+                t = self._t(row.get("ticker", ""))
                 sc = _to_float(row.get("score_total"), 0.0)
                 if t and t != "000000":
                     m[t] = sc
@@ -1739,7 +1748,7 @@ class Trader:
             
             holdings_scores = {}
             for holding in holdings_data:
-                ticker = str(holding.get("ticker", "")).zfill(6)
+                ticker = self._t(holding.get("ticker", ""))
                 if ticker and ticker != "000000":
                     holdings_scores[ticker] = {
                         "name": holding.get("name", ""),
@@ -1963,7 +1972,7 @@ class Trader:
     # ── 단일 매수 실행(회전/특수 케이스용) ────────────────────────────
     def _execute_buy_single(self, stock_info: Dict[str, Any], available_cash: int, batch_name: str = "SINGLE") -> bool:
         name = stock_info.get("Name", "N/A")
-        ticker = str(stock_info.get("Ticker", "")).zfill(6)
+        ticker = self._t(stock_info.get("Ticker", ""))
         if not ticker:
             return False
 
@@ -2131,11 +2140,11 @@ class Trader:
         if not self._check_trading_hours("sell"):
             return
 
-        holding_tickers = [str(h.get("pdno", "")).zfill(6) for h in holdings if _to_int(h.get("hldg_qty", 0)) > 0]
+        holding_tickers = [self._t(h.get("pdno", "")) for h in holdings if _to_int(h.get("hldg_qty", 0)) > 0]
         last_buy_trades = fetch_trades_by_tickers(holding_tickers)
 
         for holding in holdings:
-            ticker = str(holding.get("pdno", "")).zfill(6)
+            ticker = self._t(holding.get("pdno", ""))
             name = holding.get("prdt_name", "N/A")
             quantity = _to_int(holding.get("hldg_qty", 0))
             if not ticker or quantity <= 0:
@@ -2607,7 +2616,7 @@ class Trader:
         ticker_weights = {}
         for h in holdings:
             if _to_int(h.get("hldg_qty", 0)) > 0:
-                ticker = str(h.get("pdno", "")).zfill(6)
+                ticker = self._t(h.get("pdno", ""))
                 value = _to_int(h.get("evlu_amt", 0))
                 weight = value / total_value
                 ticker_weights[ticker] = weight
@@ -2775,7 +2784,7 @@ class Trader:
             # 현재 보유 정보 찾기
             holding = None
             for h in holdings:
-                if str(h.get("pdno", "")).zfill(6) == ticker:
+                if self._t(h.get("pdno", "")) == ticker:
                     holding = h
                     break
             
@@ -2974,7 +2983,7 @@ class Trader:
         holdings_scores = self._load_holdings_scores()
         
         for holding in holdings:
-            ticker = str(holding.get("pdno", "")).zfill(6)
+            ticker = self._t(holding.get("pdno", ""))
             if not ticker or ticker == "000000":
                 continue
             
@@ -3030,7 +3039,7 @@ class Trader:
         holdings_scores = self._load_holdings_scores()
         
         for holding in holdings:
-            ticker = str(holding.get("pdno", "")).zfill(6)
+            ticker = self._t(holding.get("pdno", ""))
             updated_holding = holding.copy()
             
             # 최신 스코어 추가
@@ -3379,7 +3388,7 @@ class Trader:
             # GPT 분석 결과 파싱
             gpt_decisions = {}
             for item in gpt_data:
-                ticker = str(item.get("stock_info", {}).get("Ticker", "")).zfill(6)
+                ticker = self._t(item.get("stock_info", {}).get("Ticker", ""))
                 decision = item.get("결정", "")
                 analysis = item.get("분석", "")
                 
@@ -3432,7 +3441,7 @@ class Trader:
         filtered_candidates = []
         for candidate in candidates:
             # 대소문자 폴백 처리: Ticker/ticker, Name/name 모두 지원
-            ticker = str(candidate.get("Ticker") or candidate.get("ticker", "")).zfill(6)
+            ticker = self._t(candidate.get("Ticker") or candidate.get("ticker", ""))
             name = candidate.get("Name") or candidate.get("name", "N/A")
             
             if ticker not in self._gpt_hold_decisions:
@@ -3467,13 +3476,13 @@ class Trader:
             if "stock_info" in item:
                 logger.debug(f"[DEBUG] 매도 항목 {i}: stock_info 구조 감지")
                 stock_info = item.get("stock_info", {})
-                ticker = str(stock_info.get("Ticker", "")).zfill(6)
+                ticker = self._t(stock_info.get("Ticker", ""))
                 name = stock_info.get("Name", "")
                 qty = item.get("qty", 0)
                 logger.debug(f"[DEBUG] 매도 항목 {i}: stock_info에서 추출 - ticker:{ticker}, name:{name}, qty:{qty}")
             else:
                 logger.debug(f"[DEBUG] 매도 항목 {i}: 직접 구조 감지")
-                ticker = str(item.get("ticker", "")).zfill(6)
+                ticker = self._t(item.get("ticker", ""))
                 name = item.get("name", "")
                 qty = item.get("qty", 0)
                 logger.debug(f"[DEBUG] 매도 항목 {i}: 직접에서 추출 - ticker:{ticker}, name:{name}, qty:{qty}")
@@ -3516,7 +3525,7 @@ class Trader:
             if "new_score" not in standardized_item:
                 standardized_item["new_score"] = float(item.get("new_score", item.get("score", 0.0)))
             if "new_ticker" not in standardized_item:
-                standardized_item["new_ticker"] = str(item.get("new_ticker", item.get("target_ticker", ""))).zfill(6)
+                standardized_item["new_ticker"] = self._t(item.get("new_ticker", item.get("target_ticker", "")))
             
             validated.append(standardized_item)
             logger.debug(f"[DEBUG] 매도 항목 {i}: 검증 통과 - {standardized_item}")
@@ -3546,7 +3555,7 @@ class Trader:
                 logger.warning(f"매수 계획 {i}: stock_info가 딕셔너리가 아님 - {type(stock_info)}")
                 continue
             
-            ticker = str(stock_info.get("Ticker", "")).zfill(6)
+            ticker = self._t(stock_info.get("Ticker", ""))
             name = stock_info.get("Name", "")
             logger.debug(f"[DEBUG] 매수 계획 {i}: stock_info에서 추출 - ticker:{ticker}, name:{name}")
             
@@ -3621,7 +3630,7 @@ class Trader:
                 # 매수 후보에 GPT 분석 결과 추가
                 enhanced_buy_plans = []
                 for plan in to_buy_plans:
-                    ticker = str(plan.get("stock_info", {}).get("Ticker", "")).zfill(6)
+                    ticker = self._t(plan.get("stock_info", {}).get("Ticker", ""))
                     logger.debug(f"[DEBUG] GPT 분석 확인 중: {ticker}")
                     if ticker in gpt_decisions:
                         gpt_info = gpt_decisions[ticker]
@@ -3691,7 +3700,7 @@ class Trader:
             logger.info(f"=== 매수 결정 상세 ({len(to_buy_plans)}건) ===")
             for i, buy_plan in enumerate(to_buy_plans[:3]):  # 최대 3건만 표시
                 stock_info = buy_plan.get("stock_info", {})
-                ticker = str(stock_info.get("Ticker", "")).zfill(6)
+                ticker = self._t(stock_info.get("Ticker", ""))
                 name = stock_info.get("Name", "N/A")
                 internal_score = stock_info.get("Score", 0.0)
                 integrated_score = buy_plan.get("integrated_score", internal_score)
@@ -3742,7 +3751,7 @@ class Trader:
             logger.info(f"[RotationSandbox] 제안 로드: 총 {total}건, 하한(conf>={min_conf:.2f}) 통과 {len(kept)}건, 제외 {dropped}건")
             for i, s in enumerate(sorted(kept, key=lambda x: x.get("priority", 0), reverse=True)[:5], 1):
                 logger.info(
-                    f"  [{i}] SELL {s.get('name','N/A')}({str(s.get('ticker','')).zfill(6)}) "
+                    f"  [{i}] SELL {s.get('name','N/A')}({self._t(s.get('ticker',''))}) "
                     f"w={float(s.get('current_weight',0)):.3f}→{float(s.get('target_weight',0)):.3f} "
                     f"conf={float(s.get('confidence',0)):.2f} reasons={s.get('reasons', [])}"
                 )
@@ -3764,7 +3773,7 @@ class Trader:
             
             # 미체결 주문 상세 정보 로깅
             for _, order in pending_orders.iterrows():
-                ticker = str(order.get('pdno', '')).zfill(6)
+                ticker = self._t(order.get('pdno', ''))
                 name = order.get('prdt_name', 'N/A')
                 side = '매수' if order.get('sll_buy_dvsn_cd', '') == '02' else '매도'
                 qty = order.get('ord_qty', '')
@@ -3984,7 +3993,7 @@ class Trader:
                 effective_slots = self._compute_effective_slots(available_cash) if self.trading_guards.get("auto_shrink_slots", False) else self.max_positions
 
         # 보유 집합
-        holding_tickers = {str(h.get("pdno", "")).zfill(6) for h in holdings if _to_int(h.get("hldg_qty", 0)) > 0}
+        holding_tickers = {self._t(h.get("pdno", "")) for h in holdings if _to_int(h.get("hldg_qty", 0)) > 0}
 
         # 후보 분리: 신규 / 추가매수 (gpt 계획이 있을 경우에만 사용)
         new_targets = []
@@ -3992,7 +4001,7 @@ class Trader:
         if buy_plans:
             for plan in buy_plans:
                 info = plan["stock_info"]
-                ticker = str(info.get("Ticker", "")).zfill(6)
+                ticker = self._t(info.get("Ticker", ""))
                 name = info.get("Name", "N/A")
 
                 if ticker in holding_tickers:
@@ -4031,7 +4040,7 @@ class Trader:
                 info = plan.get("stock_info", {})
                 for k, dv in SCHEMA_DEFAULTS.items():  # 안전 디폴트
                     info.setdefault(k, dv)
-                ticker, name = str(info.get("Ticker", "")).zfill(6), info.get("Name", "N/A")
+                ticker, name = self._t(info.get("Ticker", "")), info.get("Name", "N/A")
                 slots_left = len(plans) - i
 
                 # 중복 주문 방지 체크
@@ -4374,7 +4383,7 @@ class Trader:
         _execute_buy_batch(rebuy_candidates, batch_name="REBUY")
 
         # 2) 신규 진입: 슬롯 확인 (동적 슬롯 반영)
-        current_slots_used = len({str(h.get("pdno", "")).zfill(6) for h in holdings if _to_int(h.get("hldg_qty", 0)) > 0})
+        current_slots_used = len({self._t(h.get("pdno", "")) for h in holdings if _to_int(h.get("hldg_qty", 0)) > 0})
         slots_to_fill = max(0, effective_slots - current_slots_used)
 
         if slots_to_fill <= 0:
@@ -4411,7 +4420,7 @@ class Trader:
                 # ── 정책1: 스왑 전 시뮬레이션 ───────────────────────────
                 expected_proceeds = 0
                 # est_proceeds가 없으면 보유 목록에서 추정
-                h_pr_map = {str(h.get("pdno", "")).zfill(6): (_to_int(h.get("prpr", 0)), _to_int(h.get("hldg_qty", 0))) for h in holdings}
+                h_pr_map = {self._t(h.get("pdno", "")): (_to_int(h.get("prpr", 0)), _to_int(h.get("hldg_qty", 0))) for h in holdings}
                 for s in to_sell_list:
                     # 데이터 검증 강화
                     if not isinstance(s, dict):
@@ -4492,7 +4501,7 @@ class Trader:
                         # 매수 대상 상세 로깅
                         for i, plan in enumerate(buy_now):
                             info = plan.get("stock_info", {})
-                            ticker = str(info.get("Ticker", "")).zfill(6)
+                            ticker = self._t(info.get("Ticker", ""))
                             name = info.get("Name", "N/A")
                             score = info.get("Score", 0.0)
                             logger.info(f"  -> 매수 [{i+1}/{len(buy_now)}] {name}({ticker}) [스코어: {score:.3f}]")
@@ -4541,8 +4550,8 @@ class Trader:
         price_cache = {}
         with ThreadPoolExecutor(max_workers=5) as executor:
             future_to_ticker = {
-                executor.submit(self._get_realtime_price_parallel, str(plan.get("stock_info", {}).get("Ticker", "")).zfill(6)): 
-                str(plan.get("stock_info", {}).get("Ticker", "")).zfill(6) 
+                executor.submit(self._get_realtime_price_parallel, self._t(plan.get("stock_info", {}).get("Ticker", ""))): 
+                self._t(plan.get("stock_info", {}).get("Ticker", "")) 
                 for plan in targets
             }
             
@@ -4579,7 +4588,7 @@ class Trader:
                 info = plan.get("stock_info", {})
                 for k, dv in SCHEMA_DEFAULTS.items():
                     info.setdefault(k, dv)
-                ticker, name = str(info.get("Ticker", "")).zfill(6), info.get("Name", "N/A")
+                ticker, name = self._t(info.get("Ticker", "")), info.get("Name", "N/A")
                 
                 # 개선된 포지션 사이징 로직 (회전 매매용)
                 slots_left = len(round_targets) - i
@@ -4635,7 +4644,7 @@ class Trader:
     def _try_single_buy(self, plan: Dict, budget: int, round_num: int) -> bool:
         """단일 종목 매수 시도"""
         info = plan.get("stock_info", {})
-        ticker, name = str(info.get("Ticker", "")).zfill(6), info.get("Name", "N/A")
+        ticker, name = self._t(info.get("Ticker", "")), info.get("Name", "N/A")
         
         try:
             # 실시간 가격 조회
@@ -4917,7 +4926,7 @@ class Trader:
         held: List[Tuple[str, str, int, float, int, float, Dict]] = []
         excluded_count = 0
         for h in updated_holdings:
-            t = str(h.get("pdno", "")).zfill(6)
+            t = self._t(h.get("pdno", ""))
             nm = h.get("prdt_name", "N/A")
             qty = _to_int(h.get("hldg_qty", 0))
             
@@ -5017,7 +5026,7 @@ class Trader:
                     "cached_score": worst_score,
                     "new_score": new_score,
                     "score_delta": score_delta,
-                    "new_ticker": str(info.get("Ticker", "")).zfill(6),
+                    "new_ticker": self._t(info.get("Ticker", "")),
                     "est_proceeds": int(worst_pr * worst_qty),
                     # screener_holdings 상세 정보 추가
                     "sector": worst_screener_info.get('sector', ''),
@@ -5035,13 +5044,13 @@ class Trader:
                            f"[섹터:{worst_screener_info.get('sector', 'N/A')}, "
                            f"RSI:{worst_screener_info.get('rsi', 0):.1f}, "
                            f"52W:{worst_screener_info.get('pos_52w', 0):.1f}] → "
-                           f"{info.get('Name', 'N/A')}({str(info.get('Ticker', '')).zfill(6)}) [{new_score:.3f}] "
+                           f"{info.get('Name', 'N/A')}({self._t(info.get('Ticker', ''))}) [{new_score:.3f}] "
                            f"(Δ={score_delta:.3f})")
                 logger.debug(f"[DEBUG] 매칭 성공: to_buy={len(to_buy)}, to_sell={len(to_sell)}")
             else:
                 # 임계치 못 넘으면 더 이상 교체 진행 X (보수적)
                 logger.debug(f"리밸런싱 스킵: {worst_name}({worst_t}) [{current_worst_score:.3f}] vs "
-                           f"{info.get('Name', 'N/A')}({str(info.get('Ticker', '')).zfill(6)}) [{new_score:.3f}] "
+                           f"{info.get('Name', 'N/A')}({self._t(info.get('Ticker', ''))}) [{new_score:.3f}] "
                            f"(Δ={score_delta:.3f} < {delta_thr:.3f})")
                 break
 
@@ -5055,7 +5064,7 @@ class Trader:
             for i in range(pairs):
                 s = to_sell[i]
                 new_plan = to_buy[i]
-                nt = str(new_plan.get('stock_info', {}).get('Ticker', '')).zfill(6)
+                nt = self._t(new_plan.get('stock_info', {}).get('Ticker', ''))
                 nn = new_plan.get('stock_info', {}).get('Name', 'N/A')
                 old_score = s.get('old_score', 0.0)
                 new_score = s.get('new_score', 0.0)

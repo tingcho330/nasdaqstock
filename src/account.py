@@ -8,17 +8,19 @@
 - ❗️degraded(실패) 발생 시: 본파일(bal/summary_YYYYMMDD.json)을 절대 덮지 않고 *_degraded.json에만 기록
 """
 
+import os
 import pprint
 import json
 import sys
 import logging
 from datetime import datetime
 from pathlib import Path
-from typing import Tuple
+from typing import Tuple, Dict, Any
 
 import pandas as pd
 
-from utils import setup_logging, OUTPUT_DIR, KST
+from utils import setup_logging, OUTPUT_DIR, KST, is_us_market, fmt_money
+from kis_overseas_account import inquire_overseas_account
 from settings import settings
 from api.kis_auth import KIS
 from notifier import DiscordLogHandler, WEBHOOK_URL, send_discord_message
@@ -57,16 +59,24 @@ def build_balance_comments() -> dict:
         "evlu_pfls_rt": "평가손익률 (%)",
     }
 
-def build_summary_comments() -> dict:
-    return {
-        "dnca_tot_amt": "예수금 총액",
-        "prvs_rcdl_excc_amt": "D+2 출금 가능 금액",
+def build_summary_comments(us_mode: bool = False) -> dict:
+    base = {
+        "dnca_tot_amt": "예수금 총액 (US: USD 외화예수)",
+        "prvs_rcdl_excc_amt": "출금/주문 가능 금액 (US: ord_psbl_frcr_amt)",
         "nxdy_excc_amt": "익일(D+1) 출금 가능 금액",
         "tot_evlu_amt": "총 평가 금액 (주식 평가금 + 예수금)",
         "pchs_amt_smtl_amt": "매입 금액 합계",
         "evlu_pfls_smtl_amt": "평가 손익 합계",
         "status": "데이터 상태 (ok/degraded)",
     }
+    if us_mode:
+        base.update({
+            "currency": "통화 (USD)",
+            "ord_psbl_frcr_amt": "외화 주문 가능 금액",
+            "frcr_buy_amt": "외화 매수 가능/예수금",
+            "available_cash": "주문 가능 현금 (USD)",
+        })
+    return base
 
 def dump_with_comments(filepath: Path, comments: dict, df: pd.DataFrame | None, extra_fields: dict | None = None) -> None:
     payload = {
@@ -160,6 +170,31 @@ def inquire_balance_with_retry(kis: KIS, *, max_tries: int = 3) -> Tuple[pd.Data
     logger.warning("inquire_balance 재시도 종료: %s", last_err)
     return None, None, True, (str(last_err)[:400] if last_err else "unknown")
 
+
+def inquire_overseas_with_retry(
+    kis: KIS,
+    market: str,
+    *,
+    max_tries: int = 3,
+) -> Tuple[pd.DataFrame | None, Dict[str, Any] | None, bool, str]:
+    """해외 잔고 조회 (kis_overseas_account). 반환 summary는 dict."""
+    last_err = None
+    for _ in range(max_tries):
+        try:
+            df_balance, summary, degraded, err = kis.safe_call(
+                inquire_overseas_account,
+                kis,
+                market,
+            )
+            if not degraded and summary:
+                return df_balance, summary, False, ""
+            last_err = RuntimeError(err or "해외 summary 비어있음")
+        except Exception as e:
+            last_err = e
+    logger.warning("inquire_overseas 재시도 종료: %s", last_err)
+    return None, None, True, (str(last_err)[:400] if last_err else "unknown")
+
+
 def _make_empty_balance_df() -> pd.DataFrame:
     cols = list(build_balance_comments().keys())
     return pd.DataFrame(columns=cols)
@@ -186,10 +221,27 @@ if __name__ == "__main__":
         if not getattr(kis, "auth_token", None):
             raise ConnectionError("KIS API 인증 실패")
 
-        logger.info("'%s' 모드로 인증 완료. 계좌 잔고 조회를 시작합니다...", trading_env)
+        market = os.getenv("MARKET", "NASDAQ100")
+        us_mode = is_us_market(market)
+        logger.info(
+            "'%s' 모드, MARKET=%s — 계좌 잔고 조회 (%s)",
+            trading_env,
+            market,
+            "해외" if us_mode else "국내",
+        )
 
-        # 조회 (안전 래퍼)
-        df_balance, df_summary, degraded, err = inquire_balance_with_retry(kis)
+        summary_extra: Dict[str, Any] = {}
+        if us_mode:
+            df_balance, summary_dict, degraded, err = inquire_overseas_with_retry(kis, market)
+            df_summary = (
+                pd.DataFrame([summary_dict])
+                if summary_dict
+                else _make_empty_summary_df()
+            )
+            summary_extra = {"currency": summary_dict.get("currency", "USD")} if summary_dict else {}
+        else:
+            df_balance, df_summary, degraded, err = inquire_balance_with_retry(kis)
+            summary_dict = None
 
         # 저장 경로
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -239,7 +291,13 @@ if __name__ == "__main__":
 
         # 저장(덮어쓰기) - 정상
         dump_with_comments(balance_file, build_balance_comments(), df_balance, extra_fields={"status": "ok"})
-        dump_with_comments(summary_file, build_summary_comments(), df_summary, extra_fields={"status": "ok"})
+        sum_extra = {"status": "ok", **summary_extra}
+        dump_with_comments(
+            summary_file,
+            build_summary_comments(us_mode=us_mode),
+            df_summary,
+            extra_fields=sum_extra,
+        )
 
         # 저장된 JSON 재파싱
         _, cash_d2, cash_tot, tot_eval, nxdy_excc = _extract_summary_fields_from_saved_json(summary_file)
@@ -249,24 +307,31 @@ if __name__ == "__main__":
         if df_balance is not None and not df_balance.empty:
             hold_cnt = sum(1 for row in df_balance.to_dict("records") if _to_int(row.get("hldg_qty", 0)) > 0)
 
-        # 표준화된 요약 로그 (f-string으로 콤마표기)
+        # 표준화된 요약 로그
         logger.info("\n--- 계좌 종합 평가(표준화) ---")
         logger.info("보유종목: %d개", hold_cnt)
-        logger.info(f"D+2 출금가능: {cash_d2:,}원")
-        if nxdy_excc:
-            logger.info(f"익일 출금가능: {nxdy_excc:,}원")
-        logger.info(f"예수금: {cash_tot:,}원")
-        logger.info(f"총평가(요약): {tot_eval:,}원")
+        if us_mode:
+            logger.info("주문가능: %s", fmt_money(cash_d2, market))
+            logger.info("예수금: %s", fmt_money(cash_tot, market))
+            logger.info("총평가: %s", fmt_money(tot_eval, market))
+        else:
+            logger.info(f"D+2 출금가능: {cash_d2:,}원")
+            if nxdy_excc:
+                logger.info(f"익일 출금가능: {nxdy_excc:,}원")
+            logger.info(f"예수금: {cash_tot:,}원")
+            logger.info(f"총평가(요약): {tot_eval:,}원")
         logger.info("files: %s, %s", str(balance_file), str(summary_file))
 
         # 디스코드 전송
         try:
+            if us_mode:
+                cash_line = f"주문가능: {fmt_money(cash_d2, market)}\n예수금: {fmt_money(cash_tot, market)}\n총평가: {fmt_money(tot_eval, market)}"
+            else:
+                cash_line = f"D+2 출금가능: {cash_d2:,}원\n예수금: {cash_tot:,}원\n총평가: {tot_eval:,}원"
             _notify(
                 "✅ 계좌 조회 완료\n"
                 f"보유종목: {hold_cnt}개\n"
-                f"D+2 출금가능: {cash_d2:,}원\n"
-                f"예수금: {cash_tot:,}원\n"
-                f"총평가: {tot_eval:,}원\n"
+                f"{cash_line}\n"
                 f"files: {balance_file.name}, {summary_file.name}"
             )
         except Exception as e:

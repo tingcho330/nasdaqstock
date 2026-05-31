@@ -31,6 +31,7 @@ from utils import (
     in_time_windows,
     get_account_snapshot_cached,
     is_market_open_day,
+    normalize_ticker_6,
 )
 
 # 디스코드 노티파이어
@@ -163,7 +164,7 @@ else:
     logger.warning("유효한 DISCORD_WEBHOOK_URL이 없어 에러 로그의 디스코드 전송을 비활성화합니다.")
 
 # ───────────────── 설정 ─────────────────
-MARKET = os.getenv("MARKET", "KOSPI")
+MARKET = os.getenv("MARKET", "NASDAQ100")
 SLOTS = os.getenv("SLOTS", "3")
 MAX_ATTEMPTS = int(os.getenv("SCHED_MAX_ATTEMPTS", "3"))
 INITIAL_BACKOFF_MINUTES = int(os.getenv("SCHED_INITIAL_BACKOFF_MINUTES", "2"))
@@ -391,7 +392,7 @@ def capture_balance_snapshot(snapshot_type: str) -> Optional[Dict]:
             qty = int(str(h.get("hldg_qty", 0)).replace(",", ""))
             if qty > 0:
                 holdings_detail.append({
-                    "ticker": str(h.get("pdno", "")).zfill(6),
+                    "ticker": normalize_ticker_6(h.get("pdno", ""), os.getenv("MARKET", "NASDAQ100")),
                     "name": h.get("prdt_name", "N/A"),
                     "qty": qty,
                     "price": int(h.get("prpr", 0)),
