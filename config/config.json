@@ -222,5 +222,10 @@
   "batch_execution_check": {
     "enabled": true,
     "check_time": "06:05"
+  },
+  "order_reconcile": {
+    "enabled": true,
+    "reconcile_time": "06:10",
+    "minutes_after_batch": 5
   }
 }

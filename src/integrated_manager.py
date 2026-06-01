@@ -703,26 +703,55 @@ def run_screener_job():
     except Exception as e:
         logger.error(f"스크리너 실행 중 오류: {e}")
 
+def _resolve_batch_reconcile_times(config: Optional[dict] = None) -> Tuple[str, str, bool, bool]:
+    """config·MARKET 기준 일괄 체결·리컨실 시각(KST) 및 활성 여부."""
+    cfg = config if config is not None else (getattr(settings, "_config", None) or {})
+    batch_cfg = cfg.get("batch_execution_check") or {}
+    recon_cfg = cfg.get("order_reconcile") or {}
+    default_batch = "06:05" if is_us_market(MARKET) else "15:20"
+    batch_time = str(batch_cfg.get("check_time") or default_batch)
+    batch_enabled = bool(batch_cfg.get("enabled", True))
+    recon_enabled = bool(recon_cfg.get("enabled", True))
+    if recon_cfg.get("reconcile_time"):
+        reconcile_time = str(recon_cfg["reconcile_time"])
+    else:
+        offset = int(recon_cfg.get("minutes_after_batch", 2))
+        reconcile_time = _add_minutes_hhmm(batch_time, offset)
+    return batch_time, reconcile_time, batch_enabled, recon_enabled
+
+
 def run_batch_execution_check():
-    """15시 20분 일괄 체결 확인 실행"""
+    """설정 시각(KST) 일괄 체결 확인 — trader.py --batch-check-only"""
+    batch_time, _, _, _ = _resolve_batch_reconcile_times()
     try:
-        logger.info("15시 20분 일괄 체결 확인 시작")
-        
-        # trader.py를 직접 실행하여 일괄 체결 확인만 수행
+        if not is_market_open_day(market=MARKET):
+            logger.info("휴장일 → 일괄 체결 확인 스킵 (%s)", batch_time)
+            return
+
+        logger.info("%s KST 일괄 체결 확인 시작", batch_time)
+
         result = subprocess.run([
             sys.executable, "src/trader.py", "--batch-check-only"
         ], capture_output=True, text=True, cwd=os.getcwd())
-        
+
         if result.returncode == 0:
-            logger.info("15시 20분 일괄 체결 확인 완료")
-            _notify("✅ 15시 20분 일괄 체결 확인 완료", key="batch_execution_check", cooldown_sec=60)
+            logger.info("%s KST 일괄 체결 확인 완료", batch_time)
+            _notify(f"✅ {batch_time} 일괄 체결 확인 완료", key="batch_execution_check", cooldown_sec=60)
         else:
-            logger.error(f"15시 20분 일괄 체결 확인 실패: {result.stderr}")
-            _notify(f"❌ 15시 20분 일괄 체결 확인 실패: {result.stderr[:200]}", key="batch_execution_check_fail", cooldown_sec=60)
-            
+            logger.error("일괄 체결 확인 실패: %s", result.stderr)
+            _notify(
+                f"❌ {batch_time} 일괄 체결 확인 실패: {result.stderr[:200]}",
+                key="batch_execution_check_fail",
+                cooldown_sec=60,
+            )
+
     except Exception as e:
-        logger.error(f"15시 20분 일괄 체결 확인 중 오류: {e}")
-        _notify(f"❌ 15시 20분 일괄 체결 확인 오류: {str(e)[:200]}", key="batch_execution_check_error", cooldown_sec=60)
+        logger.error("일괄 체결 확인 중 오류: %s", e)
+        _notify(
+            f"❌ {batch_time} 일괄 체결 확인 오류: {str(e)[:200]}",
+            key="batch_execution_check_error",
+            cooldown_sec=60,
+        )
 
 def _add_minutes_hhmm(hhmm: str, minutes: int) -> str:
     """'HH:MM' 문자열에 분을 더해 'HH:MM'로 반환 (24h wrap)."""
@@ -736,10 +765,15 @@ def _add_minutes_hhmm(hhmm: str, minutes: int) -> str:
     except Exception:
         return hhmm
 
-def run_order_reconcile_job():
+def run_order_reconcile_job(*, skip_holiday_check: bool = False):
     """DB pending/partial 주문 리컨실 실행"""
+    _, reconcile_time, _, _ = _resolve_batch_reconcile_times()
     try:
-        logger.info("주문 리컨실(order_reconciler.py) 실행 시작")
+        if not skip_holiday_check and not is_market_open_day(market=MARKET):
+            logger.info("휴장일 → 주문 리컨실 스킵 (%s)", reconcile_time)
+            return
+
+        logger.info("%s KST 주문 리컨실(order_reconciler.py) 실행 시작", reconcile_time)
         # 별도 스크립트 실행 (DB 상태 정리)
         result = subprocess.run(
             [sys.executable, "src/order_reconciler.py", "--since-hours", "36", "--limit", "800"],
@@ -1020,13 +1054,13 @@ def register_jobs():
         # 파이프라인 실행
         getattr(schedule.every(), day).at(SCHEDULE_TIMES["pipeline"]).do(run_trading_pipeline)
         
-        # 15시 20분 일괄 체결 확인 (설정에서 시간 읽어오기)
-        batch_check_time = settings._config.get("batch_execution_check", {}).get("check_time", "15:20")
-        getattr(schedule.every(), day).at(batch_check_time).do(run_batch_execution_check)
-
-        # batch check 직후 리컨실 1회(주문 상태/체결수량 최신화)
-        reconcile_time = _add_minutes_hhmm(batch_check_time, 2)
-        getattr(schedule.every(), day).at(reconcile_time).do(run_order_reconcile_job)
+        batch_check_time, reconcile_time, batch_on, recon_on = _resolve_batch_reconcile_times(
+            getattr(settings, "_config", None) or {}
+        )
+        if batch_on:
+            getattr(schedule.every(), day).at(batch_check_time).do(run_batch_execution_check)
+        if recon_on:
+            getattr(schedule.every(), day).at(reconcile_time).do(run_order_reconcile_job)
         
         # 장종료시 잔액 캡처
         getattr(schedule.every(), day).at(SCHEDULE_TIMES["balance_close"]).do(capture_balance_snapshot, "close")
@@ -1036,6 +1070,17 @@ def register_jobs():
 
     # 월 1회 유지보수: 매일 점검하여 실행일에만 1회 실행(주말/휴일 포함)
     schedule.every().day.at(MONTHLY_MAINTENANCE_TIME).do(run_monthly_maintenance_if_due)
+    batch_t, recon_t, batch_on, recon_on = _resolve_batch_reconcile_times(
+        getattr(settings, "_config", None) or {}
+    )
+    logger.info(
+        "[SCHEDULE] batch_check=%s (%s) | order_reconcile=%s (%s) | MARKET=%s",
+        batch_t,
+        "on" if batch_on else "off",
+        recon_t,
+        "on" if recon_on else "off",
+        MARKET,
+    )
     logger.info(
         f"[SCHEDULE] 월간 유지보수 등록: 매월 {MONTHLY_MAINTENANCE_DAY}일 {MONTHLY_MAINTENANCE_TIME} "
         f"(reviewer.py → cleanup_output.py)"
@@ -1113,7 +1158,7 @@ if __name__ == "__main__":
 
         # 부팅 직후 1회 리컨실(전일/당일 pending 잔존 정리 시도)
         try:
-            run_order_reconcile_job()
+            run_order_reconcile_job(skip_holiday_check=True)
         except Exception:
             pass
         

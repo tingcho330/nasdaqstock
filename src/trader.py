@@ -340,7 +340,8 @@ class Trader:
         # 15시 20분 일괄 체결 확인 시스템
         self.pending_orders = []  # 미체결 주문 추적
         batch_config = self.settings.get("batch_execution_check", {})
-        self.batch_check_time = batch_config.get("check_time", "15:20")  # 설정에서 시간 읽어오기
+        _default_batch = "06:05" if is_us_market(os.getenv("MARKET", "SP500")) else "15:20"
+        self.batch_check_time = batch_config.get("check_time", _default_batch)
         self.batch_check_enabled = batch_config.get("enabled", True)
 
         # 부분익절 이력(전량매도 후 재진입 차단 갱신에 사용)

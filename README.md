@@ -92,15 +92,15 @@
 
 ### 3.2 평일 스케줄 (KST, SP500 기준)
 
-`config/config.json`의 `daily_summary`, `schedule_times`, `batch_execution_check`로 설정합니다. **현재 기본값(미국 정규장 대략 23:30~06:00 KST):**
+`config/config.json`의 `daily_summary`, `schedule_times`, `batch_execution_check`, `order_reconcile`로 설정합니다. **현재 기본값(미국 정규장 대략 23:30~06:00 KST):**
 
 | 시각 | 작업 | 실행 |
 |------|------|------|
 | 23:25 | 장 시작 직전 잔액 | `account.py` |
 | **22:30** | 스크리너 | `screener.py --market SP500` |
 | **23:40** | 매매 파이프라인 | `health_check` → `news_collector` → `gpt_analyzer` → `trader` |
-| **06:05** | 일괄 체결 확인 | `trader.py --batch-check-only` |
-| 15:22 | 주문 정합성 | `order_reconciler.py` (KR 스케줄 잔존, 필요 시 조정) |
+| **06:05** | 일괄 체결 확인 | `trader.py --batch-check-only` (`batch_execution_check.check_time`) |
+| **06:10** | 주문 정합성 | `order_reconciler.py` (`order_reconcile.reconcile_time`) |
 | **06:00** | 장 마감 후 잔액 | `account.py` |
 | **06:15** | 일일 요약 | Discord |
 
@@ -459,7 +459,7 @@ trading_bot_260530_NASDAQ/
 | USD 예수금 (`extract_cash_from_summary`) | ✅ `ord_psbl_frcr_amt` 우선 |
 | 파이프라인 E2E (health → news → GPT) | ✅ 로컬 검증 (§7.3) |
 | 장중 리스크 US 장 시간 | ✅ `is_regular_session` + `trading_params.sell_time_windows` |
-| `order_reconciler` 스케줄 | ⏳ 15:22 KST (US 장에 맞게 조정 권장) |
+| `order_reconciler` 스케줄 | ✅ 06:10 KST (`order_reconcile` / US 장 마감 후) |
 | 휴장일 판단 | ✅ US: NYSE(XNYS) / KR: 주말 (`is_market_open_day`) |
 | `Marcap` (US) | 마스터 미제공 → 0, 시총 필터 스킵 |
 | `investor_flow` (US) | 0 (국내 수급 API 경로) |
