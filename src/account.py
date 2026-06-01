@@ -1,4 +1,6 @@
 # src/account.py
+from __future__ import annotations
+
 """
 계좌 잔고/요약 조회 스크립트 (안전본)
 - utils.py 로깅/경로/시간대 사용
@@ -221,7 +223,7 @@ if __name__ == "__main__":
         if not getattr(kis, "auth_token", None):
             raise ConnectionError("KIS API 인증 실패")
 
-        market = os.getenv("MARKET", "NASDAQ100")
+        market = os.getenv("MARKET", "SP500")
         us_mode = is_us_market(market)
         logger.info(
             "'%s' 모드, MARKET=%s — 계좌 잔고 조회 (%s)",

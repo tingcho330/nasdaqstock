@@ -148,7 +148,7 @@ def _parse_pubdate(pub: str) -> datetime:
     return dt.astimezone(timezone.utc)
 
 def _market_tag() -> str:
-    return os.getenv("MARKET", "NASDAQ100")
+    return os.getenv("MARKET", "SP500")
 
 
 def _normalize_stock_dict(d: Dict) -> Dict:

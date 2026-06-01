@@ -22,6 +22,7 @@ import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
 from collections import defaultdict
 import uuid
@@ -36,6 +37,7 @@ from utils import (
     extract_cash_from_summary,
     normalize_ticker_6,
     is_us_market,
+    fmt_money,
     KST,
     in_time_windows,
     get_account_snapshot_cached,
@@ -144,7 +146,7 @@ def _notify_embed(embed: Dict, key: str, cooldown: int = DEFAULT_COOLDOWN_SEC):
 # ── 경로/상수 ─────────────────────────────────────────────────────────
 COOLDOWN_FILE = OUTPUT_DIR / "cooldown.json"
 PARTIAL_SELL_FLAGS_FILE = OUTPUT_DIR / "partial_sell_flags.json"
-ACCOUNT_SCRIPT_PATH = "/app/src/account.py"  # 계좌 스냅샷 생성 전용 스크립트
+ACCOUNT_SCRIPT_PATH = str(Path(__file__).resolve().parent / "account.py")
 
 # ── 보조 파서 ─────────────────────────────────────────────────────────
 def _to_int(v) -> int:
@@ -205,12 +207,27 @@ SCHEMA_DEFAULTS: Dict[str, Any] = {
 }
 
 # ── 가성비 통계 로그 ───────────────────────────────────────────
-def log_affordability_stats(usable_cash: int, buffer_ratio: float, candidates: List[Dict[str, Any]], min_order_cash: Optional[int] = None):
+def _money_mkt(amount, market: Optional[str] = None) -> str:
+    """모듈 레벨 금액 포맷 (Trader._money와 동일 규칙)."""
+    return fmt_money(float(amount or 0), market or os.getenv("MARKET", "SP500"))
+
+
+def log_affordability_stats(
+    usable_cash: int,
+    buffer_ratio: float,
+    candidates: List[Dict[str, Any]],
+    min_order_cash: Optional[int] = None,
+    market: Optional[str] = None,
+):
+    mkt = market or os.getenv("MARKET", "SP500")
     cheapest = min((_to_int(c.get("Price", 0)) for c in candidates), default=0)
     buyable_cnt = sum(1 for c in candidates if _to_int(c.get("Price", 0)) <= int(usable_cash * (1 - buffer_ratio)))
-    base = f"[Affordability] usable_cash={usable_cash:,}, buffer={buffer_ratio:.2%}, cheapest={cheapest:,}, buyable_count={buyable_cnt}"
+    base = (
+        f"[Affordability] usable_cash={_money_mkt(usable_cash, mkt)}, buffer={buffer_ratio:.2%}, "
+        f"cheapest={_money_mkt(cheapest, mkt)}, buyable_count={buyable_cnt}"
+    )
     if isinstance(min_order_cash, (int, float)) and min_order_cash is not None:
-        base += f", min_order_cash={int(min_order_cash):,}"
+        base += f", min_order_cash={_money_mkt(min_order_cash, mkt)}"
     logger.info(base)
 
 # ── Trader 본체 ───────────────────────────────────────────────────────
@@ -235,7 +252,22 @@ class Trader:
         self.max_legs_per_ticker = int(self.trading_params.get("max_legs_per_ticker", 1))
         self.per_ticker_max_weight = float(self.trading_params.get("per_ticker_max_weight", 1.0))
         self.min_order_cash = int(self.trading_params.get("min_order_cash", 0))
-        self.market = os.getenv("MARKET", "NASDAQ100")
+        self.market = os.getenv("MARKET", "SP500")
+        if is_us_market(self.market):
+            try:
+                from datetime import datetime as _dt
+                from kis_master import load_kis_master
+                from utils import set_us_ticker_excd_map, set_us_ticker_ovrs_excg_map
+
+                _mst = load_kis_master(self.market, cache_key=_dt.now(KST).strftime("%Y%m%d"))
+                if _mst is not None and not _mst.empty:
+                    if "EXCD" in _mst.columns:
+                        set_us_ticker_excd_map(dict(zip(_mst.index.astype(str), _mst["EXCD"].astype(str))))
+                    if "OvrsExcg" in _mst.columns:
+                        set_us_ticker_ovrs_excg_map(dict(zip(_mst.index.astype(str), _mst["OvrsExcg"].astype(str))))
+                    logger.info("US 거래소 맵 로드: %d tickers", len(_mst))
+            except Exception as e:
+                logger.warning("US 거래소 맵 로드 실패(티커별 EXCD 폴백): %s", e)
         self.rebuy_atr_k = float(self.trading_params.get("rebuy_atr_k", 0.0))
         self.rebuy_rsi_ceiling = float(self.trading_params.get("rebuy_rsi_ceiling", 100.0))
         self.min_cash_reserve = int(self.trading_params.get("min_cash_reserve", 0))
@@ -340,6 +372,44 @@ class Trader:
     def _t(self, ticker) -> str:
         """종목코드 정규화 (KR 6자리 / US 심볼)."""
         return normalize_ticker_6(ticker, self.market)
+
+    def _money(self, amount) -> str:
+        """MARKET에 맞는 통화 문자열 (US: USD, KR: 원)."""
+        return fmt_money(float(amount or 0), self.market)
+
+    def _log_account_snapshot(
+        self,
+        holdings: List[Dict],
+        cash_map: Dict[str, int],
+        available_cash: int,
+    ) -> None:
+        """계좌 스냅샷 요약 로그 (US/KR 통화 표기)."""
+        d2 = cash_map.get("prvs_rcdl_excc_amt", 0)
+        nx = cash_map.get("nxdy_excc_amt", 0)
+        dn = cash_map.get("dnca_tot_amt", 0)
+        tot = cash_map.get("tot_evlu_amt", 0)
+        hold_cnt = sum(1 for h in holdings if _to_int(h.get("hldg_qty", 0)) > 0)
+
+        if is_us_market(self.market):
+            orderable = d2 or cash_map.get("available_cash", 0) or cash_map.get("ord_psbl_frcr_amt", 0)
+            logger.info(
+                " 계좌 조회 완료\n"
+                f"보유종목: {hold_cnt}개\n"
+                f"주문가능(USD): {self._money(orderable)}\n"
+                f"예수금(USD): {self._money(dn)}\n"
+                f"총평가(USD): {self._money(tot)}\n"
+                f"→ 사용 가용예산: {self._money(available_cash)}"
+            )
+        else:
+            logger.info(
+                " 계좌 조회 완료\n"
+                f"보유종목: {hold_cnt}개\n"
+                f"D+2: {self._money(d2)}\n"
+                f"익일: {self._money(nx)}\n"
+                f"예수금: {self._money(dn)}\n"
+                f"총평가: {self._money(tot)}\n"
+                f"→ 사용 가용예산: {self._money(available_cash)}"
+            )
 
     def _load_latest_market_state(self) -> Optional[Dict[str, Any]]:
         """
@@ -598,29 +668,18 @@ class Trader:
     def get_account_info_from_files(self) -> Tuple[int, List[Dict], Dict[str, int]]:
         available_cash, holdings, cash_map = self._load_snapshot()
 
-        d2 = cash_map.get("prvs_rcdl_excc_amt", 0)
-        nx = cash_map.get("nxdy_excc_amt", 0)
-        dn = cash_map.get("dnca_tot_amt", 0)
-        tot = cash_map.get("tot_evlu_amt", 0)
-
         # 동적 현금 관리 적용
         if self.dynamic_cash_enabled:
             total_value = sum(_to_int(h.get("evlu_amt", 0)) for h in holdings if _to_int(h.get("hldg_qty", 0)) > 0) + available_cash
             adjusted_cash = self._apply_dynamic_cash_management(available_cash, total_value)
             
             if adjusted_cash != available_cash:
-                logger.info(f"동적 현금 관리 적용: {available_cash:,}원 → {adjusted_cash:,}원")
+                logger.info(
+                    f"동적 현금 관리 적용: {self._money(available_cash)} → {self._money(adjusted_cash)}"
+                )
                 available_cash = adjusted_cash
 
-        logger.info(
-            f" 계좌 조회 완료\n"
-            f"보유종목: {len(holdings)}개\n"
-            f"D+2: {d2:,}원\n"
-            f"익일: {nx:,}원\n"
-            f"예수금: {dn:,}원\n"
-            f"총평가: {tot:,}원\n"
-            f"→ 사용 가용예산: {available_cash:,}원"
-        )
+        self._log_account_snapshot(holdings, cash_map, available_cash)
         return available_cash, holdings, cash_map
 
     # ── 주문 안전 래퍼 ────────────────────────────────────────────────
@@ -964,7 +1023,7 @@ class Trader:
         self.pending_orders.append(pending_order)
         
         # 상세 로깅
-        logger.info(f" 미체결 주문 추가: {name}({ticker}) {side} {qty}주 @ {price:,.0f}원")
+        logger.info(f" 미체결 주문 추가: {name}({ticker}) {side} {qty}주 @ {self._money(price)}")
         logger.info(f"   주문번호: {order_id}, 주문시간: {pending_order['order_time']}")
         logger.info(f"   현재 미체결 주문 총 {len(self.pending_orders)}개")
         
@@ -1012,7 +1071,7 @@ class Trader:
             order_time = order.get("order_time", "N/A")
             order_id = order.get("order_id")
             
-            logger.info(f"체결 확인 중: {name}({ticker}) {side} {expected_qty}주 @ {price:,.0f}원 (주문시간: {order_time})")
+            logger.info(f"체결 확인 중: {name}({ticker}) {side} {expected_qty}주 @ {self._money(price)} (주문시간: {order_time})")
             
             # 현재 보유 수량 확인
             current_qty = self._get_qty(holdings, ticker)
@@ -1077,7 +1136,7 @@ class Trader:
                             price_df = self.kis.inquire_price(fid_cond_mrkt_div_code="J", fid_input_iscd=ticker)
                             if price_df is not None and not price_df.empty and 'stck_prpr' in price_df.columns:
                                 final_price = _to_int(price_df['stck_prpr'].iloc[0])
-                                logger.info(f"  -> 매도 체결가 조회: {final_price:,}원")
+                                logger.info(f"  -> 매도 체결가 조회: {self._money(final_price)}")
                         except Exception as e:
                             logger.warning(f"  -> 매도 체결가 조회 실패: {e}")
                     
@@ -1352,7 +1411,7 @@ class Trader:
             if validation.get('alert'):
                 logger.warning(f"[{context}] 체결 수량 검증 경고: {validation['message']}")
             if executed_qty > 0:
-                logger.info(f"[{context}] ✅ 즉시 체결: {name}({ticker}) {executed_qty}주 @ {price:,.0f}원")
+                logger.info(f"[{context}] ✅ 즉시 체결: {name}({ticker}) {executed_qty}주 @ {self._money(price)}")
                 odno = self._extract_order_id(res, order_id_key)
                 _executed_payload = {
                     "side": "buy", "ticker": ticker, "name": name,
@@ -1384,7 +1443,7 @@ class Trader:
                     }
                     _db_dbg_trade_in("trader.finalize_buy.PENDING_DB", _pending_payload, res=res)
                     record_trade(_pending_payload)
-                    logger.info(f"[{context}] 주문 제출 완료: {name}({ticker}) {requested_qty}주 @ {price:,.0f}원 (15시 20분 체결 확인, 당일 매도 방지 적용)")
+                    logger.info(f"[{context}] 주문 제출 완료: {name}({ticker}) {requested_qty}주 @ {self._money(price)} (15시 20분 체결 확인, 당일 매도 방지 적용)")
                 else:
                     logger.warning(
                         f"[{context}] 주문번호 없음 → DB pending 생략: {name}({ticker}) "
@@ -1565,7 +1624,7 @@ class Trader:
                 }
             
             # 2. 주문 실행
-            logger.info(f"[{batch_name}] 주문 실행: {name}({ticker}) {quantity}주 @ {price:,.0f}원")
+            logger.info(f"[{batch_name}] 주문 실행: {name}({ticker}) {quantity}주 @ {self._money(price)}")
             result = self._order_cash_retry(
                 ord_dv="01", pdno=ticker, ord_dvsn="01", 
                 ord_qty=str(quantity), ord_unpr=str(int(price))
@@ -1815,10 +1874,10 @@ class Trader:
             if status == 'executed':
                 self.executed_qty += qty
                 self.pending_orders.append((split_num, qty, 'executed', price))
-                logger.info(f"[SPLIT {split_num}/{self.splits}] ✅ {self.ticker} x{qty} @ {price:,} [EXECUTED]")
+                logger.info(f"[SPLIT {split_num}/{self.splits}] ✅ {self.ticker} x{qty} @ {self._money(price)} [EXECUTED]")
             else:
                 self.failed_orders.append((split_num, qty, status, price))
-                logger.info(f"[SPLIT {split_num}/{self.splits}] ❌ {self.ticker} x{qty} @ {price:,} [{status}]")
+                logger.info(f"[SPLIT {split_num}/{self.splits}] ❌ {self.ticker} x{qty} @ {self._money(price)} [{status}]")
         
         def is_fully_executed(self) -> bool:
             return self.executed_qty >= self.total_qty
@@ -1900,7 +1959,7 @@ class Trader:
             # 최소 슬라이스 금액/최소 주문 금액 체크
             if cash_i < max(self.min_order_cash, min_cash_per_slice):
                 logger.info(f"[SPLIT {i+1}/{slices}] 최소 슬라이스 금액 미달 → 스킵 "
-                            f"(need>={max(self.min_order_cash, min_cash_per_slice):,}, got={cash_i:,})")
+                            f"(need>={self._money(max(self.min_order_cash, min_cash_per_slice))}, got={self._money(cash_i)})")
                 continue
 
             # 수수료 버퍼 고려: qty_i 캡
@@ -1909,7 +1968,7 @@ class Trader:
                 logger.info(f"[SPLIT {i+1}/{slices}] 수수료 버퍼로 수량 0 → 스킵")
                 continue
 
-            logger.info(f"[SPLIT {i+1}/{slices}] BUY {name}({ticker}) x{qty_capped} @ {price_i:,} [{batch_name}]")
+            logger.info(f"[SPLIT {i+1}/{slices}] BUY {name}({ticker}) x{qty_capped} @ {self._money(price_i)} [{batch_name}]")
             if self.is_real_trading:
                 # 완전한 검증 시스템을 사용한 주문 실행 + 공통 후처리
                 context = f"SPLIT {i+1}/{slices}"
@@ -1949,7 +2008,7 @@ class Trader:
                     "qty": qty_capped, "price": price_i, "trade_status": "completed",
                     "strategy_details": {"batch": f"{batch_name}:SPLIT#{i+1}/{slices}"}
                 })
-                _notify_text(f" [모의] BUY {name}({ticker}) x{qty_capped} @ {price_i:,} [{batch_name}:SPLIT#{i+1}/{slices}]",
+                _notify_text(f" [모의] BUY {name}({ticker}) x{qty_capped} @ {self._money(price_i)} [{batch_name}:SPLIT#{i+1}/{slices}]",
                              key=f"phase:paper_buy:{ticker}:{self.run_id}", cooldown=20)
 
         if any_ok and self.is_real_trading:
@@ -1980,7 +2039,7 @@ class Trader:
         buffer = self._eff_buffer()
         budget = int(available_cash * (1 - buffer))
         if budget < 1:
-            logger.info(f"[{batch_name}] 예산 부족으로 매수 불가: {name}({ticker}), budget={budget:,}")
+            logger.info(f"[{batch_name}] 예산 부족으로 매수 불가: {name}({ticker}), budget={self._money(budget)}")
             return False
 
         # 현재가 조회 (실패 시 stock_info 가격 사용)
@@ -2010,7 +2069,7 @@ class Trader:
         # 최소 주문 금액 판정은 **금액 기준**으로
         if qty <= 0 or (self.min_order_cash > 0 and (qty * order_price) < self.min_order_cash):
             logger.info(f"[{batch_name}] 예산/최소주문 조건 불충족: {name}({ticker}) qty={qty}, "
-                        f"price={order_price:,}, spent={qty*order_price:,}, min_order_cash={self.min_order_cash:,}")
+                        f"price={self._money(order_price)}, spent={self._money(qty*order_price)}, min_order_cash={self._money(self.min_order_cash)}")
             return False
 
         # ★ 먼저 분할 매수 시도 (15시 20분 일괄 처리로 변경)
@@ -2019,7 +2078,7 @@ class Trader:
             return True  # 분할 경로에서 미체결 주문 리스트에 추가 완료
 
         # 분할이 비활성 또는 조건 미충족이면 단일 주문 (완전한 검증 시스템 적용)
-        logger.info(f"[{batch_name}] BUY {name}({ticker}) x{qty} @ {order_price:,}")
+        logger.info(f"[{batch_name}] BUY {name}({ticker}) x{qty} @ {self._money(order_price)}")
 
         if self.is_real_trading:
             # 완전 검증 + 공통 후처리 사용
@@ -2046,7 +2105,7 @@ class Trader:
                 "strategy_details": {"batch": batch_name}
             })
             _notify_text(
-                f" [모의] BUY {name}({ticker}) x{qty} @ {order_price:,} [{batch_name}]",
+                f" [모의] BUY {name}({ticker}) x{qty} @ {self._money(order_price)} [{batch_name}]",
                 key=f"phase:paper_buy_single:{ticker}:{self.run_id}", cooldown=30
             )
             # ✅ 매수 통계 반영(모의)
@@ -2275,13 +2334,13 @@ class Trader:
                     loss_pct = ((current_price - avg_price) / avg_price) * 100
                     logger.warning(
                         f"⚠️ 손절가 도달: {name}({ticker}) | "
-                        f"현재가={current_price:,}원, 매수가={avg_price:,.0f}원, 손실률={loss_pct:.2f}% | "
-                        f"손절가={stop_price:,}원, 손절임계값={stop_threshold:,}원"
+                        f"현재가={self._money(current_price)}, 매수가={self._money(avg_price)}, 손실률={loss_pct:.2f}% | "
+                        f"손절가={self._money(stop_price)}, 손절임계값={self._money(stop_threshold)}"
                     )
                 else:
                     logger.warning(
                         f"⚠️ 손절가 도달: {name}({ticker}) | "
-                        f"현재가={current_price:,}원 | 손절가={stop_price:,}원, 손절임계값={stop_threshold:,}원"
+                        f"현재가={self._money(current_price)} | 손절가={self._money(stop_price)}, 손절임계값={self._money(stop_threshold)}"
                     )
             else:
                 logger.info(f"매도 결정: {name}({ticker}) {quantity}주. 사유: {reason} | code={reason_code}")
@@ -2322,7 +2381,7 @@ class Trader:
                     avg_price = _to_float(holding.get("pchs_avg_pric"), 0.0)
                     if avg_price > 0:
                         current_price = int(avg_price)
-                        logger.warning(f"⚠️ [{ticker}] 가격 조회 실패, 보유 평균가 사용: {current_price:,}원")
+                        logger.warning(f"⚠️ [{ticker}] 가격 조회 실패, 보유 평균가 사용: {self._money(current_price)}")
                     else:
                         logger.error(f"❌ [{ticker}] 가격 정보 없음 (API 조회 실패, 평균가도 없음)")
 
@@ -3778,7 +3837,7 @@ class Trader:
                 side = '매수' if order.get('sll_buy_dvsn_cd', '') == '02' else '매도'
                 qty = order.get('ord_qty', '')
                 price = order.get('ord_unpr', '')
-                logger.info(f"  - {name}({ticker}) {side} {qty}주 @ {price}원")
+                logger.info(f"  - {name}({ticker}) {side} {qty}주 @ {self._money(price)}")
             
             # 모든 미체결 주문 취소
             cancelled_orders = self.kis.cancel_all_pending_orders()
@@ -3832,7 +3891,10 @@ class Trader:
             
             # 손실 제한 체크
             if max_daily_loss_amount > 0 and abs(total_loss) >= max_daily_loss_amount:
-                return False, f"일일 손실 금액 제한 초과: {abs(total_loss):,.0f}원 >= {max_daily_loss_amount:,}원"
+                return False, (
+                    f"일일 손실 금액 제한 초과: {self._money(abs(total_loss))} >= "
+                    f"{self._money(max_daily_loss_amount)}"
+                )
             
             if max_daily_loss_pct > 0 and total_value > 0:
                 loss_pct = abs(total_loss) / total_value
@@ -3888,7 +3950,7 @@ class Trader:
             _notify_text("ℹ️ 매수 로직 비활성화됨", key=f"buy_disabled:{self.run_id}", cooldown=600)
             return
         
-        logger.info(f"--------- 신규/추가 매수 로직 실행 (가용 예산: {available_cash:,} 원) ---------")
+        logger.info(f"--------- 신규/추가 매수 로직 실행 (가용 예산: {self._money(available_cash)}) ---------")
 
         # Phase 2: 일일 손실 제한 체크
         daily_loss_ok, daily_loss_msg = self._check_daily_loss_limit()
@@ -3966,14 +4028,16 @@ class Trader:
         affordable = [c for c in candidates_all if _to_int(c.get("Price", 0)) <= int(available_cash * (1 - buffer))]
 
         # 통계 로그(참고용) — 필터에는 min_order_cash를 사용하지 않음
-        log_affordability_stats(available_cash, buffer, candidates_all, min_order_cash=min_order)
+        log_affordability_stats(
+            available_cash, buffer, candidates_all, min_order_cash=min_order, market=self.market
+        )
 
         if self.screener_params.get("affordability_filter", False) and not affordable:
             # LOW_FUNDS 전에 회전 시도. 단, rotation.enabled=false이면 회전 매매를 절대 실행하지 않음
             if not self._is_rotation_enabled():
                 cheapest = min((_to_int(c.get("Price", 0)) for c in candidates_all), default=0)
                 self._set_summary_reason("SKIPPED_LOW_FUNDS_ROTATION_DISABLED",
-                                         f"cheapest={cheapest:,} cash={available_cash:,} buffer={buffer:.2%} min_order_cash={min_order:,}")
+                                         f"cheapest={self._money(cheapest)} cash={self._money(available_cash)} buffer={buffer:.2%} min_order_cash={self._money(min_order)}")
                 logger.info("가용 예산 부족 & 회전매매 비활성화 → 매수 종료.")
                 return
 
@@ -3981,7 +4045,7 @@ class Trader:
             if not rotated:
                 cheapest = min((_to_int(c.get("Price", 0)) for c in candidates_all), default=0)
                 self._set_summary_reason("SKIPPED_LOW_FUNDS_NO_ROTATION",
-                                         f"cheapest={cheapest:,} cash={available_cash:,} buffer={buffer:.2%} min_order_cash={min_order:,}")
+                                         f"cheapest={self._money(cheapest)} cash={self._money(available_cash)} buffer={buffer:.2%} min_order_cash={self._money(min_order)}")
                 logger.info("가용 예산 부족 & 회전 실패 → 매수 종료.")
                 return
             else:
@@ -4029,10 +4093,10 @@ class Trader:
             if not plans:
                 return
             if remaining_cash <= max(self.min_order_cash, self.min_cash_reserve):
-                logger.info(f"잔여 현금이 최소치 이하({remaining_cash:,}원)로 {batch_name} 스킵.")
+                logger.info(f"잔여 현금이 최소치 이하({self._money(remaining_cash)})로 {batch_name} 스킵.")
                 return
 
-            _notify_text(f" {batch_name} 매수 시도 {len(plans)}종목 (예산 {remaining_cash:,}원)",
+            _notify_text(f" {batch_name} 매수 시도 {len(plans)}종목 (예산 {self._money(remaining_cash)})",
                          key=f"phase:{batch_name.lower()}_start:{self.run_id}", cooldown=120)
             logger.info(f"총 {len(plans)}개 종목 {batch_name} 매수 시도. 유동적 예산 배분 + 버퍼 적용.")
 
@@ -4066,8 +4130,11 @@ class Trader:
                 # 4. 리스크 가드 적용 (enforce_per_ticker_limit)
                 if self.trading_guards.get("enforce_per_ticker_limit", False):
                     budget_for_this_stock = min(budget_for_this_stock, max_allowed_per_stock)
-                logger.info(f"  -> [{i+1}/{len(plans)}] {name}({ticker}) 배분 예산: {budget_for_this_stock:,.0f}원")
-                logger.info(f"      [POSITION_SIZING] max_allowed={max_allowed_per_stock:,.0f}, equal_share={equal_share:,.0f}, final_budget={budget_for_this_stock:,.0f}")
+                logger.info(f"  -> [{i+1}/{len(plans)}] {name}({ticker}) 배분 예산: {self._money(budget_for_this_stock)}")
+                logger.info(
+                    f"      [POSITION_SIZING] max_allowed={self._money(max_allowed_per_stock)}, "
+                    f"equal_share={self._money(equal_share)}, final_budget={self._money(budget_for_this_stock)}"
+                )
 
                 # 실시간 현재가 및 호가 정보 조회
                 price_info = self._get_realtime_price_with_quotes(ticker)
@@ -4084,7 +4151,7 @@ class Trader:
                 bid_price = price_info['bid_price']
                 ask_price = price_info['ask_price']
                 
-                logger.info(f"  -> [{name}({ticker})] 현재가: {current_price:,}원, 매수호가: {bid_price:,}원, 매도호가: {ask_price:,}원")
+                logger.info(f"  -> [{name}({ticker})] 현재가: {self._money(current_price)}, 매수호가: {self._money(bid_price)}, 매도호가: {self._money(ask_price)}")
 
                 # 수수료 버퍼 적용한 실예산
                 effective_budget = int(budget_for_this_stock * (1 - max(0.0, self.fee_buffer_pct)))
@@ -4104,8 +4171,8 @@ class Trader:
                 # 최소 주문 금액은 **수량×가격**으로 판정
                 if quantity == 0 or (self.min_order_cash > 0 and (quantity * order_price) < self.min_order_cash):
                     logger.info(f"  -> [{name}({ticker})] 예산/최소주문 미충족. "
-                                f"price={order_price:,}, budget={budget_for_this_stock:,}, "
-                                f"qty={quantity}, spent={quantity*order_price:,}, min_order_cash={self.min_order_cash:,}")
+                                f"price={self._money(order_price)}, budget={self._money(budget_for_this_stock)}, "
+                                f"qty={quantity}, spent={self._money(quantity*order_price)}, min_order_cash={self._money(self.min_order_cash)}")
                     _notify_embed(create_trade_embed({
                         "side": "BUY", "name": name, "ticker": ticker,
                         "qty": 0, "price": order_price, "trade_status": "skipped",
@@ -4119,7 +4186,7 @@ class Trader:
                     continue
 
                 pre_qty = 0  # 신규/리밸런스에서는 0 기준
-                logger.info(f"  -> 매수 준비: {name}({ticker}), 수량: {quantity}주, 지정가: {order_price:,.0f}원 [{batch_name}]")
+                logger.info(f"  -> 매수 준비: {name}({ticker}), 수량: {quantity}주, 지정가: {self._money(order_price)} [{batch_name}]")
 
                 # ① 분할 매수 먼저 시도
                 split_ok, spent_est = self._place_split_buy(name, ticker, quantity, order_price, batch_name)
@@ -4127,7 +4194,7 @@ class Trader:
                     any_order_placed = True
                     # 분할 경로는 내부에서 스냅샷/통계 반영. remaining_cash는 보수적으로 추정 차감
                     remaining_cash = max(0, remaining_cash - spent_est)
-                    logger.info(f"  -> [SPLIT] 남은 예산(추정): {remaining_cash:,.0f}원")
+                    logger.info(f"  -> [SPLIT] 남은 예산(추정): {self._money(remaining_cash)}")
                     continue
 
                 # ② 분할이 아니면 단일 주문 (개선된 로직)
@@ -4370,13 +4437,13 @@ class Trader:
                         "gpt_analysis": plan,
                         "strategy_details": {"batch": batch_name}
                     })
-                    logger.info(f"  -> [모의] {name}({ticker}) {quantity}주 @{order_price:,.0f}원 지정가 매수 실행. [{batch_name}]")
+                    logger.info(f"  -> [모의] {name}({ticker}) {quantity}주 @{self._money(order_price)} 지정가 매수 실행. [{batch_name}]")
                     _notify_text(
-                        f" [모의] BUY {name}({ticker}) x{quantity} @ {order_price:,.0f} [{batch_name}]",
+                        f" [모의] BUY {name}({ticker}) x{quantity} @ {self._money(order_price)} [{batch_name}]",
                         key=f"phase:paper_buy:{ticker}:{self.run_id}", cooldown=30
                     )
 
-                logger.info(f"  -> 남은 예산: {remaining_cash:,.0f}원")
+                logger.info(f"  -> 남은 예산: {self._money(remaining_cash)}")
                 # time.sleep(0.3)  # 불필요한 대기 시간 제거
 
         # 1) 추가매수 먼저
@@ -4458,7 +4525,7 @@ class Trader:
                     feasible_buy = (px > 0) and (qty1 >= 1) and ((self.min_order_cash <= 0) or (qty1 * px >= self.min_order_cash))
 
                 logger.info(
-                    f"[SWAP-SIM] expected_cash={expected_cash:,}, eff_slots_after={eff_after}, "
+                    f"[SWAP-SIM] expected_cash={self._money(expected_cash)}, eff_slots_after={eff_after}, "
                     f"slots_after={slots_after}, feasible_buy={'YES' if feasible_buy else 'NO'}"
                 )
 
@@ -4493,7 +4560,7 @@ class Trader:
                     eff_now = self._compute_effective_slots(new_cash) if self.trading_guards.get("auto_shrink_slots", False) else self.max_positions
                     slots_now = max(0, eff_now - len(holdings_after))
 
-                    logger.info(f"[SWAP-AFTER] new_cash={new_cash:,}, eff_slots_now={eff_now}, slots_now={slots_now}")
+                    logger.info(f"[SWAP-AFTER] new_cash={self._money(new_cash)}, eff_slots_now={eff_now}, slots_now={slots_now}")
                     if slots_now > 0:
                         buy_now = to_buy_plans[:slots_now]
                         logger.info(f"회전 매매 매수 시작: {len(buy_now)}개 종목 (슬롯: {slots_now}개)")
@@ -4543,7 +4610,7 @@ class Trader:
         if not targets:
             return
             
-        logger.info(f"순차적 매수 시작: {len(targets)}개 종목, 예산: {available_cash:,}원")
+        logger.info(f"순차적 매수 시작: {len(targets)}개 종목, 예산: {self._money(available_cash)}")
         
         # 병렬로 모든 종목의 가격 정보 미리 조회
         logger.info("병렬 가격 조회 시작...")
@@ -4582,7 +4649,7 @@ class Trader:
             
             for i, plan in enumerate(round_targets):
                 if remaining_cash <= max(self.min_order_cash, self.min_cash_reserve):
-                    logger.info(f"잔여 현금 부족({remaining_cash:,}원)으로 매수 중단")
+                    logger.info(f"잔여 현금 부족({self._money(remaining_cash)})으로 매수 중단")
                     break
                     
                 info = plan.get("stock_info", {})
@@ -4607,8 +4674,11 @@ class Trader:
                 if self.trading_guards.get("enforce_per_ticker_limit", False):
                     budget_for_this_stock = min(budget_for_this_stock, max_allowed_per_stock)
                 
-                logger.info(f"  -> [{i+1}/{len(round_targets)}] {name}({ticker}) 배분 예산: {budget_for_this_stock:,}원")
-                logger.info(f"      [ROTATION_SIZING] max_allowed={max_allowed_per_stock:,}, equal_share={equal_share:,}, final_budget={budget_for_this_stock:,}")
+                logger.info(f"  -> [{i+1}/{len(round_targets)}] {name}({ticker}) 배분 예산: {self._money(budget_for_this_stock)}")
+                logger.info(
+                    f"      [ROTATION_SIZING] max_allowed={self._money(max_allowed_per_stock)}, "
+                    f"equal_share={self._money(equal_share)}, final_budget={self._money(budget_for_this_stock)}"
+                )
                 
                 # 매수 시도
                 success = self._try_single_buy(plan, budget_for_this_stock, round_num + 1)
@@ -4621,7 +4691,7 @@ class Trader:
                     new_cash, new_holdings, _ = self._load_snapshot()
                     remaining_cash = new_cash
                     round_success = True
-                    logger.info(f"  -> ✅ {name}({ticker}) 매수 성공, 잔여 현금: {remaining_cash:,}원")
+                    logger.info(f"  -> ✅ {name}({ticker}) 매수 성공, 잔여 현금: {self._money(remaining_cash)}")
                 else:
                     failed_targets.append(plan)
                     logger.info(f"  -> ❌ {name}({ticker}) 매수 실패")
@@ -4674,7 +4744,7 @@ class Trader:
                     quantity = min_qty_by_price
                     logger.info(f"  -> [{name}({ticker})] 최소 주문 금액 기준으로 수량 조정: {quantity}주")
                 else:
-                    logger.warning(f"  -> [{name}({ticker})] 수량 계산 실패 (예산: {budget:,}원, 최소주문: {self.min_order_cash:,}원)")
+                    logger.warning(f"  -> [{name}({ticker})] 수량 계산 실패 (예산: {self._money(budget)}, 최소주문: {self._money(self.min_order_cash)})")
                     return False
             
             # 동적 지정가 계산
@@ -4691,7 +4761,7 @@ class Trader:
                 logger.warning(f"  -> [{name}({ticker})] 최소 주문 금액 미충족")
                 return False
             
-            logger.info(f"  -> 매수 준비: {name}({ticker}), 수량: {quantity}주, 지정가: {order_price:,}원 [라운드{round_num}]")
+            logger.info(f"  -> 매수 준비: {name}({ticker}), 수량: {quantity}주, 지정가: {self._money(order_price)} [라운드{round_num}]")
             
             # 예산이 충분하면 분할 매수 시도, 아니면 단일 주문
             min_cash_per_slice = self.trading_params.get("split_buy", {}).get("min_cash_per_slice", 50000)
@@ -4733,7 +4803,7 @@ class Trader:
             
             # 단일 지정가 주문 시도
             if self.is_real_trading:
-                logger.info(f"  -> 단일 지정가 주문 시도: {name}({ticker}) {quantity}주 @ {order_price:,}원")
+                logger.info(f"  -> 단일 지정가 주문 시도: {name}({ticker}) {quantity}주 @ {self._money(order_price)}")
                 res = self._order_cash_retry(
                     ord_dv="02", pdno=ticker, ord_dvsn="00",
                     ord_qty=str(quantity), ord_unpr=str(int(order_price))
@@ -4760,7 +4830,7 @@ class Trader:
                         return True
                     else:
                         # 주문 접수 성공, 미체결 상태
-                        logger.info(f"  -> 단일 지정가 주문 접수 완료: {name}({ticker}) {quantity}주 @ {order_price:,}원 (미체결, 15시 20분 체결 확인)")
+                        logger.info(f"  -> 단일 지정가 주문 접수 완료: {name}({ticker}) {quantity}주 @ {self._money(order_price)} (미체결, 15시 20분 체결 확인)")
                         odno = self._extract_order_id(res)
                         if odno:
                             record_trade({
@@ -4852,7 +4922,7 @@ class Trader:
                             px = round_to_tick(best_ask + get_tick_size(best_ask), mode="up")
                         except Exception:
                             pass
-                        logger.info(f"  -> 시장성 지정가 주문 시도: {name}({ticker}) {quantity}주 @ {px:,}원")
+                        logger.info(f"  -> 시장성 지정가 주문 시도: {name}({ticker}) {quantity}주 @ {self._money(px)}")
                         alt_res = self._order_cash_retry(
                             ord_dv="02", pdno=ticker, ord_dvsn="00",
                             ord_qty=str(quantity), ord_unpr=str(int(px))
@@ -5307,12 +5377,12 @@ if __name__ == "__main__":
         # 세션 시작 가드
         usable_cash = cash0
         if trader.reporting.get("include_cash_breakdown", False):
-            logger.info(f"usable_cash={usable_cash:,}")
-        if trader.trading_guards.get("skip_when_low_funds", False) and \
-           usable_cash < int(trader.trading_guards.get("min_total_cash_to_trade", 0)):
+            logger.info(f"usable_cash={trader._money(usable_cash)}")
+        min_trade = int(trader.trading_guards.get("min_total_cash_to_trade", 0))
+        if trader.trading_guards.get("skip_when_low_funds", False) and usable_cash < min_trade:
             trader._set_summary_reason(
                 "SKIPPED_LOW_FUNDS_SESSION",
-                f"cash {usable_cash:,} < min_total_cash_to_trade {int(trader.trading_guards.get('min_total_cash_to_trade', 0)):,}"
+                f"cash {trader._money(usable_cash)} < min_total_cash_to_trade {trader._money(min_trade)}",
             )
             trader.emit_final_summary(start_ts, status="SUCCESS", warnings=0)
             sys.exit(0)
@@ -5335,7 +5405,9 @@ if __name__ == "__main__":
             for attempt in range(max_retries):
                 cash1, holdings1, _ = trader.get_account_info_from_files()
                 if cash1 > cash0:  # 현금이 증가했으면 매도 성공
-                    logger.info(f"매도 후 계좌 상태: 현금 {cash1:,}원, 보유종목 {len(holdings1)}개")
+                    logger.info(
+                        f"매도 후 계좌 상태: 현금 {trader._money(cash1)}, 보유종목 {len(holdings1)}개"
+                    )
                     break
                 elif attempt < max_retries - 1:
                     logger.warning(f"매도 후 현금 증가 미확인 (시도 {attempt + 1}/{max_retries}), 재시도...")
@@ -5345,7 +5417,9 @@ if __name__ == "__main__":
         else:
             # 매도가 없었으면 기존 정보 사용
             cash1, holdings1 = cash0, holdings0
-            logger.info(f"매도 없음 → 기존 계좌 상태 유지: 현금 {cash1:,}원, 보유종목 {len(holdings1)}개")
+            logger.info(
+                f"매도 없음 → 기존 계좌 상태 유지: 현금 {trader._money(cash1)}, 보유종목 {len(holdings1)}개"
+            )
         
         # 회전 샌드박스 제안 로깅
         trader._log_gpt_rotation_sandbox()
@@ -5399,7 +5473,7 @@ if __name__ == "__main__":
         # 종료 시점 간단 상태 로그(참고용)
         if trader.is_real_trading:
             cash_end, holdings_end, _ = trader.get_account_info_from_files()
-            logger.info(f"[END] 보유: {len(holdings_end)}개, 예수금: {cash_end:,}원")
+            logger.info(f"[END] 보유: {len(holdings_end)}개, 예수금: {trader._money(cash_end)}")
         else:
             logger.info("[END][MOCK] 실거래 아님 → 최종 보유/예수금은 실계좌 스냅샷과 다를 수 있음(모의 체결은 DB에만 기록).")
 

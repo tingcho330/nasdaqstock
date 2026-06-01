@@ -10,6 +10,8 @@ from datetime import datetime, time as dt_time, timedelta
 from typing import Dict, Tuple, Optional, List
 
 # ── 공통 유틸/노티파이어 ────────────────────────────────────────────────
+from pathlib import Path
+
 from utils import (
     KST,
     OUTPUT_DIR,
@@ -20,6 +22,9 @@ from utils import (
     get_account_snapshot_cached,
     check_min_holding_period,
     check_min_holding_hours,
+    fmt_money,
+    fmt_money_signed,
+    is_us_market,
 )
 from notifier import (
     DiscordLogHandler,
@@ -64,8 +69,20 @@ if WEBHOOK_URL and is_valid_webhook(WEBHOOK_URL):
 else:
     logger.warning("유효한 DISCORD_WEBHOOK_URL이 없어 에러 로그의 디스코드 전송을 비활성화합니다.")
 
-ACCOUNT_SCRIPT_PATH = "/app/src/account.py"
-TRADER_SCRIPT_PATH = "/app/src/trader.py"  # [NEW] 파이프라인 트리거 대상
+_SRC_DIR = Path(__file__).resolve().parent
+ACCOUNT_SCRIPT_PATH = str(_SRC_DIR / "account.py")
+TRADER_SCRIPT_PATH = str(_SRC_DIR / "trader.py")
+
+def _market() -> str:
+    return os.getenv("MARKET", "SP500")
+
+
+def _money(amount) -> str:
+    return fmt_money(float(amount or 0), _market())
+
+
+def _money_signed(amount) -> str:
+    return fmt_money_signed(float(amount or 0), _market())
 
 # ── 장중 정의(평일 09:00~15:30) ────────────────────────────────────────
 MARKET_START = dt_time(9, 0)
@@ -132,7 +149,7 @@ def _notify_sell_embed(holding: Dict, reason: str, decision_type: str = "SELL",
     """매도 판단 시 하이라이트된 Discord embed 메시지 전송 (쿨다운 적용)."""
     try:
         now = pytime.time()
-        ticker = normalize_ticker_6(holding.get("pdno", ""), os.getenv("MARKET", "NASDAQ100"))
+        ticker = normalize_ticker_6(holding.get("pdno", ""), os.getenv("MARKET", "SP500"))
         unique_key = f"{key}_{ticker}"
         
         if unique_key not in _last_sent or now - _last_sent[unique_key] >= cooldown_sec:
@@ -183,22 +200,22 @@ def _notify_sell_embed(holding: Dict, reason: str, decision_type: str = "SELL",
                 },
                 {
                     "name": "현재가",
-                    "value": f"{cur_price:,}원",
+                    "value": f"{_money(cur_price)}",
                     "inline": True
                 },
                 {
                     "name": "매수가",
-                    "value": f"{avg_price:,.0f}원",
+                    "value": f"{_money(avg_price)}",
                     "inline": True
                 },
                 {
                     "name": "손익",
-                    "value": f"{profit_loss:+,}원 ({profit_rate:+.2f}%)",
+                    "value": f"{_money_signed(profit_loss)} ({profit_rate:+.2f}%)",
                     "inline": True
                 },
                 {
                     "name": "평가금액",
-                    "value": f"{eval_amt:,}원",
+                    "value": f"{_money(eval_amt)}",
                     "inline": True
                 },
                 {
@@ -582,7 +599,7 @@ class RiskManager:
         - entry_price: 진입가가 없다면 현재가를 그대로 넣어도 됨
         인터페이스 보장: 항상 {'손절가','목표가','RSI','Price','source'} 포함.
         """
-        t = normalize_ticker_6(ticker, os.getenv("MARKET", "NASDAQ100"))
+        t = normalize_ticker_6(ticker, os.getenv("MARKET", "SP500"))
         ep = float(entry_price)
         risk_params = self.config.get("risk_params", {}) or {}
         strategy_params = self.config.get("strategy_params", {}) or {}  # Phase 1: strategy_params 추가
@@ -616,7 +633,7 @@ class RiskManager:
                         out["손절가"] = int(round(stop_loss))
                         out["목표가"] = int(round(target))
                         out["source"] = str(levels.get("source", "core_levels"))
-                        logger.debug(f"[{t}] 손절/목표가 업데이트: {out['손절가']:,}/{out['목표가']:,} ({out['source']})")
+                        logger.debug(f"[{t}] 손절/목표가 업데이트: {_money(out['손절가'])}/{_money(out['목표가'])} ({out['source']})")
                     else:
                         logger.warning(f"[{t}] 잘못된 손절/목표가 값: {stop_loss}/{target}")
         except Exception as e:
@@ -788,7 +805,7 @@ class RiskManager:
 
     # ── [NEW] 전일 종가 조회(세션 캐시) ───────────────────────────────
     def _get_prev_close(self, ticker: str) -> Optional[int]:
-        t = normalize_ticker_6(ticker, os.getenv("MARKET", "NASDAQ100"))
+        t = normalize_ticker_6(ticker, os.getenv("MARKET", "SP500"))
         if t in self._prev_close_cache:
             return self._prev_close_cache[t]
         try:
@@ -845,7 +862,7 @@ class RiskManager:
         )
         cash_map = extract_cash_from_summary(
             summary_dict,
-            market=os.getenv("MARKET", "NASDAQ100"),
+            market=os.getenv("MARKET", "SP500"),
         )
         return (
             cash_map,
@@ -881,7 +898,7 @@ class RiskManager:
 
         available = int(cash_map.get("available_cash") or cash_map.get("dnca_tot_amt") or 0)
         if available < self.min_cash_to_trigger:
-            return False, f"가용 현금 부족 {available:,} < {self.min_cash_to_trigger:,}"
+            return False, f"가용 현금 부족 {_money(available)} < {_money(self.min_cash_to_trigger)}"
 
         # 쿨다운
         if not _can_trigger("trigger_trader_when_empty", self.auto_trigger_cooldown_sec):
@@ -932,7 +949,7 @@ class RiskManager:
         1. 기본 규칙 (안전장치) - 손절가/목표가/RSI/전일종가 이탈/보유일수/부분 익절
         2. 고급 전략 (strategies.py) - 가중치 조합 전략
         """
-        ticker = normalize_ticker_6(holding.get("pdno", ""), os.getenv("MARKET", "NASDAQ100"))
+        ticker = normalize_ticker_6(holding.get("pdno", ""), os.getenv("MARKET", "SP500"))
         name = holding.get("prdt_name", "N/A")
         qty = _to_int(holding.get("hldg_qty", 0))
         cur_price = _to_int(holding.get("prpr", 0))  # 현재가
@@ -944,8 +961,8 @@ class RiskManager:
         # 판단 시작 로그
         logger.info(
             f"[판단시작] {name}({ticker}) | "
-            f"수량={qty:,}주, 현재가={cur_price:,}원, 매수가={avg_price:,.0f}원 | "
-            f"평가금액={eval_amt:,}원, 손익={profit_loss:+,}원, 손익률={profit_rate:.2f}%"
+            f"수량={qty:,}주, 현재가={_money(cur_price)}, 매수가={_money(avg_price)} | "
+            f"평가금액={_money(eval_amt)}, 손익={_money_signed(profit_loss)}, 손익률={profit_rate:.2f}%"
         )
         
         if qty <= 0 or cur_price <= 0:
@@ -988,7 +1005,7 @@ class RiskManager:
 
     def _check_basic_rules(self, holding: Dict, stock_info: Dict) -> Tuple[str, str, Dict]:
         """Phase 1: 당일 매도 방지 체크 추가"""
-        ticker = normalize_ticker_6(holding.get("pdno", ""), os.getenv("MARKET", "NASDAQ100"))
+        ticker = normalize_ticker_6(holding.get("pdno", ""), os.getenv("MARKET", "SP500"))
         
         # Phase 1.4: 당일 매도 방지 체크
         trading_params = self.config.get("trading_params", {})
@@ -1014,7 +1031,7 @@ class RiskManager:
         
         # 기존 로직 계속
         """기본 매도 규칙 체크 (기존 로직)"""
-        ticker = normalize_ticker_6(holding.get("pdno", ""), os.getenv("MARKET", "NASDAQ100"))
+        ticker = normalize_ticker_6(holding.get("pdno", ""), os.getenv("MARKET", "SP500"))
         name = holding.get("prdt_name", "N/A")
         qty = _to_int(holding.get("hldg_qty", 0))
         cur_price = _to_int(holding.get("prpr", 0))
@@ -1030,9 +1047,9 @@ class RiskManager:
             entry_price = _to_float(holding.get("pchs_avg_pric"), 0.0)
             if entry_price <= 0:
                 entry_price = float(cur_price)
-                logger.warning(f"[{ticker}] 매수 평균가 없음, 현재가로 손절가 계산: {entry_price:,}원")
+                logger.warning(f"[{ticker}] 매수 평균가 없음, 현재가로 손절가 계산: {_money(entry_price)}")
             else:
-                logger.debug(f"[{ticker}] 매수 평균가 기준 손절가 계산: {entry_price:,}원")
+                logger.debug(f"[{ticker}] 매수 평균가 기준 손절가 계산: {_money(entry_price)}")
             backup = _percent_backup_levels(entry_price, self.config.get("risk_params", {}) or {})
             stop_px = float(backup["손절가"]); take_px = float(backup["목표가"])
             levels_source = "percent_backup"
@@ -1046,7 +1063,7 @@ class RiskManager:
         tp_threshold   = take_px * (1.0 - self.rules.take_profit_buffer) if (self.rules.take_profit_buffer and take_px > 0) else take_px
         
         # 손절가 계산 디버깅 로그
-        logger.debug(f"[{ticker}] 손절가 체크: 현재가={cur_price:,}, 손절가={stop_px:,.0f}, 손절임계값={stop_threshold:,.0f}, 손절버퍼={self.rules.stop_loss_buffer}, 도달여부={cur_price <= stop_threshold}")
+        logger.debug(f"[{ticker}] 손절가 체크: 현재가={_money(cur_price)}, 손절가={_money(stop_px)}, 손절임계값={_money(stop_threshold)}, 손절버퍼={self.rules.stop_loss_buffer}, 도달여부={cur_price <= stop_threshold}")
 
         # RSI 확보 (미존재 시 50.0 + 지표부재 표기)
         rsi_raw = stock_info.get("RSI")
@@ -1065,8 +1082,8 @@ class RiskManager:
         # 판단 조건 요약 로그
         logger.info(
             f"[판단조건] {name}({ticker}) | "
-            f"손절: 현재가={cur_price:,} vs 임계값={stop_threshold:,.0f} ({'도달' if cur_price <= stop_threshold else '미도달'}) | "
-            f"목표: 현재가={cur_price:,} vs 임계값={tp_threshold:,.0f} ({'도달' if cur_price >= tp_threshold else '미도달'}) | "
+            f"손절: 현재가={_money(cur_price)} vs 임계값={_money(stop_threshold)} ({'도달' if cur_price <= stop_threshold else '미도달'}) | "
+            f"목표: 현재가={_money(cur_price)} vs 임계값={_money(tp_threshold)} ({'도달' if cur_price >= tp_threshold else '미도달'}) | "
             f"RSI: {rsi:.1f} vs {self.rules.rsi_take_profit} ({'과열' if (self.rules.rsi_take_profit and rsi >= self.rules.rsi_take_profit) else '정상'})"
         )
 
@@ -1102,10 +1119,10 @@ class RiskManager:
             pass
 
         # 1) 손절 전략 (시간대 필터 적용)
-        logger.debug(f"[{ticker}] 손절가체크] 손절가={stop_px:,.0f}, 임계값={stop_threshold:,.0f}, 현재가={cur_price:,}, 조건={stop_threshold > 0 and cur_price <= stop_threshold}")
+        logger.debug(f"[{ticker}] 손절가체크] 손절가={_money(stop_px)}, 임계값={_money(stop_threshold)}, 현재가={_money(cur_price)}, 조건={stop_threshold > 0 and cur_price <= stop_threshold}")
         if stop_threshold > 0 and cur_price <= stop_threshold:
             if not sell_win_ok:
-                logger.info(f"[{ticker}] ⚠️ 손절가 도달했으나 매도 시간대 아님: 현재가={cur_price:,}, 손절임계값={stop_threshold:,.0f}, 시간대={self.rules.time_windows_for_sells}")
+                logger.info(f"[{ticker}] ⚠️ 손절가 도달했으나 매도 시간대 아님: 현재가={_money(cur_price)}, 손절임계값={_money(stop_threshold)}, 시간대={self.rules.time_windows_for_sells}")
             else:
                 # 최소 보유일수 체크
                 rotation_config = self.config.get("rotation", {})
@@ -1115,13 +1132,13 @@ class RiskManager:
                 if min_holding_days > 0 and not is_eligible:
                     logger.info(
                         f"[{ticker}] ⚠️ 손절가 도달했으나 최소 보유일수 미충족: "
-                        f"현재가={cur_price:,}, 손절임계값={stop_threshold:,.0f}, "
+                        f"현재가={_money(cur_price)}, 손절임계값={_money(stop_threshold)}, "
                         f"보유일수={holding_days}일 < 최소 {min_holding_days}일 → 유지"
                     )
                     return (
                         "KEEP",
                         f"손절가 도달했으나 최소 보유일수 미충족 ({holding_days}일 < {min_holding_days}일) | "
-                        f"현재가={cur_price:,}, 손절임계값={stop_threshold:,.0f}",
+                        f"현재가={_money(cur_price)}, 손절임계값={_money(stop_threshold)}",
                         {
                             "type": "KEEP_MIN_HOLDING",
                             "context": {
@@ -1136,8 +1153,8 @@ class RiskManager:
                 
                 # 최소 보유일수 충족 또는 체크 없음 → 손절 진행
                 log_msg = (
-                    f"[{ticker}] ✅ 손절가 도달 조건 충족: 현재가={cur_price:,} ≤ 손절임계값={stop_threshold:,.0f} "
-                    f"(손절가={stop_px:,.0f}, 버퍼={self.rules.stop_loss_buffer}"
+                    f"[{ticker}] ✅ 손절가 도달 조건 충족: 현재가={_money(cur_price)} ≤ 손절임계값={_money(stop_threshold)} "
+                    f"(손절가={_money(stop_px)}, 버퍼={self.rules.stop_loss_buffer}"
                 )
                 if holding_days > 0:
                     log_msg += f", 보유일수={holding_days}일"
@@ -1160,7 +1177,7 @@ class RiskManager:
                 
                 return (
                     "SELL",
-                    f"손절가 도달({cur_price:,} ≤ {int(round(stop_threshold)):,}) | "
+                    f"손절가 도달({_money(cur_price)} ≤ {_money(stop_threshold)}) | "
                     f"전략=StopLoss, levels_source={levels_source} | "
                     f"win={self.rules.time_windows_for_sells or 'ALL'}",
                     context
@@ -1225,12 +1242,12 @@ class RiskManager:
                         )
         
         # 2) 목표가 전략 (시간대 필터 적용: 없으면 전반 윈도우 사용)
-        logger.debug(f"[{ticker}] 목표가체크] 목표가={take_px:,.0f}, 임계값={tp_threshold:,.0f}, 현재가={cur_price:,}, 조건={tp_threshold > 0 and cur_price >= tp_threshold and tp_win_ok}")
+        logger.debug(f"[{ticker}] 목표가체크] 목표가={_money(take_px)}, 임계값={_money(tp_threshold)}, 현재가={_money(cur_price)}, 조건={tp_threshold > 0 and cur_price >= tp_threshold and tp_win_ok}")
         if tp_threshold > 0 and cur_price >= tp_threshold and tp_win_ok:
-            logger.info(f"[{ticker}] ✅ 목표가 도달 조건 충족: 현재가={cur_price:,} ≥ 목표임계값={tp_threshold:,.0f} (목표가={take_px:,.0f}, 버퍼={self.rules.take_profit_buffer})")
+            logger.info(f"[{ticker}] ✅ 목표가 도달 조건 충족: 현재가={_money(cur_price)} ≥ 목표임계값={_money(tp_threshold)} (목표가={_money(take_px)}, 버퍼={self.rules.take_profit_buffer})")
             return (
                 "SELL",
-                f"목표가 도달({cur_price:,} ≥ {int(round(tp_threshold)):,}) | 전략=TakeProfit, levels_source={levels_source} | win={self.rules.time_windows_for_take_profit or self.rules.time_windows_for_sells or 'ALL'}",
+                f"목표가 도달({_money(cur_price)} ≥ {_money(tp_threshold)}) | 전략=TakeProfit, levels_source={levels_source} | win={self.rules.time_windows_for_take_profit or self.rules.time_windows_for_sells or 'ALL'}",
                 {
                     "type": "TakeProfit",
                     "context": {
@@ -1394,7 +1411,7 @@ class RiskManager:
             prev_close = self._get_prev_close(ticker)
             if prev_close and prev_close > 0:
                 thresh = int(round(prev_close * (1.0 - float(self.rules.prev_close_buffer_pct))))
-                logger.debug(f"[{ticker}] 전일종가체크] 전일종가={prev_close:,}, 임계값={thresh:,}, 현재가={cur_price:,}, 조건={cur_price <= thresh}")
+                logger.debug(f"[{ticker}] 전일종가체크] 전일종가={_money(prev_close)}, 임계값={_money(thresh)}, 현재가={_money(cur_price)}, 조건={cur_price <= thresh}")
                 if cur_price <= thresh:
                     # 최소 보유일수 체크
                     is_eligible, holding_days = self._check_min_holding_period(ticker)
@@ -1404,13 +1421,13 @@ class RiskManager:
                     if min_holding_days > 0 and not is_eligible:
                         logger.info(
                             f"[{ticker}] ⚠️ 전일 종가 이탈 조건 충족했으나 최소 보유일수 미충족: "
-                            f"현재가={cur_price:,} ≤ 임계값={thresh:,}, "
+                            f"현재가={_money(cur_price)} ≤ 임계값={_money(thresh)}, "
                             f"보유일수={holding_days}일 < 최소 {min_holding_days}일 → 유지"
                         )
                         return (
                             "KEEP",
                             f"전일 종가 이탈 조건 충족했으나 최소 보유일수 미충족 ({holding_days}일 < {min_holding_days}일) | "
-                            f"현재가={cur_price:,} ≤ 임계값={thresh:,} (전일종가={prev_close:,})",
+                            f"현재가={_money(cur_price)} ≤ 임계값={_money(thresh)} (전일종가={_money(prev_close)})",
                             {
                                 "type": "KEEP_MIN_HOLDING",
                                 "context": {
@@ -1427,8 +1444,8 @@ class RiskManager:
                     # 최소 보유일수 충족 또는 체크 없음 → 전일 종가 이탈 매도 진행
                     confirm_note = f", confirm={self.rules.confirm_bars_for_break}D" if self.rules.confirm_bars_for_break > 0 else ""
                     log_msg = (
-                        f"[{ticker}] ✅ 전일 종가 이탈 조건 충족: 현재가={cur_price:,} ≤ 임계값={thresh:,} "
-                        f"(전일종가={prev_close:,}, 버퍼={self.rules.prev_close_buffer_pct:.2%}"
+                        f"[{ticker}] ✅ 전일 종가 이탈 조건 충족: 현재가={_money(cur_price)} ≤ 임계값={_money(thresh)} "
+                        f"(전일종가={_money(prev_close)}, 버퍼={self.rules.prev_close_buffer_pct:.2%}"
                     )
                     if holding_days > 0:
                         log_msg += f", 보유일수={holding_days}일"
@@ -1451,7 +1468,7 @@ class RiskManager:
                     
                     return (
                         "SELL",
-                        f"전일 종가 이탈({cur_price:,} ≤ {thresh:,}) | 전략=PrevCloseBreak{confirm_note}, levels_source={levels_source} | prev_close={prev_close:,} | win={self.rules.time_windows_for_sells or 'ALL'}",
+                        f"전일 종가 이탈({_money(cur_price)} ≤ {_money(thresh)}) | 전략=PrevCloseBreak{confirm_note}, levels_source={levels_source} | prev_close={_money(prev_close)} | win={self.rules.time_windows_for_sells or 'ALL'}",
                         context
                     )
         # 5) 보유일수 상한
@@ -1481,15 +1498,15 @@ class RiskManager:
         # 모든 매도 조건 미충족 → 유지
         logger.info(
             f"[{ticker}] ✅ 모든 매도 조건 미충족 → 유지 결정 | "
-            f"손절: {cur_price:,} > {stop_threshold:,.0f} | "
-            f"목표: {cur_price:,} < {tp_threshold:,.0f} | "
+            f"손절: {_money(cur_price)} > {_money(stop_threshold)} | "
+            f"목표: {_money(cur_price)} < {_money(tp_threshold)} | "
             f"RSI: {rsi:.1f} < {self.rules.rsi_take_profit if self.rules.rsi_take_profit else 'N/A'} | "
             f"전일종가이탈: {('활성화' if self.rules.prev_close_break_sell else '비활성화')} | "
             f"보유일수: {('정상' if not self.rules.max_holding_days else '정상')}"
         )
         return (
             "KEEP",
-            f"유지: {name}({ticker}) 현재가={cur_price:,}, 손절={int(round(stop_px)) if stop_px else 'N/A'}, "
+            f"유지: {name}({ticker}) 현재가={_money(cur_price)}, 손절={_money(stop_px) if stop_px else 'N/A'}, "
             f"목표={int(round(take_px)) if take_px else 'N/A'}, RSI={rsi:.1f}{rsi_note}, levels_source={levels_source}"
             f", win_sell={self.rules.time_windows_for_sells or 'ALL'}",
             {
@@ -1508,7 +1525,7 @@ class RiskManager:
 
     def _check_advanced_strategies(self, holding: Dict, stock_info: Dict) -> Tuple[str, str, Dict]:
         """고급 전략 체크 (strategies.py 사용)"""
-        ticker = normalize_ticker_6(holding.get("pdno", ""), os.getenv("MARKET", "NASDAQ100"))
+        ticker = normalize_ticker_6(holding.get("pdno", ""), os.getenv("MARKET", "SP500"))
         name = holding.get("prdt_name", "N/A")
         cur_price = _to_int(holding.get("prpr", 0))
         avg_price = _to_float(holding.get("pchs_avg_pric"), 0.0)
@@ -1675,7 +1692,7 @@ class RiskManager:
         Returns:
             (충족된 조건 개수, 충족된 조건 목록)
         """
-        ticker = normalize_ticker_6(holding.get("pdno", ""), os.getenv("MARKET", "NASDAQ100"))
+        ticker = normalize_ticker_6(holding.get("pdno", ""), os.getenv("MARKET", "SP500"))
         current_rsi = stock_info.get("RSI", 50.0)
         satisfied_conditions = []
         
@@ -1720,7 +1737,7 @@ class RiskManager:
         Returns:
             (판단 결과, 이유, 컨텍스트)
         """
-        ticker = normalize_ticker_6(holding.get("pdno", ""), os.getenv("MARKET", "NASDAQ100"))
+        ticker = normalize_ticker_6(holding.get("pdno", ""), os.getenv("MARKET", "SP500"))
         name = holding.get("prdt_name", "N/A")
         rsi = _to_float(stock_info.get("RSI"), 50.0)
         cur_price = _to_int(holding.get("prpr", 0))
@@ -1866,12 +1883,21 @@ class RiskManager:
         nx = cash_map.get("nxdy_excc_amt", 0)
         dn = cash_map.get("dnca_tot_amt", 0)
         total = cash_map.get("tot_evlu_amt", 0) or 0
+        hold_n = len([h for h in holdings if _to_int(h.get("hldg_qty", 0)) > 0])
+        if is_us_market(_market()):
+            orderable = d2 or cash_map.get("available_cash", 0) or cash_map.get("ord_psbl_frcr_amt", 0)
+            return (
+                f"보유종목: {hold_n}개\n"
+                f"주문가능(USD): {_money(orderable)}\n"
+                f"예수금(USD): {_money(dn)}\n"
+                f"총평가(USD): {_money(total)}"
+            )
         return (
-            f"보유종목: {len([h for h in holdings if _to_int(h.get('hldg_qty', 0))>0])}개\n"
-            f"D+2 출금가능: {d2:,}원\n"
-            f"익일 출금가능: {nx:,}원\n"
-            f"예수금: {dn:,}원\n"
-            f"총평가(요약): {total:,}원"
+            f"보유종목: {hold_n}개\n"
+            f"D+2 출금가능: {_money(d2)}\n"
+            f"익일 출금가능: {_money(nx)}\n"
+            f"예수금: {_money(dn)}\n"
+            f"총평가(요약): {_money(total)}"
         )
 
 # ── 실행 루틴 ──────────────────────────────────────────────────────────
@@ -1911,24 +1937,24 @@ def _run_cycle(rm: RiskManager, *, notify_summary: bool = True) -> None:
             for h in holds:
                 qty = _to_int(h.get("hldg_qty", 0))
                 if qty <= 0:
-                    ticker = normalize_ticker_6(h.get("pdno", ""), os.getenv("MARKET", "NASDAQ100"))
+                    ticker = normalize_ticker_6(h.get("pdno", ""), os.getenv("MARKET", "SP500"))
                     name = h.get("prdt_name", "N/A")
                     eval_amt = _to_int(h.get("evlu_amt", 0))
                     if eval_amt > 0:
                         logger.warning(
-                            f"[리스크체크] {name}({ticker}) 수량 0이지만 평가금액 {eval_amt:,}원 → "
+                            f"[리스크체크] {name}({ticker}) 수량 0이지만 평가금액 {_money(eval_amt)} → "
                             f"계좌 동기화 지연 가능성 (다음 사이클에서 재확인)"
                         )
         
         if valid_holdings:
             logger.info(f"[리스크체크] 보유 종목 {len(valid_holdings)}개 모니터링 시작")
             for idx, h in enumerate(valid_holdings, 1):
-                ticker = normalize_ticker_6(h.get("pdno", ""), os.getenv("MARKET", "NASDAQ100"))
+                ticker = normalize_ticker_6(h.get("pdno", ""), os.getenv("MARKET", "SP500"))
                 name = h.get("prdt_name", "N/A")
                 qty = _to_int(h.get("hldg_qty", 0))
                 cur_price = _to_float(h.get("prpr"), 0.0)
             
-                logger.info(f"[리스크체크] [{idx}/{len(valid_holdings)}] {name}({ticker}) 시작 - 수량={qty:,}주, 현재가={cur_price:,.0f}원")
+                logger.info(f"[리스크체크] [{idx}/{len(valid_holdings)}] {name}({ticker}) 시작 - 수량={qty:,}주, 현재가={_money(cur_price)}")
                 
                 if cur_price <= 0:
                     logger.warning(f"[리스크체크] [{idx}/{len(valid_holdings)}] {name}({ticker}) 현재가 정보 없음 → 스킵")

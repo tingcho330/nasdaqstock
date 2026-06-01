@@ -132,7 +132,7 @@ def build_overseas_summary(
 
 def inquire_overseas_account(
     kis,
-    market: str = "NASDAQ100",
+    market: str = "SP500",
     *,
     tr_crcy_cd: str = "USD",
 ) -> Tuple[pd.DataFrame, Dict[str, Any], bool, str]:

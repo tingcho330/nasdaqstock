@@ -28,7 +28,7 @@ if __name__ == "__main__":
     print("=== run_integrated_manager.py 시작 ===")
     
     # 환경 변수 설정
-    os.environ.setdefault("MARKET", "NASDAQ100")
+    os.environ.setdefault("MARKET", "SP500")
     os.environ.setdefault("SLOTS", "3")
     os.environ.setdefault("SCHED_MAX_ATTEMPTS", "3")
     os.environ.setdefault("SCHED_INITIAL_BACKOFF_MINUTES", "2")

@@ -17,7 +17,7 @@ from typing import Dict, List, Tuple, Optional, Any
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
-from utils import normalize_ticker_6, KST, _to_int, _to_float, check_min_holding_period
+from utils import normalize_ticker_6, KST, _to_int, _to_float, check_min_holding_period, fmt_money
 from screener_core import MarketAnalyzer, MarketState
 
 logger = logging.getLogger(__name__)
@@ -152,7 +152,7 @@ class RotationManager:
         
         holding_list = []
         for h in holdings:
-            ticker = normalize_ticker_6(h.get("pdno", ""), os.getenv("MARKET", "NASDAQ100"))
+            ticker = normalize_ticker_6(h.get("pdno", ""), os.getenv("MARKET", "SP500"))
             name = h.get("prdt_name", "N/A")
             quantity = _to_int(h.get("hldg_qty", 0))
             price = _to_int(h.get("prpr", 0))
@@ -182,7 +182,7 @@ class RotationManager:
         
         candidate_list = []
         for c in candidates:
-            ticker = normalize_ticker_6(c.get("Ticker", ""), os.getenv("MARKET", "NASDAQ100"))
+            ticker = normalize_ticker_6(c.get("Ticker", ""), os.getenv("MARKET", "SP500"))
             name = c.get("Name", "N/A")
             price = _to_int(c.get("Price", 0))
             score = _to_float(c.get("Score", scores_map.get(ticker, 0.0)), 0.0)
@@ -328,7 +328,7 @@ class RotationManager:
         if not should_rotate:
             logger.info(
                 f"회전 매매 중단: {holding.ticker} → {candidate.ticker} | "
-                f"순수익: {rotation_judgment.get('net_profit', 0):,}원 | "
+                f"순수익: {fmt_money(rotation_judgment.get('net_profit', 0), os.getenv('MARKET', 'NASDAQ100'))} | "
                 f"비용효과: {rotation_judgment.get('cost_effectiveness_ratio', 0):.1f}배"
             )
         

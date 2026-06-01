@@ -265,7 +265,7 @@ INITIAL_FILTER_PROMPT_TMPL = (
 )
 
 INITIAL_FILTER_PROMPT_US_TMPL = (
-    "You are an expert US equity analyst for NASDAQ100 swing trading (regular session, USD). "
+    "You are an expert US equity analyst for S&P 500 swing trading (regular session, USD). "
     "Perform rapid screening from quantitative scores (0.0–1.0 scale, NOT 0–100) and news. "
     "Respond with a single valid JSON object only.\n\n"
     "**Input:**\n"
@@ -327,7 +327,7 @@ TACTICAL_PLAN_PROMPT_TMPL = (
 )
 
 TACTICAL_PLAN_PROMPT_US_TMPL = (
-    "You are a US equity strategist for NASDAQ100 swing trades. "
+    "You are a US equity strategist for S&P 500 swing trades. "
     "All share prices, moving averages, stop/target levels, and budget figures are in **USD**. "
     "Output a single JSON object only (Korean field names below).\n\n"
     "**Market regime:** {market_trend} (Bull / Bear / Sideways — US large-cap tech context)\n"
@@ -416,7 +416,7 @@ REBALANCE_PROMPT_KR_TMPL = """
 """
 
 REBALANCE_PROMPT_US_TMPL = """
-You are a US equity portfolio manager rebalancing a NASDAQ100-focused account.
+You are a US equity portfolio manager rebalancing an S&P 500-focused account.
 All quoted prices and position values are in **USD**. Ticker symbols are US (e.g. AAPL, MSFT).
 
 **Current holdings:**
@@ -464,13 +464,13 @@ All quoted prices and position values are in **USD**. Ticker symbols are US (e.g
 
 
 def _market_env(market: Optional[str] = None) -> str:
-    return market or os.getenv("MARKET", "NASDAQ100")
+    return market or os.getenv("MARKET", "SP500")
 
 
 def _gpt_system_initial(market: Optional[str] = None) -> str:
     if is_us_market(_market_env(market)):
         return (
-            "You are a fast NASDAQ100 equity analyst. "
+            "You are a fast S&P 500 equity analyst. "
             "Quantitative scores use a 0.0–1.0 scale (not 0–100). "
             "Reply with a single JSON object only."
         )
@@ -480,7 +480,7 @@ def _gpt_system_initial(market: Optional[str] = None) -> str:
 def _gpt_system_tactical(market: Optional[str] = None) -> str:
     if is_us_market(_market_env(market)):
         return (
-            "You are Chief Investment Strategist for US equities (NASDAQ100). "
+            "You are Chief Investment Strategist for US equities (S&P 500). "
             "Express all monetary values in USD ($). Output must be a single JSON object ONLY."
         )
     return "You are a Chief Investment Strategist. Output must be a single JSON object ONLY."
@@ -489,7 +489,7 @@ def _gpt_system_tactical(market: Optional[str] = None) -> str:
 def _gpt_system_rebalance(market: Optional[str] = None) -> str:
     if is_us_market(_market_env(market)):
         return (
-            "You are a professional US equity portfolio manager (NASDAQ100). "
+            "You are a professional US equity portfolio manager (S&P 500). "
             "All prices and notionals are USD. Output a single JSON object only."
         )
     return "당신은 전문 포트폴리오 매니저입니다. 한국 주식시장의 리밸런싱 결정을 내려야 합니다."
@@ -563,7 +563,7 @@ def _normalize_candidates(cands: List[Dict]) -> List[Dict]:
         item = dict(c)
         if not item.get("Ticker"):
             if item.get("Code"):
-                item["Ticker"] = norm_ticker(item["Code"], os.getenv("MARKET", "NASDAQ100"))
+                item["Ticker"] = norm_ticker(item["Code"], os.getenv("MARKET", "SP500"))
         if not item.get("Name"):
             for k in ["Name", "종목명", "name"]:
                 if c.get(k):
@@ -724,7 +724,7 @@ def _build_budget_guard_block(
     if not enabled or usable_cash is None:
         return ""
     max_entry = int(usable_cash * ratio)
-    mkt = os.getenv("MARKET", "NASDAQ100")
+    mkt = os.getenv("MARKET", "SP500")
     if is_us_market(mkt):
         return (
             "\n**Budget Guard (USD — overseas account buying power):**\n"
@@ -748,7 +748,7 @@ def _tactical_plan_gpt(
     budget_ctx: Optional[Dict[str, Any]] = None,
     market: Optional[str] = None,
 ) -> Optional[dict]:
-    mkt = market or os.getenv("MARKET", "NASDAQ100")
+    mkt = market or os.getenv("MARKET", "SP500")
     name = c.get("Name", "N/A")
     ticker = norm_ticker(c.get("Ticker", "N/A"), mkt)
     sector = c.get("Sector", "N/A")
@@ -1035,7 +1035,7 @@ def _get_usable_cash() -> Optional[int]:
         )
         cash_map = extract_cash_from_summary(
             summary_dict,
-            market=os.getenv("MARKET", "NASDAQ100"),
+            market=os.getenv("MARKET", "SP500"),
         ) if summary_dict else {}
         usable = cash_map.get("available_cash")
         if isinstance(usable, (int, float)):
@@ -1080,7 +1080,7 @@ def analyze_candidates_and_create_plans(
         logger.info(f"기본 분석 모드: {max_candidates}개 종목 분석")
     
     candidates_to_process = cand_sorted[:max_candidates]
-    mkt = market or os.getenv("MARKET", "NASDAQ100")
+    mkt = market or os.getenv("MARKET", "SP500")
 
     logger.info(f"분석 대상: {len(candidates_to_process)}개 종목 (전체 {len(cand_sorted)}개 중)")
 
@@ -1238,7 +1238,7 @@ def analyze_candidates_and_create_plans(
 
 def run_pipeline(
     fixed_date: Optional[str] = None,
-    market: str = "NASDAQ100",
+    market: str = "SP500",
     available_slots: int = 3
 ) -> Optional[Path]:
     start_msg = f"▶ GPT 분석 시작 (date={fixed_date or 'auto'}, market={market}, slots={available_slots})"
@@ -1347,7 +1347,7 @@ def run_pipeline(
                 min_conf = float(ia.get("min_confidence_for_rotation", 0.7))
 
                 suggestions = []
-                mkt_rot = os.getenv("MARKET", "NASDAQ100")
+                mkt_rot = os.getenv("MARKET", "SP500")
                 for h in holdings:
                     t = norm_ticker(h.get("pdno", ""), mkt_rot)
                     n = h.get("prdt_name", "N/A")
@@ -1443,7 +1443,7 @@ def get_top_screener_candidates(all_stock_data: Dict, holdings: List[Dict], sett
     logger.debug(f"[DEBUG] Screener 상위 후보 선정 시작")
     
     # 보유 종목 제외
-    held_tickers = {normalize_ticker_6(h.get("pdno", ""), os.getenv("MARKET", "NASDAQ100")) for h in holdings}
+    held_tickers = {normalize_ticker_6(h.get("pdno", ""), os.getenv("MARKET", "SP500")) for h in holdings}
     
     # 설정에서 최소 점수 임계치 가져오기
     min_score_threshold = settings.get("rebalance_params", {}).get("min_score_threshold", 0.6)
@@ -1480,7 +1480,7 @@ def analyze_rebalance_with_gpt(
         holdings_info = []
         for h in current_holdings:
             holdings_info.append({
-                "ticker": normalize_ticker_6(h.get("pdno", ""), os.getenv("MARKET", "NASDAQ100")),
+                "ticker": normalize_ticker_6(h.get("pdno", ""), os.getenv("MARKET", "SP500")),
                 "name": h.get("prdt_name", "N/A"),
                 "qty": h.get("hldg_qty", 0),
                 "price": h.get("prpr", 0),
@@ -1494,7 +1494,7 @@ def analyze_rebalance_with_gpt(
         candidates_info = []
         for c in new_candidates:
             candidates_info.append({
-                "ticker": normalize_ticker_6(c.get("Ticker", ""), os.getenv("MARKET", "NASDAQ100")),
+                "ticker": normalize_ticker_6(c.get("Ticker", ""), os.getenv("MARKET", "SP500")),
                 "name": c.get("Name", "N/A"),
                 "price": c.get("Price", 0),
                 "score": c.get("Score", 0.0),
@@ -1565,7 +1565,7 @@ def parse_gpt_rebalance_decisions(
     
     for decision in decisions:
         action = decision.get("action")
-        ticker = normalize_ticker_6(decision.get("ticker", ""), os.getenv("MARKET", "NASDAQ100"))
+        ticker = normalize_ticker_6(decision.get("ticker", ""), os.getenv("MARKET", "SP500"))
         name = decision.get("name", "N/A")
         reason = decision.get("reason", "")
         confidence = decision.get("confidence", 0.0)
@@ -1574,7 +1574,7 @@ def parse_gpt_rebalance_decisions(
         if action == "SELL":
             # 보유 종목에서 매도 대상 찾기
             for holding in holdings:
-                if normalize_ticker_6(holding.get("pdno", ""), os.getenv("MARKET", "NASDAQ100")) == ticker:
+                if normalize_ticker_6(holding.get("pdno", ""), os.getenv("MARKET", "SP500")) == ticker:
                     to_sell_list.append({
                         "ticker": ticker,
                         "name": name,
@@ -1589,7 +1589,7 @@ def parse_gpt_rebalance_decisions(
         elif action == "BUY":
             # 후보에서 매수 대상 찾기
             for candidate in candidates:
-                if normalize_ticker_6(candidate.get("Ticker", ""), os.getenv("MARKET", "NASDAQ100")) == ticker:
+                if normalize_ticker_6(candidate.get("Ticker", ""), os.getenv("MARKET", "SP500")) == ticker:
                     to_buy_plans.append({
                         "stock_info": candidate,
                         "reason": reason,
@@ -1629,7 +1629,7 @@ def get_gpt_enhanced_rebalance_candidates(
     from utils import KST
     analysis_date = datetime.now(KST).strftime("%Y%m%d")
     
-    mkt = os.getenv("MARKET", "NASDAQ100")
+    mkt = os.getenv("MARKET", "SP500")
     gpt_analysis = analyze_rebalance_with_gpt(
         holdings,
         screener_candidates,
@@ -1694,7 +1694,7 @@ def fallback_rebalance_logic(holdings: List[Dict], all_stock_data: Dict) -> Tupl
                 # 점수 차이가 충분한 경우에만 매칭
                 if new_score - old_score > 0.1:
                     to_sell_list.append({
-                        "ticker": normalize_ticker_6(holding.get("pdno", ""), os.getenv("MARKET", "NASDAQ100")),
+                        "ticker": normalize_ticker_6(holding.get("pdno", ""), os.getenv("MARKET", "SP500")),
                         "name": holding.get("prdt_name", "N/A"),
                         "qty": holding.get("hldg_qty", 0),
                         "reason": f"점수 하락 ({old_score:.3f} → {new_score:.3f})"
@@ -1717,8 +1717,8 @@ if __name__ == "__main__":
     parser.add_argument("--date", help="YYYYMMDD (미지정 시 최신 파일 자동 탐색)")
     parser.add_argument(
         "--market",
-        default=os.getenv("MARKET", "NASDAQ100"),
-        choices=["KOSPI", "KONEX", "KOSDAQ", "NASDAQ100"],
+        default=os.getenv("MARKET", "SP500"),
+        choices=["KOSPI", "KONEX", "KOSDAQ", "SP500"],
     )
     parser.add_argument("--slots", type=int, default=3, help="생성할 최대 매수 계획 개수")
     args = parser.parse_args()

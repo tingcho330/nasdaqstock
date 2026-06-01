@@ -60,7 +60,7 @@ def _normalize_order_row(row: Any) -> Optional[Dict[str, Any]]:
             return None
         qty = _safe_int(row.get("ord_qty", 0))
         executed_qty = _safe_int(row.get("tot_ccld_qty", 0))
-        ticker = norm_ticker(str(row.get("pdno", "") or ""), os.getenv("MARKET", "NASDAQ100"))
+        ticker = norm_ticker(str(row.get("pdno", "") or ""), os.getenv("MARKET", "SP500"))
         side = "buy" if str(row.get("sll_buy_dvsn_cd", "")) == "02" else "sell"
         order_time = str(row.get("ord_tmd", "") or "")
         # 취소 여부(주식일별주문체결조회 output1.cncl_yn: Y/N)

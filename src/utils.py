@@ -55,8 +55,14 @@ __all__ = [
     "norm_ticker_series",
     "us_excd",
     "us_ovrs_excg_cd",
+    "resolve_us_excd",
+    "resolve_us_ovrs_excg",
+    "set_us_ticker_excd_map",
+    "set_us_ticker_ovrs_excg_map",
+    "us_regime_benchmark",
     "min_trading_value_5d_avg",
     "fmt_money",
+    "fmt_money_signed",
 ]
 
 # ────────────────────────────────
@@ -281,14 +287,19 @@ _date_patterns = [
     re.compile(r"(?P<date>\d{8})"),                       # 20250904
 ]
 _market_pattern = re.compile(
-    r"(KOSPI|KOSDAQ|KONEX|NASDAQ100|NYSE|NASDAQ|AMEX|SPX|NIKKEI|HKEX)",
+    r"(KOSPI|KOSDAQ|KONEX|SP500|SPX500|NASDAQ100|NYSE|NASDAQ|AMEX|SPX|NIKKEI|HKEX)",
     re.IGNORECASE,
 )
 
 _US_MARKETS = frozenset({
-    "NASDAQ100", "NDX100", "NASDAQ", "NASD", "NYSE", "AMEX", "US",
+    "SP500", "SPX500", "SPX",
+    "NASDAQ100", "NDX100",
+    "NASDAQ", "NASD", "NYSE", "AMEX", "US",
 })
 _US_EXCD_MAP = {
+    "SP500": "NAS",
+    "SPX500": "NAS",
+    "SPX": "NAS",
     "NASDAQ100": "NAS",
     "NDX100": "NAS",
     "NASDAQ": "NAS",
@@ -298,6 +309,9 @@ _US_EXCD_MAP = {
     "US": "NAS",
 }
 _US_OVRS_EXCG_MAP = {
+    "SP500": "NASD",
+    "SPX500": "NASD",
+    "SPX": "NASD",
     "NASDAQ100": "NASD",
     "NDX100": "NASD",
     "NASDAQ": "NASD",
@@ -306,6 +320,51 @@ _US_OVRS_EXCG_MAP = {
     "AMEX": "AMEX",
     "US": "NASD",
 }
+_EXCD_TO_OVRS = {"NAS": "NASD", "NYS": "NYSE", "AMS": "AMEX"}
+_US_TICKER_EXCD: Dict[str, str] = {}
+_US_TICKER_OVRS: Dict[str, str] = {}
+
+
+def set_us_ticker_excd_map(mapping: Dict[str, str]) -> None:
+    global _US_TICKER_EXCD
+    _US_TICKER_EXCD = {
+        str(k).strip().upper(): str(v).strip().upper()
+        for k, v in (mapping or {}).items()
+        if k and v
+    }
+
+
+def set_us_ticker_ovrs_excg_map(mapping: Dict[str, str]) -> None:
+    global _US_TICKER_OVRS
+    _US_TICKER_OVRS = {
+        str(k).strip().upper(): str(v).strip().upper()
+        for k, v in (mapping or {}).items()
+        if k and v
+    }
+
+
+def us_regime_benchmark(market: Optional[str] = None) -> str:
+    """US 시장 레짐·추세 벤치마크 심볼."""
+    return "SPY" if is_us_market(market) else ""
+
+
+def resolve_us_excd(ticker: str, market: Optional[str] = None) -> str:
+    """티커별 KIS EXCD (NAS/NYS/AMS). 마스터 맵 → MARKET 폴백."""
+    t = norm_ticker(ticker, market)
+    if t and t in _US_TICKER_EXCD:
+        return _US_TICKER_EXCD[t]
+    m = (market or os.getenv("MARKET", "SP500")).upper().strip()
+    return _US_EXCD_MAP.get(m, "NAS")
+
+
+def resolve_us_ovrs_excg(ticker: str, market: Optional[str] = None) -> str:
+    t = norm_ticker(ticker, market)
+    if t and t in _US_TICKER_OVRS:
+        return _US_TICKER_OVRS[t]
+    excd = resolve_us_excd(t, market)
+    return _EXCD_TO_OVRS.get(excd, _US_OVRS_EXCG_MAP.get(
+        (market or os.getenv("MARKET", "SP500")).upper().strip(), "NASD"
+    ))
 
 
 def is_us_market(market: Optional[str] = None) -> bool:
@@ -331,12 +390,12 @@ def norm_ticker_series(series: pd.Series, market: Optional[str] = None) -> pd.In
 
 
 def us_excd(market: Optional[str] = None) -> str:
-    m = (market or os.getenv("MARKET", "NASDAQ100")).upper().strip()
+    m = (market or os.getenv("MARKET", "SP500")).upper().strip()
     return _US_EXCD_MAP.get(m, "NAS")
 
 
 def us_ovrs_excg_cd(market: Optional[str] = None) -> str:
-    m = (market or os.getenv("MARKET", "NASDAQ100")).upper().strip()
+    m = (market or os.getenv("MARKET", "SP500")).upper().strip()
     return _US_OVRS_EXCG_MAP.get(m, "NASD")
 
 
@@ -355,6 +414,22 @@ def fmt_money(amount: float, market: Optional[str] = None) -> str:
     if is_us_market(market):
         return f"${val:,.2f} USD"
     return f"{val:,.0f}원"
+
+
+def fmt_money_signed(amount: float, market: Optional[str] = None) -> str:
+    """Signed PnL / balance change (e.g. +$100.00 USD, -1,000원)."""
+    try:
+        val = float(amount)
+    except (TypeError, ValueError):
+        val = 0.0
+    if is_us_market(market):
+        if val < 0:
+            return f"-${abs(val):,.2f} USD"
+        if val > 0:
+            return f"+${val:,.2f} USD"
+        return "$0.00 USD"
+    return f"{val:+,.0f}원"
+
 
 def _extract_meta_from_name(name: str) -> Dict[str, Any]:
     meta: Dict[str, Any] = {"date": None, "hms": None, "market": None}
@@ -612,7 +687,7 @@ def extract_cash_from_summary(
     if not summary_dict:
         return {"available_cash": 0}
 
-    mkt = market or os.getenv("MARKET", "NASDAQ100")
+    mkt = market or os.getenv("MARKET", "SP500")
     us_mode = is_us_market(mkt) or str(summary_dict.get("currency", "")).upper() == "USD"
 
     def _amt_keys(k: str) -> bool:

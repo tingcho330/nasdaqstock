@@ -2,7 +2,7 @@
   "trading_environment": "prod",
   "kis_limits": {
     "max_rps": 2,
-    "max_concurrency": 1
+    "max_concurrency": 2
   },
   "screener_params": {
     "min_market_cap": 50000000000,
@@ -10,7 +10,7 @@
     "max_market_cap": 50000000000000,
     "max_market_cap_us": 5000000000000,
     "min_trading_value_5d_avg": 100000000000,
-    "min_trading_value_5d_avg_us": 1000000000,
+    "min_trading_value_5d_avg_us": 5000000000,
     "top_n": 8,
     "fin_weight": 0.25,
     "tech_weight": 0.35,

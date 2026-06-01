@@ -339,9 +339,9 @@ class KIS(DomesticStock, OverseasStock):
         - US: overseas_order (NASD 등)
         """
         import os
-        from utils import is_us_market, us_ovrs_excg_cd, norm_ticker
+        from utils import is_us_market, norm_ticker, resolve_us_ovrs_excg
 
-        mkt = market or os.getenv("MARKET", "NASDAQ100")
+        mkt = market or os.getenv("MARKET", "SP500")
         if is_us_market(mkt):
             sym = norm_ticker(pdno, mkt)
             if not sym:
@@ -352,6 +352,6 @@ class KIS(DomesticStock, OverseasStock):
                 ord_dvsn=ord_dvsn,
                 ord_qty=int(ord_qty),
                 ord_unpr=int(ord_unpr),
-                ovrs_excg_cd=us_ovrs_excg_cd(mkt),
+                ovrs_excg_cd=resolve_us_ovrs_excg(sym, mkt),
             )
         return DomesticStock.order_cash(self, ord_dv, pdno, ord_dvsn, ord_qty, ord_unpr)

@@ -35,7 +35,7 @@ except Exception:  # pragma: no cover
 
 from utils import normalize_ticker_6
 
-_MARKET = lambda: os.getenv("MARKET", "NASDAQ100")
+_MARKET = lambda: os.getenv("MARKET", "SP500")
 
 @dataclass
 class TradeRecord:

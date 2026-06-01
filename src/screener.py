@@ -40,6 +40,10 @@ from utils import (
     norm_ticker_series,
     us_excd,
     min_trading_value_5d_avg,
+    resolve_us_excd,
+    set_us_ticker_excd_map,
+    set_us_ticker_ovrs_excg_map,
+    us_regime_benchmark,
 )
 
 # 시장 분석 모듈 (screener_core에서 통합)
@@ -321,11 +325,12 @@ def _kis_overseas_daily_price_safe(
     date_str: str,
     market: str,
     *,
+    excd: Optional[str] = None,
     retries: int = 4,
 ) -> pd.DataFrame:
     """해외주식 기간별시세(HHDFS76240000) — Amount5D용."""
     symb = norm_ticker(symb, market)
-    excd = us_excd(market)
+    excd = excd or resolve_us_excd(symb, market)
     for attempt in range(max(1, retries)):
         try:
             if _KIS_RATE_LIMITER:
@@ -353,7 +358,7 @@ def _kis_period_price_safe(
 ) -> pd.DataFrame:
     """KIS 기간별시세(FHKST03010100) 안전 래퍼 (레이트리밋/백오프)."""
     if is_us_market(market):
-        return _kis_overseas_daily_price_safe(kis, code, end_date, market or "NASDAQ100", retries=retries)
+        return _kis_overseas_daily_price_safe(kis, code, end_date, market or "SP500", retries=retries)
     code = norm_ticker(code, market)
     for attempt in range(max(1, retries)):
         try:
@@ -669,6 +674,16 @@ def get_stock_listing(market: str = "KOSPI") -> pd.DataFrame:
             close = pd.to_numeric(out.get("Close", 0), errors="coerce").fillna(0)
             shares = pd.to_numeric(out.get("ListedShares", 0), errors="coerce").fillna(0)
             out["Marcap"] = close * shares
+        if is_us_market(market):
+            if "EXCD" in out.columns:
+                set_us_ticker_excd_map(dict(zip(out.index.astype(str), out["EXCD"].astype(str))))
+            if "OvrsExcg" in out.columns:
+                set_us_ticker_ovrs_excg_map(dict(zip(out.index.astype(str), out["OvrsExcg"].astype(str))))
+            logger.info(
+                "US 티커 거래소 맵 로드: %d종 (EXCD 분포 %s)",
+                len(out),
+                out["EXCD"].value_counts().to_dict() if "EXCD" in out.columns else {},
+            )
         return out
     except Exception as e:
         logger.error("KIS 마스터(.mst) 조회 실패: %s", str(e))
@@ -695,12 +710,11 @@ def get_fundamentals(
 
         uniq = [norm_ticker(t, market) for t in pd.unique(pd.Series(tickers)) if t]
         rows = []
-        excd = us_excd(market) if is_us_market(market) else None
         for code in uniq:
             if is_us_market(market):
                 if _KIS_RATE_LIMITER:
                     _KIS_RATE_LIMITER.wait()
-                df = kis.overseas_price_detail(excd, code)
+                df = kis.overseas_price_detail(resolve_us_excd(code, market), code)
             else:
                 df = _kis_inquire_price_safe(kis, code, retries=3)
             if df is None or df.empty:
@@ -721,16 +735,40 @@ def get_fundamentals(
         return pd.DataFrame()
 
 
+def _get_us_benchmark_close(date_str: str, min_bars: int = 60) -> Optional[pd.Series]:
+    """US 레짐/추세: SPY 일봉 종가 (FinanceDataReader)."""
+    try:
+        end_dt = datetime.strptime(date_str, "%Y%m%d")
+        start_dt = (end_dt - timedelta(days=max(400, int(min_bars * 1.8)))).strftime("%Y%m%d")
+        sym = us_regime_benchmark("SP500") or "SPY"
+        df = get_historical_prices(sym, start_dt, date_str)
+        if df is None or df.empty or "Close" not in df.columns:
+            return None
+        close = pd.to_numeric(df["Close"], errors="coerce").dropna()
+        return close if len(close) >= min_bars else None
+    except Exception:
+        return None
+
+
 def get_market_trend(date_str: str, market: str = "KOSPI") -> str:
     """
     시장 추세(단기): MA5 vs MA20
-    - KIS 업종 일자별(FHKUP03500100)로 코스피/코스닥 지수 대용을 조회
+    - KR: KIS 업종 일자별 / US: SPY (fdr)
     """
     try:
+        if is_us_market(market):
+            close = _get_us_benchmark_close(date_str, min_bars=20)
+            if close is None or len(close) < 20:
+                return "Sideways"
+            ma5 = close.rolling(5).mean().iloc[-1]
+            ma20 = close.rolling(20).mean().iloc[-1]
+            if pd.isna(ma5) or pd.isna(ma20):
+                return "Sideways"
+            return "Bull" if ma5 > ma20 else "Bear"
+
         kis = _KIS_INSTANCE
         if kis is None:
             return "Sideways"
-        # 코스피(0001), 코스닥(1001) 코드 사용(가이드)
         idx_code = "0001" if (market or "").upper() == "KOSPI" else "1001"
         end_dt = datetime.strptime(date_str, "%Y%m%d")
         start_dt = (end_dt - timedelta(days=60)).strftime("%Y%m%d")
@@ -1392,6 +1430,21 @@ def _kis_industry_close_history(
 
 def _get_market_regime_score(date_str: str, market: str) -> float:
     try:
+        if is_us_market(market):
+            close = _get_us_benchmark_close(date_str, min_bars=200)
+            if close is None or len(close) < 60:
+                return 0.5
+            ma50 = close.rolling(50).mean().iloc[-1]
+            ma200 = close.rolling(200).mean().iloc[-1] if len(close) >= 200 else np.nan
+            rsi_val = calculate_rsi(close)
+            rsi = rsi_val.iloc[-1] if isinstance(rsi_val, pd.Series) and len(rsi_val) else float(rsi_val) if rsi_val is not None else np.nan
+            if pd.isna(ma50) or pd.isna(rsi):
+                return 0.5
+            above_ma50 = 1 if close.iloc[-1] > ma50 else 0
+            ma_term = 0.5 if pd.isna(ma200) else (1 if ma50 > ma200 else 0)
+            rsi_term = max(0.0, 1 - abs(rsi - 50) / 50)
+            return float((above_ma50 + ma_term + rsi_term) / 3.0)
+
         kis = _KIS_INSTANCE
         if kis is None:
             return 0.5
@@ -1416,6 +1469,21 @@ def _get_market_regime_score(date_str: str, market: str) -> float:
 
 def _get_market_regime_components(date_str: str, market: str) -> Dict[str, float]:
     try:
+        if is_us_market(market):
+            close = _get_us_benchmark_close(date_str, min_bars=200)
+            if close is None or len(close) < 60:
+                return {"above_ma50": 0.5, "ma50_gt_ma200": 0.5, "rsi_term": 0.5}
+            ma50 = close.rolling(50).mean().iloc[-1]
+            ma200 = close.rolling(200).mean().iloc[-1] if len(close) >= 200 else np.nan
+            rsi_val = calculate_rsi(close)
+            rsi = rsi_val.iloc[-1] if isinstance(rsi_val, pd.Series) and len(rsi_val) else float(rsi_val) if rsi_val is not None else np.nan
+            return {
+                "above_ma50": 1.0 if (not pd.isna(ma50) and close.iloc[-1] > ma50) else 0.0,
+                "ma50_gt_ma200": 0.5 if pd.isna(ma200) else (1.0 if ma50 > ma200 else 0.0),
+                "rsi_term": max(0.0, 1 - abs(rsi - 50) / 50) if not pd.isna(rsi) else 0.5,
+                "benchmark": us_regime_benchmark(market) or "SPY",
+            }
+
         kis = _KIS_INSTANCE
         if kis is None:
             return {"above_ma50": 0.5, "ma50_gt_ma200": 0.5, "rsi_term": 0.5}
@@ -1689,7 +1757,9 @@ def _filter_initial_stocks(
         df_all["Marcap"] = close * shares
 
     # 1) 마켓캡 기반 1차 필터(빠름)
-    df_pre = df_all[[c for c in ["Name", "Marcap", "Sector", "SectorSource"] if c in df_all.columns]].copy()
+    df_pre = df_all[
+        [c for c in ["Name", "Marcap", "Sector", "SectorSource", "EXCD", "OvrsExcg"] if c in df_all.columns]
+    ].copy()
     df_pre["Marcap"] = pd.to_numeric(df_pre["Marcap"], errors="coerce").fillna(0)
 
     if debug:
@@ -2860,7 +2930,7 @@ def run_screener(date_str: str, market: str, config_path: Optional[str], workers
 
         # 컬럼 순서
         cols = [
-            "Ticker", "Name", "Sector", "SectorSource", "Price",
+            "Ticker", "Name", "Sector", "SectorSource", "EXCD", "OvrsExcg", "Price",
             "손절가", "목표가", "source", "stop_price", "target_price", "levels_source",
             "MA50", "MA200", "Score",
             "FinScore", "TechScore", "MktScore", "SectorScore", "VolKki", "Pos52w",
@@ -2989,8 +3059,8 @@ def parse_args():
     parser.add_argument("--date", default=datetime.now().strftime("%Y%m%d"))
     parser.add_argument(
         "--market",
-        default=os.getenv("MARKET", "NASDAQ100"),
-        choices=["KOSPI", "KOSDAQ", "KONEX", "NASDAQ100"],
+        default=os.getenv("MARKET", "SP500"),
+        choices=["KOSPI", "KOSDAQ", "KONEX", "SP500"],
     )
     parser.add_argument("--config", help="추가/오버레이할 config.json 파일 경로")
     parser.add_argument("--workers", type=int, default=int(os.getenv("WORKERS", "4")))

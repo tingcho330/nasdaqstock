@@ -347,6 +347,74 @@ class MarketAnalyzer:
         try:
             current_time = datetime.now()
 
+            from utils import is_us_market, us_regime_benchmark
+
+            # US: SPY 일봉 (fdr) — S&P500 레짐
+            if is_us_market(self.market):
+                end_dt = self.date_str or current_time.strftime("%Y%m%d")
+                sym = us_regime_benchmark(self.market) or "SPY"
+                start_dt = (
+                    datetime.strptime(end_dt, "%Y%m%d") - timedelta(days=500)
+                ).strftime("%Y%m%d")
+                df = get_historical_prices(sym, start_dt, end_dt)
+                if df is not None and not df.empty and "Close" in df.columns:
+                    close = pd.to_numeric(df["Close"], errors="coerce").dropna()
+                    if close is not None and len(close) >= 60:
+                        ma20 = close.rolling(20).mean()
+                        ma50 = close.rolling(50).mean().iloc[-1] if len(close) >= 50 else close.rolling(20).mean().iloc[-1]
+                        ma200 = close.rolling(200).mean().iloc[-1] if len(close) >= 200 else float("nan")
+                        rsi_val = calculate_rsi(close)
+                        rsi = (
+                            float(rsi_val.iloc[-1])
+                            if isinstance(rsi_val, pd.Series) and len(rsi_val)
+                            else float(rsi_val) if rsi_val is not None else 50.0
+                        )
+                        returns = close.pct_change().dropna()
+                        vol_ann = float(returns.std() * (252 ** 0.5)) if len(returns) else 0.0
+                        if vol_ann < 0.15:
+                            volatility_level = "low"
+                        elif vol_ann < 0.25:
+                            volatility_level = "medium"
+                        else:
+                            volatility_level = "high"
+                        trend_direction = "sideways"
+                        try:
+                            ma20_last = float(ma20.iloc[-1])
+                            ma20_prev = float(ma20.iloc[-6])
+                            delta = (ma20_last - ma20_prev) / ma20_prev if ma20_prev else 0.0
+                            if delta > 0.003:
+                                trend_direction = "up"
+                            elif delta < -0.003:
+                                trend_direction = "down"
+                        except Exception:
+                            pass
+                        last_close = float(close.iloc[-1])
+                        ma50_gt_ma200 = (ma50 > ma200) if not pd.isna(ma200) else None
+                        is_bull = (last_close > ma50) and ((ma50_gt_ma200 is None) or ma50_gt_ma200) and (rsi >= 55)
+                        is_bear = (last_close < ma50) and ((ma50_gt_ma200 is None) or (not ma50_gt_ma200)) and (rsi <= 45)
+                        if vol_ann >= 0.35:
+                            regime = MarketRegime.VOLATILE
+                        elif is_bull:
+                            regime = MarketRegime.BULL
+                        elif is_bear:
+                            regime = MarketRegime.BEAR
+                        else:
+                            regime = MarketRegime.SIDEWAYS
+                        rsi_term = max(0.0, 1 - abs(rsi - 50) / 50)
+                        ma_term = 0.5 if (ma50_gt_ma200 is None) else (1.0 if ma50_gt_ma200 else 0.0)
+                        score = ((1 if last_close > ma50 else 0) + ma_term + rsi_term) / 3.0
+                        confidence = 0.50 + min(0.40, abs(score - 0.5) * 0.8)
+                        if regime == MarketRegime.VOLATILE:
+                            confidence = max(0.50, confidence - 0.10)
+                        self.logger.info("US market state from %s (%d bars)", sym, len(close))
+                        return MarketState(
+                            regime=regime,
+                            volatility_level=volatility_level,
+                            trend_direction=trend_direction,
+                            confidence=confidence,
+                            timestamp=current_time,
+                        )
+
             # KIS 업종지수 일자별(일봉) 기반 결정적 시장판단
             if self.kis is not None:
                 end_dt = self.date_str or current_time.strftime("%Y%m%d")

@@ -1,6 +1,6 @@
-# NASDAQ100 자동매매 트레이딩 봇
+# SP500 자동매매 트레이딩 봇
 
-한국투자증권(KIS) Open API를 이용한 **NASDAQ100(미국)** 중심 퀀트 자동매매 봇입니다.  
+한국투자증권(KIS) Open API를 이용한 **SP500(미국)** 중심 퀀트 자동매매 봇입니다.  
 국내 시장(KOSPI / KOSDAQ / KONEX) 경로도 코드에 남아 있어 `MARKET` 환경 변수로 전환할 수 있습니다.
 
 > **⚠️ 면책 조항 — 본 코드를 사용하기 전에 반드시 읽으세요**
@@ -32,16 +32,16 @@
 
 정해진 스케줄(**KST 기준**, 미국 장 시간에 맞춤)에 따라 다음을 자동 수행합니다.
 
-| 단계 | 설명 (NASDAQ100) |
+| 단계 | 설명 (SP500) |
 |------|------------------|
-| 스크리닝 | KIS `frgn_code.mst` + `nasmst.cod` 마스터 → 유동성·재무·기술·레짐·섹터 트렌드 |
+| 스크리닝 | KIS `frgn_code.mst`(S&P500) + NAS/NYS/AMS 마스터 → 유동성·재무·기술·**SPY 레짐**·섹터 트렌드 |
 | 뉴스 수집 | Google News RSS (KR 시장은 네이버 검색 API) |
 | 분석 | OpenAI GPT(US 프롬프트·USD 표기) 또는 휴리스틱 (`OPENAI_API_KEY` 없을 때) |
-| 매매 | KIS Open API — `MARKET=NASDAQ100` 시 **해외 잔고·주문** (`TTTS3012R`, `TTTT1002U` 등) |
+| 매매 | KIS Open API — `MARKET=SP500` 시 **해외 잔고·주문** (`TTTS3012R`, `TTTT1002U` 등) |
 | 리스크 | 장중 별도 프로세스에서 손절·익절·전략 매도 |
 | 사후 처리 | SQLite 기록, 주문 정합성, 월간 성과 리뷰·산출물 정리 |
 
-- **기본 시장:** `MARKET=NASDAQ100` (`integrated_manager`, `screener`, `gpt_analyzer` 기본값)
+- **기본 시장:** `MARKET=SP500` (`integrated_manager`, `screener`, `gpt_analyzer` 기본값)
 - **실행 환경:** Docker Compose (`integrated_manager` + `background_risk_manager`)
 - **설정:** `config/config.json`(전략·스케줄) + `config/.env`(비밀값, Git 제외)
 - **모듈 연동:** `output/` 아래 JSON·DB 파일 파이프라인
@@ -51,11 +51,11 @@
 
 ## 2. 주요 기능
 
-- **NASDAQ100 유니버스** — KIS 해외 마스터에서 나스닥100 편입 종목만 조인 (~101종)
+- **SP500 유니버스** — `frgn_code.mst`(S&P500=1) ∩ NAS/NYS/AMS 해외 마스터 (~500종, 티커별 거래소)
 - **US 스크리닝** — 5일 평균 거래대금(`min_trading_value_5d_avg_us`), 최소 점수·모멘텀·변동성 필터, 섹터 다양화
 - **티커 정규화** — `utils.normalize_ticker_6()` / `norm_ticker` (`MARKET` 기준: US 심볼·KR 6자리). `trader`는 `self._t()` 헬퍼 사용
 - **KIS 해외 시세** — `overseas_daily_price`, `overseas_price_detail` 등 (`api/overseas_stock/`)
-- **GPT / 휴리스틱 분석** — `MARKET=NASDAQ100` 시 US 전용 프롬프트(초기필터·전술·리밸런싱), 가격·예산 **USD** (`fmt_money`), `gpt_params.budget_guard` / `initial_filter` 연동
+- **GPT / 휴리스틱 분석** — `MARKET=SP500` 시 US 전용 프롬프트(초기필터·전술·리밸런싱), 가격·예산 **USD** (`fmt_money`), `gpt_params.budget_guard` / `initial_filter` 연동
 - **스케줄 오케스트레이션** — `integrated_manager.py`가 평일 잡·스크리너·파이프라인·잔액·체결확인·리컨실·요약 담당
 - **해외 잔고·주문** — `account.py` → `kis_overseas_account` (USD), `KIS.order_cash()` → `overseas_order` (NASD)
 - **장중 리스크** — `background_risk_manager` 컨테이너 (국내 장 시간 로직 잔존, US 전환 작업 중)
@@ -80,7 +80,7 @@
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
 │  config/config.json + config/.env (Git 제외)                             │
-│  output/  ← screener_*_NASDAQ100.json, gpt_trades_*, trading_log.db     │
+│  output/  ← screener_*_SP500.json, gpt_trades_*, trading_log.db     │
 └─────────────────────────────────────────────────────────────────────────┘
          ▲                              ▲
          │                              │
@@ -90,14 +90,14 @@
 └──────────────────────┘      └──────────────────────────┘
 ```
 
-### 3.2 평일 스케줄 (KST, NASDAQ100 기준)
+### 3.2 평일 스케줄 (KST, SP500 기준)
 
 `config/config.json`의 `daily_summary`, `schedule_times`, `batch_execution_check`로 설정합니다. **현재 기본값(미국 정규장 대략 23:30~06:00 KST):**
 
 | 시각 | 작업 | 실행 |
 |------|------|------|
 | 23:25 | 장 시작 직전 잔액 | `account.py` |
-| **22:30** | 스크리너 | `screener.py --market NASDAQ100` |
+| **22:30** | 스크리너 | `screener.py --market SP500` |
 | **23:40** | 매매 파이프라인 | `health_check` → `news_collector` → `gpt_analyzer` → `trader` |
 | **06:05** | 일괄 체결 확인 | `trader.py --batch-check-only` |
 | 15:22 | 주문 정합성 | `order_reconciler.py` (KR 스케줄 잔존, 필요 시 조정) |
@@ -113,10 +113,10 @@
 
 ```
 [22:30 screener]                         [23:40 pipeline]
-screener.py --market NASDAQ100           health_check.py (AAPL @ NAS)
-  → screener_candidates_*_NASDAQ100.json   → news_collector.py (Google RSS)
-  → screener_scores_*_NASDAQ100.json       → gpt_analyzer.py
-  → market_state_*_NASDAQ100.json          → trader.py → recorder → trading_log.db
+screener.py --market SP500           health_check.py (AAPL @ NAS)
+  → screener_candidates_*_SP500.json   → news_collector.py (Google RSS)
+  → screener_scores_*_SP500.json       → gpt_analyzer.py
+  → market_state_*_SP500.json          → trader.py → recorder → trading_log.db
          └──────────────────────────────────────────┘
                               (장중, 별도 컨테이너) risk_manager.py
 ```
@@ -134,11 +134,11 @@ screener.py --market NASDAQ100           health_check.py (AAPL @ NAS)
 
 | 패턴 | 모듈 |
 |------|------|
-| `screener_candidates_{date}_NASDAQ100.json` | `screener.py` |
+| `screener_candidates_{date}_SP500.json` | `screener.py` |
 | `screener_candidates_full_*`, `screener_scores_*` | `screener.py` |
-| `market_state_{date}_NASDAQ100.json` | `screener.py` |
-| `collected_news_{date}_NASDAQ100.json` | `news_collector.py` |
-| `gpt_trades_{date}_NASDAQ100.json` | `gpt_analyzer.py` (`plans[]`, 결정·전략·USD 분석) |
+| `market_state_{date}_SP500.json` | `screener.py` |
+| `collected_news_{date}_SP500.json` | `news_collector.py` |
+| `gpt_trades_{date}_SP500.json` | `gpt_analyzer.py` (`plans[]`, 결정·전략·USD 분석) |
 | `balance_*`, `summary_*` | `account.py` (US: `currency: "USD"`) |
 | `trading_log.db` | `recorder.py` |
 | `cache/` (`kis_token.json`, `*.mst`, `*.pkl`) | KIS·스크리너 |
@@ -164,7 +164,7 @@ api/kis_auth.KIS (DomesticStock + OverseasStock)
 
 정규화: `kis_overseas_account.py` → `balance_*.json` / `summary_*.json` (USD, `currency` 필드)
 
-- **마스터:** `kis_master.load_kis_master("NASDAQ100")` — `frgn_code.mst` ∩ `nasmst.cod`
+- **마스터:** `kis_master.load_kis_master("SP500")` — `frgn_code.mst`(S&P500) ∩ (nasmst+nysmst+amsmst)
 - **레이트 리밋:** `config.json` → `kis_limits.max_rps=2`, `max_concurrency=1`
 
 ---
@@ -175,7 +175,7 @@ api/kis_auth.KIS (DomesticStock + OverseasStock)
 
 | 파일 | 역할 |
 |------|------|
-| `integrated_manager.py` | 스케줄, subprocess 파이프라인, `MARKET` 기본 `NASDAQ100` |
+| `integrated_manager.py` | 스케줄, subprocess 파이프라인, `MARKET` 기본 `SP500` |
 | `run_integrated_manager.py` | Docker / 로컬 진입점 |
 | `risk_manager.py` | 장중 리스크 사이클 |
 | `run_background_risk_manager.py` | 리스크 전용 컨테이너 |
@@ -184,7 +184,7 @@ api/kis_auth.KIS (DomesticStock + OverseasStock)
 
 | 파일 | 역할 |
 |------|------|
-| `screener.py` | `--market NASDAQ100` (기본), `--debug` 퍼널 로그 |
+| `screener.py` | `--market SP500` (기본), `--debug` 퍼널 로그 |
 | `screener_core.py` | 지표·점수·`MarketState` |
 | `kis_master.py` | 국내/해외 `.mst`·`.cod` 다운로드·캐시 |
 | `health_check.py` | US: `AAPL` @ `NAS`, KR: `005930` |
@@ -245,15 +245,15 @@ api/kis_auth.KIS (DomesticStock + OverseasStock)
 
 발급: [KIS Developers](https://apiportal.koreainvestment.com/) — **해외주식 거래 권한·계좌** 필요
 
-**NASDAQ100 실매매 시:** 해외증권 계좌에 **USD 예수금**(또는 원화 → 외화 환전)이 있어야 합니다.  
-`account.py`는 `MARKET=NASDAQ100`일 때 해외 잔고 TR을 조회하며, `summary_*.json`의 금액은 **USD**이고 `currency: "USD"`가 포함됩니다. `gpt_analyzer` Budget Guard·`trader` 주문 가능 금액도 이 값을 사용합니다.
+**SP500 실매매 시:** 해외증권 계좌에 **USD 예수금**(또는 원화 → 외화 환전)이 있어야 합니다.  
+`account.py`는 `MARKET=SP500`일 때 해외 잔고 TR을 조회하며, `summary_*.json`의 금액은 **USD**이고 `currency: "USD"`가 포함됩니다. `gpt_analyzer` Budget Guard·`trader` 주문 가능 금액도 이 값을 사용합니다.
 
 로컬 해외 잔고 확인:
 
 ```bash
 cd src
 CONFIG_PATH=../config/config.json OUTPUT_DIR=../output CACHE_DIR=../output/cache \
-  KIS_TOKEN_FILE=../output/cache/kis_token.json MARKET=NASDAQ100 \
+  KIS_TOKEN_FILE=../output/cache/kis_token.json MARKET=SP500 \
   python account.py
 ```
 
@@ -261,7 +261,7 @@ CONFIG_PATH=../config/config.json OUTPUT_DIR=../output CACHE_DIR=../output/cache
 
 | 변수 | 기본 | 설명 |
 |------|------|------|
-| `MARKET` | `NASDAQ100` | `NASDAQ100` / `KOSPI` / `KOSDAQ` / `KONEX` |
+| `MARKET` | `SP500` | `SP500` / `KOSPI` / `KOSDAQ` / `KONEX` |
 | `SLOTS` | `3` | GPT 최대 매수 계획 수 |
 
 로컬 실행 시 (Docker 외):
@@ -275,7 +275,7 @@ KIS_TOKEN_FILE=./output/cache/kis_token.json
 
 #### Naver Search API — KR 뉴스만
 
-`MARKET`이 국내 시장일 때 `news_collector`에 필요합니다. NASDAQ100만 쓸 경우 **선택**.
+`MARKET`이 국내 시장일 때 `news_collector`에 필요합니다. SP500만 쓸 경우 **선택**.
 
 #### OpenAI — 선택
 
@@ -340,7 +340,7 @@ docker compose up --build -d
 docker compose logs -f integrated_manager
 ```
 
-### 7.3 로컬 — E2E 테스트 (NASDAQ100)
+### 7.3 로컬 — E2E 테스트 (SP500)
 
 프로젝트 루트에서 공통 환경 변수를 설정한 뒤 `src/`에서 실행합니다.
 
@@ -351,10 +351,10 @@ export CONFIG_PATH="$(pwd)/config/config.json"
 export OUTPUT_DIR="$(pwd)/output"
 export CACHE_DIR="$(pwd)/output/cache"
 export KIS_TOKEN_FILE="$(pwd)/output/cache/kis_token.json"
-export MARKET=NASDAQ100
+export MARKET=SP500
 export SLOTS=3
 
-# 날짜: output/screener_candidates_YYYYMMDD_NASDAQ100.json 의 YYYYMMDD
+# 날짜: output/screener_candidates_YYYYMMDD_SP500.json 의 YYYYMMDD
 DATE=20260529   # 실제 파일명에 맞게 변경
 
 cd src
@@ -363,8 +363,8 @@ cd src
 #### A. 스크리너 (선택, ~3–4분)
 
 ```bash
-python3 -u screener.py --market NASDAQ100 --workers 1 --debug
-# → ../output/screener_candidates_${DATE}_NASDAQ100.json
+python3 -u screener.py --market SP500 --workers 1 --debug
+# → ../output/screener_candidates_${DATE}_SP500.json
 ```
 
 #### B. 매매 파이프라인 — GPT까지 (`integrated_manager`와 동일 순서)
@@ -374,15 +374,15 @@ python3 -u screener.py --market NASDAQ100 --workers 1 --debug
 python3 health_check.py
 
 # 2) 뉴스 (Google RSS)
-python3 news_collector.py --file ../output/screener_candidates_${DATE}_NASDAQ100.json
+python3 news_collector.py --file ../output/screener_candidates_${DATE}_SP500.json
 
 # 3) 해외 잔고 스냅샷 (권장 — GPT Budget Guard용 USD)
 python3 account.py
 # → ../output/summary_${DATE}.json (currency: USD)
 
 # 4) GPT 분석
-python3 gpt_analyzer.py --date ${DATE} --market NASDAQ100 --slots ${SLOTS:-3}
-# → ../output/gpt_trades_${DATE}_NASDAQ100.json
+python3 gpt_analyzer.py --date ${DATE} --market SP500 --slots ${SLOTS:-3}
+# → ../output/gpt_trades_${DATE}_SP500.json
 ```
 
 #### C. 트레이더 (실주문 주의)
@@ -426,7 +426,7 @@ trading_bot_260530_NASDAQ/
 │   │   ├── domestic_stock/
 │   │   └── overseas_stock/
 │   │       └── overseas_stock_functions.py
-│   ├── kis_master.py            # KOSPI/KOSDAQ + NASDAQ100 마스터
+│   ├── kis_master.py            # KOSPI/KOSDAQ + SP500 마스터
 │   ├── screener.py / screener_core.py
 │   ├── news_collector.py / gpt_analyzer.py
 │   ├── kis_overseas_account.py  # 해외 잔고 → balance/summary JSON (USD)
@@ -448,7 +448,7 @@ trading_bot_260530_NASDAQ/
 
 | 영역 | 상태 |
 |------|------|
-| NASDAQ100 마스터·1·2차 스크리닝 | ✅ 동작 확인 |
+| SP500 마스터·1·2차 스크리닝 | ✅ 동작 확인 |
 | 해외 시세·Amount5D·PER/PBR | ✅ KIS TR |
 | Google News RSS (US) | ✅ |
 | GPT 분석·`gpt_trades_*.json` | ✅ (US 프롬프트·USD 표기) |

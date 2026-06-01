@@ -246,7 +246,7 @@ def get_event_emoji(event_type: str) -> str:
 def create_trade_embed(payload: Dict[str, Any]) -> Dict[str, Any]:
     side = str(payload.get("side", "?")).upper()
     name = payload.get("name", "N/A")
-    ticker = normalize_ticker_6(payload.get("ticker", "N/A"), os.getenv("MARKET", "NASDAQ100"))
+    ticker = normalize_ticker_6(payload.get("ticker", "N/A"), os.getenv("MARKET", "SP500"))
     qty = payload.get("qty", 0)
     price = payload.get("price", 0)
     trade_status = payload.get("trade_status", "submitted")

@@ -32,6 +32,8 @@ from utils import (
     get_account_snapshot_cached,
     is_market_open_day,
     normalize_ticker_6,
+    fmt_money,
+    fmt_money_signed,
 )
 
 # 디스코드 노티파이어
@@ -164,7 +166,7 @@ else:
     logger.warning("유효한 DISCORD_WEBHOOK_URL이 없어 에러 로그의 디스코드 전송을 비활성화합니다.")
 
 # ───────────────── 설정 ─────────────────
-MARKET = os.getenv("MARKET", "NASDAQ100")
+MARKET = os.getenv("MARKET", "SP500")
 SLOTS = os.getenv("SLOTS", "3")
 MAX_ATTEMPTS = int(os.getenv("SCHED_MAX_ATTEMPTS", "3"))
 INITIAL_BACKOFF_MINUTES = int(os.getenv("SCHED_INITIAL_BACKOFF_MINUTES", "2"))
@@ -392,7 +394,7 @@ def capture_balance_snapshot(snapshot_type: str) -> Optional[Dict]:
             qty = int(str(h.get("hldg_qty", 0)).replace(",", ""))
             if qty > 0:
                 holdings_detail.append({
-                    "ticker": normalize_ticker_6(h.get("pdno", ""), os.getenv("MARKET", "NASDAQ100")),
+                    "ticker": normalize_ticker_6(h.get("pdno", ""), os.getenv("MARKET", "SP500")),
                     "name": h.get("prdt_name", "N/A"),
                     "qty": qty,
                     "price": int(h.get("prpr", 0)),
@@ -529,12 +531,17 @@ def send_daily_trading_summary():
         
         # 변화량 이모지
         change_emoji = "📈" if total_change > 0 else "📉" if total_change < 0 else "➡️"
-        
+        mkt = os.getenv("MARKET", "SP500")
+
         # 임베드 필드 구성
         fields = [
             {
                 "name": f"{change_emoji} 잔액 변화",
-                "value": f"**{open_balance['total_balance']:,}원** → **{close_balance['total_balance']:,}원** ({total_change:+,}원)",
+                "value": (
+                    f"**{fmt_money(open_balance['total_balance'], mkt)}** → "
+                    f"**{fmt_money(close_balance['total_balance'], mkt)}** "
+                    f"({fmt_money_signed(total_change, mkt)})"
+                ),
                 "inline": False
             }
         ]
@@ -549,12 +556,12 @@ def send_daily_trading_summary():
                 },
                 {
                     "name": "💰 실현 손익",
-                    "value": f"{realized_pnl:+,}원",
+                    "value": fmt_money_signed(realized_pnl, mkt),
                     "inline": True
                 },
                 {
                     "name": "📈 미실현 손익",
-                    "value": f"{unrealized_pnl:+,}원", 
+                    "value": fmt_money_signed(unrealized_pnl, mkt),
                     "inline": True
                 }
             ])
@@ -562,7 +569,7 @@ def send_daily_trading_summary():
             if abs(estimated_fees) > 0:
                 fields.append({
                     "name": "💸 추정 수수료",
-                    "value": f"{estimated_fees:+,}원",
+                    "value": fmt_money_signed(estimated_fees, mkt),
                     "inline": True
                 })
         

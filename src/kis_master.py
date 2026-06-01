@@ -29,7 +29,13 @@ _MST_URLS = {
 }
 
 _MST_PARSE_VERSION = "v4"
-_US_MST_PARSE_VERSION = "v1"
+_US_MST_PARSE_VERSION = "v2"
+_EXCD_OVRS = {
+    "NAS": ("NAS", "NASD"),
+    "NYS": ("NYS", "NYSE"),
+    "AMS": ("AMS", "AMEX"),
+}
+_SP500_EXCD_PRIORITY = {"NYS": 0, "NAS": 1, "AMS": 2}
 
 # 해외주식 종목정보파일 (KIS 공식: overseas_stock_code.py)
 _OVERSEAS_COD_URLS = {
@@ -221,8 +227,13 @@ def _download_frgn_mst(cache_key: str) -> Optional[Path]:
     return mst_path
 
 
-def _standardize_nasmst_df(df: pd.DataFrame) -> pd.DataFrame:
-    """nasmst.cod → screener 표준 스키마."""
+def _standardize_overseas_cod_df(
+    df: pd.DataFrame,
+    *,
+    excd: str,
+    ovrs_excg: str,
+) -> pd.DataFrame:
+    """nasmst/nysmst/amsmst.cod → screener 표준 스키마."""
     if df is None or df.empty:
         return pd.DataFrame()
     work = df.copy()
@@ -246,8 +257,8 @@ def _standardize_nasmst_df(df: pd.DataFrame) -> pd.DataFrame:
     else:
         out["Sector"] = "N/A"
     out["SectorSource"] = "mst"
-    out["EXCD"] = "NAS"
-    out["OvrsExcg"] = "NASD"
+    out["EXCD"] = excd
+    out["OvrsExcg"] = ovrs_excg
     out["Marcap"] = out["Close"] * out["ListedShares"]
     out = out[out["Code"].astype(str).str.len() >= 1]
     out = out.drop_duplicates(subset=["Code"]).set_index("Code")
@@ -255,35 +266,60 @@ def _standardize_nasmst_df(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def _load_nasdaq100_master(cache_key: str, force_refresh: bool = False) -> pd.DataFrame:
-    """frgn_code(나스닥100=1) ∩ nasmst.cod(주식)."""
-    cache_id = f"NASDAQ100_{cache_key}_{_US_MST_PARSE_VERSION}"
+def _sp500_symbols_from_frgn(frgn: pd.DataFrame) -> set:
+    sym = frgn["심볼"].astype(str).str.strip().str.upper()
+    sp_flag = frgn.get("S&P 500 편입종목여부", pd.Series(dtype=str)).astype(str).str.strip()
+    return set(sym[sp_flag == "1"].tolist())
+
+
+def _load_sp500_master(cache_key: str, force_refresh: bool = False) -> pd.DataFrame:
+    """frgn_code(S&P500=1) ∩ (nasmst + nysmst + amsmst) 주식. 중복 시 NYS > NAS > AMS."""
+    cache_id = f"SP500_{cache_key}_{_US_MST_PARSE_VERSION}"
     if not force_refresh:
         cached = cache_load("kis_master", cache_id)
         if isinstance(cached, pd.DataFrame) and not cached.empty:
             return cached
 
     frgn_path = _download_frgn_mst(cache_key)
-    nas_path = _download_overseas_cod("NAS", cache_key)
-    if frgn_path is None or nas_path is None:
+    if frgn_path is None:
         return pd.DataFrame()
 
     try:
         frgn = _parse_frgn_code_mst(frgn_path)
-        nas_raw = _parse_nasmst_cod(nas_path)
-        nas = _standardize_nasmst_df(nas_raw)
     except Exception:
         return pd.DataFrame()
-
-    if frgn.empty or nas.empty:
+    if frgn.empty:
         return pd.DataFrame()
 
-    sym = frgn["심볼"].astype(str).str.strip().str.upper()
-    ndx_flag = frgn.get("나스닥100 편입종목여부", pd.Series(dtype=str)).astype(str).str.strip()
-    ndx_symbols = set(sym[ndx_flag == "1"].tolist())
-    out = nas[nas.index.isin(ndx_symbols)].copy()
-    if out.empty:
+    sp500_symbols = _sp500_symbols_from_frgn(frgn)
+    if not sp500_symbols:
         return pd.DataFrame()
+
+    frames: List[pd.DataFrame] = []
+    for val in ("NAS", "NYS", "AMS"):
+        excd, ovrs = _EXCD_OVRS[val]
+        cod_path = _download_overseas_cod(val, cache_key)
+        if cod_path is None:
+            continue
+        try:
+            raw = _parse_nasmst_cod(cod_path)
+            std = _standardize_overseas_cod_df(raw, excd=excd, ovrs_excg=ovrs)
+        except Exception:
+            continue
+        if std.empty:
+            continue
+        hit = std[std.index.isin(sp500_symbols)].copy()
+        if not hit.empty:
+            frames.append(hit)
+
+    if not frames:
+        return pd.DataFrame()
+
+    out = pd.concat(frames)
+    out["_pri"] = out["EXCD"].map(_SP500_EXCD_PRIORITY).fillna(9)
+    out = out.sort_values("_pri")
+    out = out[~out.index.duplicated(keep="first")]
+    out = out.drop(columns=["_pri"])
 
     cache_save("kis_master", cache_id, out)
     return out
@@ -426,8 +462,14 @@ def load_kis_master(market: str, cache_key: Optional[str] = None, force_refresh:
     market = (market or "").upper()
     ck = cache_key or datetime_now_yyyymmdd()
 
+    if market in ("SP500", "SPX500", "S&P500"):
+        return _load_sp500_master(ck, force_refresh=force_refresh)
     if market in ("NASDAQ100", "NDX100"):
-        return _load_nasdaq100_master(ck, force_refresh=force_refresh)
+        import logging
+        logging.getLogger(__name__).warning(
+            "NASDAQ100 is deprecated; loading SP500 universe instead."
+        )
+        return _load_sp500_master(ck, force_refresh=force_refresh)
 
     cache_id = f"{market}_{ck}_{_MST_PARSE_VERSION}"
     cached = None if force_refresh else cache_load("kis_master", cache_id)
