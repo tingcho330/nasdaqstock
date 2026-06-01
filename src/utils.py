@@ -6,8 +6,9 @@ import logging
 import math
 from pathlib import Path
 from typing import Optional, Tuple, List, Dict, Any, Iterable, Union
-from datetime import datetime, time as dt_time, date  # ← datetime.time 별칭
+from datetime import datetime, time as dt_time, date, timedelta  # ← datetime.time 별칭
 from zoneinfo import ZoneInfo
+import holidays
 import threading
 import re
 import pandas as pd
@@ -30,6 +31,9 @@ __all__ = [
     "is_newly_listed",
     "in_time_windows",
     "is_market_open_day",
+    "risk_session_windows",
+    "is_regular_session",
+    "next_session_open_kst",
     "find_latest_file",
     "cache_save",
     "cache_load",
@@ -69,6 +73,8 @@ __all__ = [
 # KST 타임존 정의
 # ────────────────────────────────
 KST = ZoneInfo("Asia/Seoul")
+_ET = ZoneInfo("America/New_York")
+_XNYS_HOLIDAY_YEARS: Dict[int, set] = {}
 
 # ────────────────────────────────
 # 공통 경로
@@ -272,12 +278,130 @@ def in_time_windows(
     return False
 
 # ────────────────────────────────
-# 장 개장일 체크 (간단: 주말 제외)
+# 장 개장일 체크 (KR: 주말 제외 / US: NYSE XNYS 휴장 캘린더)
 # ────────────────────────────────
-def is_market_open_day(date: Optional[date] = None) -> bool:
-    if date is None:
-        date = datetime.now(KST).date()
-    return date.weekday() < 5
+def _xnys_holiday_dates(year: int) -> set:
+    cached = _XNYS_HOLIDAY_YEARS.get(year)
+    if cached is not None:
+        return cached
+    cal = holidays.financial_holidays("XNYS", years=year)
+    cached = set(cal.keys())
+    _XNYS_HOLIDAY_YEARS[year] = cached
+    return cached
+
+
+def _is_us_trading_day(d: date) -> bool:
+    if d.weekday() >= 5:
+        return False
+    return d not in _xnys_holiday_dates(d.year)
+
+
+def is_market_open_day(check_date: Optional[date] = None, market: Optional[str] = None) -> bool:
+    """
+    거래일 여부. MARKET 미지정 시 환경변수 MARKET 사용.
+    US(SP500 등): America/New_York 기준 달력일 + NYSE(XNYS) 휴장.
+    KR: KST 기준 달력일, 주말 제외(공휴일 캘린더는 미연동).
+    """
+    m = (market or os.getenv("MARKET", "KOSPI")).upper().strip()
+    if is_us_market(m):
+        if check_date is None:
+            check_date = datetime.now(_ET).date()
+        return _is_us_trading_day(check_date)
+    if check_date is None:
+        check_date = datetime.now(KST).date()
+    return check_date.weekday() < 5
+
+
+def previous_trading_day(
+    check_date: Optional[date] = None,
+    market: Optional[str] = None,
+    max_lookback: int = 15,
+) -> date:
+    """check_date 직전(포함 시 개장일이면 check_date) 거래일."""
+    m = (market or os.getenv("MARKET", "KOSPI")).upper().strip()
+    if check_date is None:
+        check_date = datetime.now(_ET).date() if is_us_market(m) else datetime.now(KST).date()
+    if is_market_open_day(check_date, m):
+        return check_date
+    d = check_date
+    for _ in range(max_lookback):
+        d -= timedelta(days=1)
+        if is_market_open_day(d, m):
+            return d
+    return check_date
+
+# ────────────────────────────────
+# 장중 세션 (리스크 폴링·트리거 가드) — KST 시간창 + 거래일
+# ────────────────────────────────
+_KR_RISK_SESSION_WINDOWS = ["09:00-15:30"]
+_US_RISK_SESSION_DEFAULT = ["23:15-06:00"]
+
+
+def risk_session_windows(market: Optional[str] = None, config: Optional[dict] = None) -> List[str]:
+    """리스크 모니터링 활성 KST 시간창. US: trading_params.sell_time_windows 또는 market_hours."""
+    m = (market or os.getenv("MARKET", "KOSPI")).upper().strip()
+    cfg = config if config is not None else (load_config() or {})
+    if is_us_market(m):
+        mh = cfg.get("market_hours") if isinstance(cfg.get("market_hours"), dict) else {}
+        entry = (mh or {}).get(m) or (mh or {}).get("SP500") or {}
+        if isinstance(entry, dict) and entry.get("risk_poll_windows"):
+            return [str(w) for w in entry["risk_poll_windows"]]
+        tp = cfg.get("trading_params") or {}
+        sw = tp.get("sell_time_windows")
+        if sw:
+            return [str(w) for w in sw]
+        return list(_US_RISK_SESSION_DEFAULT)
+    return list(_KR_RISK_SESSION_WINDOWS)
+
+
+def is_regular_session(
+    now: Optional[datetime] = None,
+    market: Optional[str] = None,
+    session_windows: Optional[List[str]] = None,
+    config: Optional[dict] = None,
+) -> bool:
+    """거래일이며 세션 시간창(KST) 안이면 True."""
+    m = (market or os.getenv("MARKET", "KOSPI")).upper().strip()
+    if now is None:
+        now = datetime.now(KST)
+    elif now.tzinfo is None:
+        now = now.replace(tzinfo=KST)
+    else:
+        now = now.astimezone(KST)
+
+    if is_us_market(m):
+        if not is_market_open_day(now.astimezone(_ET).date(), m):
+            return False
+    elif not is_market_open_day(now.date(), m):
+        return False
+
+    wins = session_windows if session_windows is not None else risk_session_windows(m, config)
+    return in_time_windows(now, wins, tz=KST)
+
+
+def next_session_open_kst(
+    now: Optional[datetime] = None,
+    market: Optional[str] = None,
+    session_windows: Optional[List[str]] = None,
+    config: Optional[dict] = None,
+) -> datetime:
+    """다음 세션 시작 시각(KST). 이미 장중이면 now 반환."""
+    if now is None:
+        now = datetime.now(KST)
+    elif now.tzinfo is None:
+        now = now.replace(tzinfo=KST)
+    else:
+        now = now.astimezone(KST)
+
+    if is_regular_session(now, market, session_windows, config):
+        return now
+
+    candidate = now
+    for _ in range(7 * 24 * 4):
+        candidate += timedelta(minutes=15)
+        if is_regular_session(candidate, market, session_windows, config):
+            return candidate
+    return now + timedelta(hours=1)
 
 # ────────────────────────────────
 # 내부: 파일명에서 날짜/시장/런ID 추출

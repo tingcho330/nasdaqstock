@@ -31,6 +31,8 @@ from utils import (
     in_time_windows,
     get_account_snapshot_cached,
     is_market_open_day,
+    is_us_market,
+    is_regular_session,
     normalize_ticker_6,
     fmt_money,
     fmt_money_signed,
@@ -133,15 +135,9 @@ class BackgroundRiskManager:
             self.is_running = False
             
     def _is_trading_hours(self, now: datetime) -> bool:
-        """장중 시간 확인"""
-        # 평일 09:00-15:30 (장중)
-        if now.weekday() >= 5:  # 주말
-            return False
-            
-        market_start = now.replace(hour=9, minute=0, second=0, microsecond=0)
-        market_end = now.replace(hour=15, minute=30, second=0, microsecond=0)
-        
-        return market_start <= now <= market_end
+        """장중 세션 (US: sell_time_windows + NYSE 거래일 / KR: 09:00-15:30)."""
+        cfg = getattr(self.settings, "_config", None) or {}
+        return is_regular_session(now, MARKET, config=cfg)
         
     def _run_risk_check(self):
         """리스크 체크 실행 - RiskManager의 완전한 판단 로직 사용"""
@@ -684,8 +680,9 @@ def run_script(script_name: str, run_id: str) -> Tuple[bool, bool, float]:
 def run_screener_job():
     """스크리너 단독 실행"""
     try:
-        if not is_market_open_day():
-            msg = "오늘은 휴장일이므로 screener 실행을 건너뜁니다."
+        if not is_market_open_day(market=MARKET):
+            label = "US(NYSE)" if is_us_market(MARKET) else "국내"
+            msg = f"오늘은 {label} 휴장일이므로 screener 실행을 건너뜁니다."
             logger.info(msg)
             _notify(msg=f"ℹ️ {msg}", key="screener_holiday", cooldown_sec=600)
             return
@@ -835,8 +832,9 @@ def run_monthly_maintenance_if_due():
 def run_trading_pipeline():
     """전체 파이프라인 실행 (상태 관리 및 의존성 기반 재시작 포함)"""
     try:
-        if not is_market_open_day():
-            msg = "오늘은 휴장일이므로 자동매매 파이프라인을 실행하지 않습니다."
+        if not is_market_open_day(market=MARKET):
+            label = "US(NYSE)" if is_us_market(MARKET) else "국내"
+            msg = f"오늘은 {label} 휴장일이므로 자동매매 파이프라인을 실행하지 않습니다."
             logger.info(msg)
             _notify(msg=f"ℹ️ {msg}", key="holiday", cooldown_sec=600)
             return

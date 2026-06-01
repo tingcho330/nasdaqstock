@@ -1194,12 +1194,12 @@ def _resolve_business_date(date_str: str, market: str) -> str:
     except Exception:
         return date_str
 
-    if is_market_open_day(dt):
+    if is_market_open_day(dt, market):
         return date_str
 
     for i in range(1, 15):
         prev = dt - timedelta(days=i)
-        if is_market_open_day(prev):
+        if is_market_open_day(prev, market):
             d = prev.strftime("%Y%m%d")
             logger.info("휴장일 감지 → 기준일 보정: %s → %s", date_str, d)
             return d
@@ -2482,10 +2482,17 @@ def run_screener(date_str: str, market: str, config_path: Optional[str], workers
 
     ensure_output_dir()
 
+    if not is_market_open_day(market=market):
+        msg = f"휴장일이므로 screener를 건너뜁니다. (market={market})"
+        logger.info(msg)
+        _notify(f"ℹ️ {msg}", key="screener_holiday", cooldown_sec=600)
+        return
+
     # 오늘 개장일 여부(로그용)
     try:
-        open_day = is_market_open_day(datetime.now(KST).date())
-        logger.info("오늘 한국 시장 개장일 여부: %s", "개장" if open_day else "휴장")
+        mkt_label = "US(NYSE)" if is_us_market(market) else "국내"
+        open_day = is_market_open_day(market=market)
+        logger.info("오늘 %s 개장일 여부: %s", mkt_label, "개장" if open_day else "휴장")
     except Exception:
         pass
 

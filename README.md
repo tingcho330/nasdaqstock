@@ -58,7 +58,7 @@
 - **GPT / 휴리스틱 분석** — `MARKET=SP500` 시 US 전용 프롬프트(초기필터·전술·리밸런싱), 가격·예산 **USD** (`fmt_money`), `gpt_params.budget_guard` / `initial_filter` 연동
 - **스케줄 오케스트레이션** — `integrated_manager.py`가 평일 잡·스크리너·파이프라인·잔액·체결확인·리컨실·요약 담당
 - **해외 잔고·주문** — `account.py` → `kis_overseas_account` (USD), `KIS.order_cash()` → `overseas_order` (NASD)
-- **장중 리스크** — `background_risk_manager` 컨테이너 (국내 장 시간 로직 잔존, US 전환 작업 중)
+- **장중 리스크** — `background_risk_manager` (US: `sell_time_windows` / NYSE 거래일, KR: 09:00–15:30 KST)
 - **주문 정합성** — `order_reconciler.py` (`norm_ticker`로 US/KR 티커 통일)
 - **비밀값 분리** — API 키·계좌·웹훅은 `config/.env`만 사용
 
@@ -106,7 +106,7 @@
 
 > 서머타임(DST) 적용 시 미국 장 개장·마감이 KST에서 약 1시간 밀리므로 `schedule_times`·`buy_time_windows`를 수동 조정하세요.
 
-- 휴장일: 스크리너·파이프라인 스킵 (`is_market_open_day` — 한국 거래소 캘린더 기준, US 전용 캘린더는 미구현)
+- 휴장일: 스크리너·파이프라인 스킵 (`is_market_open_day` — US: NYSE/XNYS, KR: 주말만)
 - **월간 유지보수:** `monthly_maintenance.day`(기본 1일) 1회 — `reviewer.py` → `cleanup_output.py`
 
 ### 3.3 스크리너 vs 매매 파이프라인
@@ -458,9 +458,9 @@ trading_bot_260530_NASDAQ/
 | 해외 잔고 (`account.py` + `kis_overseas_account`) | ✅ USD `summary_*.json` |
 | USD 예수금 (`extract_cash_from_summary`) | ✅ `ord_psbl_frcr_amt` 우선 |
 | 파이프라인 E2E (health → news → GPT) | ✅ 로컬 검증 (§7.3) |
-| 장중 리스크 US 장 시간 | ⏳ `risk_manager` KR 09:00–15:30 잔존 |
+| 장중 리스크 US 장 시간 | ✅ `is_regular_session` + `trading_params.sell_time_windows` |
 | `order_reconciler` 스케줄 | ⏳ 15:22 KST (US 장에 맞게 조정 권장) |
-| 휴장일 판단 | ⏳ 한국 거래소 캘린더 (`is_market_open_day`) |
+| 휴장일 판단 | ✅ US: NYSE(XNYS) / KR: 주말 (`is_market_open_day`) |
 | `Marcap` (US) | 마스터 미제공 → 0, 시총 필터 스킵 |
 | `investor_flow` (US) | 0 (국내 수급 API 경로) |
 

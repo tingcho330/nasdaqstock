@@ -6,7 +6,7 @@ import subprocess
 import time as pytime
 import pandas as pd
 from dataclasses import dataclass
-from datetime import datetime, time as dt_time, timedelta
+from datetime import datetime, timedelta
 from typing import Dict, Tuple, Optional, List
 
 # ── 공통 유틸/노티파이어 ────────────────────────────────────────────────
@@ -25,6 +25,10 @@ from utils import (
     fmt_money,
     fmt_money_signed,
     is_us_market,
+    is_market_open_day,
+    is_regular_session,
+    next_session_open_kst,
+    risk_session_windows,
 )
 from notifier import (
     DiscordLogHandler,
@@ -84,40 +88,10 @@ def _money(amount) -> str:
 def _money_signed(amount) -> str:
     return fmt_money_signed(float(amount or 0), _market())
 
-# ── 장중 정의(평일 09:00~15:30) ────────────────────────────────────────
-MARKET_START = dt_time(9, 0)
-MARKET_END   = dt_time(15, 30)
-
 def is_market_hours(now: Optional[datetime] = None) -> bool:
-    """평일 09:00~15:30 (KST) 에만 True"""
-    if now is None:
-        now = datetime.now(KST)
-    if now.weekday() > 4:  # 0=월 ~ 4=금
-        return False
-    now_t = now.time()
-    return MARKET_START <= now_t <= MARKET_END
+    """장중 세션 여부 (MARKET·config 기준, utils.is_regular_session)."""
+    return is_regular_session(now, _market())
 
-def next_market_open_kst(now: Optional[datetime] = None) -> datetime:
-    """다음 장 시작(평일 09:00) 시각 계산"""
-    if now is None:
-        now = datetime.now(KST)
-
-    # 이미 장중이면 지금 반환
-    if is_market_hours(now):
-        return now
-
-    # 오늘 09:00 기준
-    candidate = now.replace(hour=9, minute=0, second=0, microsecond=0)
-
-    # 오늘 장이 끝났으면 익일 09:00
-    if now.time() >= MARKET_END:
-        candidate = candidate + timedelta(days=1)
-
-    # 주말 건너뛰기
-    while candidate.weekday() >= 5:
-        candidate += timedelta(days=1)
-
-    return candidate
 
 def sleep_until_kst(when_dt: datetime):
     """지정한 KST 시각까지 대기. 15분 단위로 쪼개서 sleep."""
@@ -340,7 +314,14 @@ class RiskManager:
         self.auto_trigger_when_empty: bool = bool(rp.get("auto_trigger_trader_when_empty", True))
         self.auto_trigger_cooldown_sec: int = int(rp.get("auto_trigger_cooldown_sec", 900))  # 15분
         self.min_cash_to_trigger: int = int(rp.get("min_cash_to_trigger", 100_000))
-        self.buy_time_windows: List[str] = rp.get("buy_time_windows") or ["09:05-14:50"]
+        tp = self.config.get("trading_params", {}) or {}
+        mkt = _market()
+        self.session_windows: List[str] = risk_session_windows(mkt, self.config)
+        self.buy_time_windows: List[str] = (
+            tp.get("buy_time_windows")
+            or rp.get("buy_time_windows")
+            or (["23:20-05:45"] if is_us_market(mkt) else ["09:05-14:50"])
+        )
 
         # [NEW] 즉시 매도 옵션 및 브로커 초기화
         auto_sell_cfg = rp.get("auto_sell", {}) or {}
@@ -454,10 +435,12 @@ class RiskManager:
             return False
         # 시간대 가드
         now_kst = datetime.now(KST)
-        if now_kst.weekday() > 4:
-            logger.debug(f"[DIRECT_SELL] skip: weekend (ticker={ticker})")
+        if not is_market_open_day(market=_market()):
+            logger.debug(f"[DIRECT_SELL] skip: non-trading day (ticker={ticker})")
             return False
-        sell_win_ok = True if not self.rules.time_windows_for_sells else in_time_windows(now_kst, self.rules.time_windows_for_sells)
+        tp = self.config.get("trading_params", {}) or {}
+        sell_wins = self.rules.time_windows_for_sells or tp.get("sell_time_windows")
+        sell_win_ok = True if not sell_wins else in_time_windows(now_kst, sell_wins, tz=KST)
         if not sell_win_ok:
             logger.debug(f"[DIRECT_SELL] skip: outside sell window (ticker={ticker}, now={now_kst.strftime('%H:%M:%S')})")
             return False
@@ -889,7 +872,7 @@ class RiskManager:
             return False, f"holdings_qty>0 ({total_qty})"
 
         now = datetime.now(KST)
-        if not is_market_hours(now):
+        if not is_regular_session(now, _market(), self.session_windows, self.config):
             return False, "장외"
 
         # 매수 시간 창
