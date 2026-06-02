@@ -115,6 +115,20 @@ def build_overseas_summary(
 
     available = int(round(ord_psbl if ord_psbl > 0 else buy_amt))
 
+    if available <= 0 and os.getenv("KIS_TRACE", "").strip() == "1":
+        try:
+            logger.info(
+                "[KIS_TRACE] overseas_summary candidates ord_psbl=%s buy_amt=%s tot_evlu=%s keys_bal2=%s keys_pres2=%s keys_pres3=%s",
+                ord_psbl,
+                buy_amt,
+                tot_evlu,
+                list(bal2.keys())[:50],
+                list(pres2.keys())[:50],
+                list(pres3.keys())[:50],
+            )
+        except Exception as e:
+            logger.info("[KIS_TRACE] overseas_summary trace error: %s", e)
+
     return {
         "currency": "USD",
         "dnca_tot_amt": str(_i(buy_amt if buy_amt > 0 else ord_psbl)),

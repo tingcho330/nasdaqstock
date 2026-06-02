@@ -3,6 +3,7 @@
 
 import json
 import logging
+import os
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
@@ -156,6 +157,22 @@ class OverseasStock:
             )
             return pd.DataFrame(), pd.DataFrame()
         body = res.json()
+        if os.getenv("KIS_TRACE", "").strip() == "1":
+            try:
+                o2 = body.get("output2") or []
+                if isinstance(o2, dict):
+                    o2 = [o2]
+                k2 = list((o2[0] or {}).keys())[:50] if o2 else []
+                logger.info(
+                    "[KIS_TRACE] inquire_overseas_balance tr_id=%s rt_cd=%s msg_cd=%s msg1=%s out2_keys=%s",
+                    tr_id,
+                    body.get("rt_cd"),
+                    body.get("msg_cd"),
+                    str(body.get("msg1") or "")[:120],
+                    k2,
+                )
+            except Exception as e:
+                logger.info("[KIS_TRACE] inquire_overseas_balance parse error: %s", e)
         o1 = body.get("output1") or []
         o2 = body.get("output2") or []
         if isinstance(o1, dict):
@@ -195,6 +212,27 @@ class OverseasStock:
             )
             return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
         body = res.json()
+        if os.getenv("KIS_TRACE", "").strip() == "1":
+            try:
+                o2 = body.get("output2") or []
+                o3 = body.get("output3") or []
+                if isinstance(o2, dict):
+                    o2 = [o2]
+                if isinstance(o3, dict):
+                    o3 = [o3]
+                k2 = list((o2[0] or {}).keys())[:50] if o2 else []
+                k3 = list((o3[0] or {}).keys())[:50] if o3 else []
+                logger.info(
+                    "[KIS_TRACE] inquire_overseas_present_balance tr_id=%s rt_cd=%s msg_cd=%s msg1=%s out2_keys=%s out3_keys=%s",
+                    tr_id,
+                    body.get("rt_cd"),
+                    body.get("msg_cd"),
+                    str(body.get("msg1") or "")[:120],
+                    k2,
+                    k3,
+                )
+            except Exception as e:
+                logger.info("[KIS_TRACE] inquire_overseas_present_balance parse error: %s", e)
 
         def _df(key: str) -> pd.DataFrame:
             raw = body.get(key) or []
