@@ -59,7 +59,9 @@
 - **스케줄 오케스트레이션** — `integrated_manager.py`가 평일 잡·스크리너·파이프라인·잔액·체결확인·리컨실·요약 담당
 - **해외 잔고·주문** — `account.py` → `kis_overseas_account` (USD), `KIS.order_cash()` → `overseas_order` (NASD)
 - **장중 리스크** — `background_risk_manager` (US: `sell_time_windows` / NYSE 거래일, KR: 09:00–15:30 KST)
-- **주문 정합성** — `order_reconciler.py` (`norm_ticker`로 US/KR 티커 통일)
+- **주문 정합성** — `order_reconciler.py` (pending/partial 상태 리컨실 + `--backfill-only`로 `order_id` 누락 레코드 backfill)
+- **영속 손절/목표(positions)** — `recorder.py`의 `positions` 테이블에 `stop_price/target_price`를 저장하고, `trader.run_sell_logic()`에서 **positions 레벨을 우선 적용**
+- **회전 정책 모듈화** — `rotation_policy.py`에서 최소 보유일·Δscore·예산/경제성·페어 상한(`max_pairs_per_run`)을 공통 정책으로 적용
 - **비밀값 분리** — API 키·계좌·웹훅은 `config/.env`만 사용
 
 ---
@@ -389,6 +391,8 @@ python3 gpt_analyzer.py --date ${DATE} --market SP500 --slots ${SLOTS:-3}
 
 `trading_environment`가 `prod`이면 실계좌 주문이 나갈 수 있습니다. 처음에는 `config.json`에서 **`vps`** 로 두고 검증하세요.
 
+또한 기본 설정에서는 안전을 위해 `config/config.json`의 `trading_params.buy_enabled=false`로 둘 것을 권장합니다(매도/리스크만 검증).
+
 ```bash
 python3 trader.py --date ${DATE}
 ```
@@ -432,6 +436,7 @@ trading_bot_260530_NASDAQ/
 │   ├── kis_overseas_account.py  # 해외 잔고 → balance/summary JSON (USD)
 │   ├── trader.py / risk_manager.py / account.py
 │   ├── order_reconciler.py
+│   ├── rotation_policy.py        # 회전(리밸런싱) 공통 정책
 │   ├── integrated_manager.py
 │   └── utils.py                 # norm_ticker, normalize_ticker_6, fmt_money
 ├── run_integrated_manager.py

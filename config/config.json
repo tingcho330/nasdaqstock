@@ -106,7 +106,7 @@
     }
   },
   "trading_params": {
-    "buy_enabled": true,
+    "buy_enabled": false,
     "allow_rebuy": false,
     "max_legs_per_ticker": 1,
     "post_partial_sell_buy_cooldown_days": 5,

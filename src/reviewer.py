@@ -166,14 +166,14 @@ class PerformanceReviewer:
         return max_dd
     
     def _calculate_win_rate(self, trade_records: List[TradeRecord]) -> float:
-        sell_trades = [t for t in trade_records if t.action == "sell"]
+        sell_trades = [t for t in trade_records if str(getattr(t, "action", "")).upper() == "SELL"]
         if not sell_trades:
             return 0.0
         winning_trades = [t for t in sell_trades if t.profit_loss > 0]
         return len(winning_trades) / len(sell_trades)
     
     def _calculate_profit_factor(self, trade_records: List[TradeRecord]) -> float:
-        sell_trades = [t for t in trade_records if t.action == "sell"]
+        sell_trades = [t for t in trade_records if str(getattr(t, "action", "")).upper() == "SELL"]
         if not sell_trades:
             return 0.0
         total_profit = sum(t.profit_loss for t in sell_trades if t.profit_loss > 0)
@@ -238,10 +238,10 @@ class PerformanceReviewer:
                 if not trades:
                     continue
                 
-                total_profit = sum(t.profit_loss for t in trades if t.action == "sell")
-                total_volume = sum(t.amount for t in trades if t.action == "sell")
-                trade_count = len([t for t in trades if t.action == "sell"])
-                win_count = len([t for t in trades if t.action == "sell" and t.profit_loss > 0])
+                total_profit = sum(t.profit_loss for t in trades if str(getattr(t, "action", "")).upper() == "SELL")
+                total_volume = sum(t.amount for t in trades if str(getattr(t, "action", "")).upper() == "SELL")
+                trade_count = len([t for t in trades if str(getattr(t, "action", "")).upper() == "SELL"])
+                win_count = len([t for t in trades if str(getattr(t, "action", "")).upper() == "SELL" and t.profit_loss > 0])
                 
                 sector_analysis[sector] = {
                     "total_profit": total_profit,
@@ -249,7 +249,12 @@ class PerformanceReviewer:
                     "trade_count": trade_count,
                     "win_rate": win_count / trade_count if trade_count > 0 else 0,
                     "avg_profit": total_profit / trade_count if trade_count > 0 else 0,
-                    "weight": total_volume / sum(sector_trades[s].amount for s in sector_trades for s in sector_trades[s] if s.action == "sell") if any(sector_trades.values()) else 0
+                    "weight": total_volume / sum(
+                        t.amount
+                        for s in sector_trades.values()
+                        for t in s
+                        if str(getattr(t, "action", "")).upper() == "SELL"
+                    ) if any(sector_trades.values()) else 0
                 }
             
             return sector_analysis
@@ -279,10 +284,10 @@ class PerformanceReviewer:
                 if not trades:
                     continue
                 
-                total_profit = sum(t.profit_loss for t in trades if t.action == "sell")
-                total_volume = sum(t.amount for t in trades if t.action == "sell")
-                trade_count = len([t for t in trades if t.action == "sell"])
-                win_count = len([t for t in trades if t.action == "sell" and t.profit_loss > 0])
+                total_profit = sum(t.profit_loss for t in trades if str(getattr(t, "action", "")).upper() == "SELL")
+                total_volume = sum(t.amount for t in trades if str(getattr(t, "action", "")).upper() == "SELL")
+                trade_count = len([t for t in trades if str(getattr(t, "action", "")).upper() == "SELL"])
+                win_count = len([t for t in trades if str(getattr(t, "action", "")).upper() == "SELL" and t.profit_loss > 0])
                 
                 regime_analysis[regime] = {
                     "total_profit": total_profit,
@@ -320,13 +325,18 @@ class PerformanceReviewer:
                 if not trades:
                     continue
                 
-                total_profit = sum(t.profit_loss for t in trades if t.action == "sell")
-                total_volume = sum(t.amount for t in trades if t.action == "sell")
-                trade_count = len([t for t in trades if t.action == "sell"])
-                win_count = len([t for t in trades if t.action == "sell" and t.profit_loss > 0])
+                total_profit = sum(t.profit_loss for t in trades if str(getattr(t, "action", "")).upper() == "SELL")
+                total_volume = sum(t.amount for t in trades if str(getattr(t, "action", "")).upper() == "SELL")
+                trade_count = len([t for t in trades if str(getattr(t, "action", "")).upper() == "SELL"])
+                win_count = len([t for t in trades if str(getattr(t, "action", "")).upper() == "SELL" and t.profit_loss > 0])
                 
                 # 전체 거래량 계산
-                all_volume = sum(t.amount for s in sector_trades.values() for t in s if t.action == "sell")
+                all_volume = sum(
+                    t.amount
+                    for s in sector_trades.values()
+                    for t in s
+                    if str(getattr(t, "action", "")).upper() == "SELL"
+                )
                 
                 sector_analysis[sector] = {
                     "total_profit": total_profit,

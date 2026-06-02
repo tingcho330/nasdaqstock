@@ -37,6 +37,22 @@ from utils import normalize_ticker_6
 
 _MARKET = lambda: os.getenv("MARKET", "SP500")
 
+
+def is_completed_sell(trade: Any) -> bool:
+    """체결 완료 매도 여부 (reviewer·집계 공통)."""
+    action = str(getattr(trade, "action", "")).upper()
+    if action != "SELL":
+        return False
+    status = str(getattr(trade, "order_status", "executed") or "").lower()
+    if status in ("pending", "partial", "cancelled", "failed", "submitted"):
+        return False
+    exe = int(getattr(trade, "executed_qty", 0) or 0)
+    qty = int(getattr(trade, "quantity", 0) or 0)
+    price = float(getattr(trade, "price", 0) or 0)
+    if exe > 0:
+        return True
+    return status == "executed" and qty > 0 and price > 0
+
 @dataclass
 class TradeRecord:
     """거래 기록"""
@@ -132,6 +148,23 @@ class DataRecorder:
                         structured_context TEXT DEFAULT ''
                     )
                 ''')
+
+                # 포지션 테이블 (A안): 티커 단위로 entry/stop/target을 영속 저장
+                # - 기존 보유 종목이 trade_records에 BUY 기록이 없어도 동작하게 하기 위함
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS positions (
+                        ticker TEXT PRIMARY KEY,
+                        entry_price REAL NOT NULL,
+                        stop_price REAL NOT NULL,
+                        target_price REAL NOT NULL,
+                        levels_source TEXT NOT NULL,
+                        levels_updated_at TEXT NOT NULL,
+                        entry_updated_at TEXT NOT NULL,
+                        qty INTEGER DEFAULT 0,
+                        avg_price REAL DEFAULT 0.0,
+                        last_seen_at TEXT DEFAULT ''
+                    )
+                ''')
                 
                 # 포트폴리오 스냅샷 테이블
                 cursor.execute('''
@@ -203,6 +236,13 @@ class DataRecorder:
                     CREATE INDEX IF NOT EXISTS idx_rsi_history_ticker_timestamp 
                     ON rsi_history(ticker, timestamp DESC)
                 ''')
+
+                # positions 인덱스 (운영 편의)
+                try:
+                    cursor.execute("CREATE INDEX IF NOT EXISTS idx_positions_last_seen_at ON positions(last_seen_at)")
+                    conn.commit()
+                except Exception:
+                    pass
                 
                 # order_status 컬럼 추가 (기존 DB 마이그레이션, 당일 매도 방지용)
                 try:
@@ -439,157 +479,6 @@ class DataRecorder:
             _db_dbg_log("recorder.upsert.FAIL", error=str(e), order_id=order_id)
             return False
 
-    def update_order_status(
-        self,
-        *,
-        order_id: str,
-        order_status: str,
-        executed_qty: Optional[int] = None,
-        price: Optional[float] = None,
-        profit_loss: Optional[float] = None,
-        sell_reason: Optional[str] = None,
-        reason_code: Optional[str] = None,
-        structured_context: Optional[str] = None,
-    ) -> int:
-        """order_id 기준 상태 갱신. 반환: 업데이트 행 수."""
-        try:
-            order_id = (order_id or "").strip()
-            _db_dbg_log(
-                "recorder.update_order_status.IN",
-                caller=_db_dbg_caller(2),
-                order_id=order_id or "(empty)",
-                order_status=order_status,
-                executed_qty=executed_qty,
-            )
-            if not order_id:
-                _db_dbg_skip("recorder.update_order_status.SKIP", reason="empty order_id")
-                return 0
-
-            now_iso = datetime.now().isoformat()
-            sets = ["order_status = ?", "last_status_update_ts = ?"]
-            params: List[Any] = [order_status, now_iso]
-
-            if executed_qty is not None:
-                sets.append("executed_qty = ?")
-                params.append(int(executed_qty))
-            if price is not None:
-                sets.append("price = ?")
-                params.append(float(price))
-            if profit_loss is not None:
-                sets.append("profit_loss = ?")
-                params.append(float(profit_loss))
-            if sell_reason:
-                sets.append("sell_reason = ?")
-                params.append(str(sell_reason))
-            if reason_code:
-                sets.append("reason_code = ?")
-                params.append(str(reason_code))
-            if structured_context:
-                sets.append("structured_context = ?")
-                params.append(str(structured_context))
-
-            params.append(order_id)
-            with sqlite3.connect(self.db_path) as conn:
-                cursor = conn.cursor()
-                cursor.execute(
-                    f"UPDATE trade_records SET {', '.join(sets)} WHERE order_id = ?",
-                    params,
-                )
-                n = cursor.rowcount
-                conn.commit()
-                _db_dbg_log(
-                    "recorder.update_order_status.OK" if n else "recorder.update_order_status.NO_MATCH",
-                    order_id=order_id,
-                    order_status=order_status,
-                    rows_affected=n,
-                )
-                return n
-        except Exception as e:
-            self.logger.error(f"order_status 업데이트 실패: {e}")
-            _db_dbg_log("recorder.update_order_status.FAIL", error=str(e), order_id=order_id)
-            return 0
-
-    def get_open_orders(
-        self,
-        *,
-        statuses: Tuple[str, ...] = ("pending", "partial"),
-        since_ts: Optional[str] = None,
-        limit: int = 500,
-    ) -> List[Dict[str, Any]]:
-        """
-        리컨실 대상 주문 조회.
-        - order_id가 있는 pending/partial만 반환.
-        """
-        try:
-            st = tuple(s.lower() for s in statuses)
-            where = "WHERE order_id IS NOT NULL AND order_id != '' AND lower(order_status) IN ({})".format(
-                ",".join(["?"] * len(st))
-            )
-            params: List[Any] = list(st)
-            if since_ts:
-                where += " AND timestamp >= ?"
-                params.append(since_ts)
-            q = f"""
-                SELECT id, timestamp, ticker, action, quantity, price, requested_qty, executed_qty, order_status, order_id
-                FROM trade_records
-                {where}
-                ORDER BY timestamp DESC
-                LIMIT ?
-            """
-            params.append(int(limit))
-            with sqlite3.connect(self.db_path) as conn:
-                cursor = conn.cursor()
-                cursor.execute(q, params)
-                rows = cursor.fetchall()
-            out: List[Dict[str, Any]] = []
-            for r in rows:
-                out.append(
-                    {
-                        "id": r[0],
-                        "timestamp": r[1],
-                        "ticker": r[2],
-                        "action": r[3],
-                        "quantity": r[4],
-                        "price": r[5],
-                        "requested_qty": r[6],
-                        "executed_qty": r[7],
-                        "order_status": r[8],
-                        "order_id": r[9],
-                    }
-                )
-            orphan_pending = 0
-            if _db_dbg_enabled():
-                try:
-                    orphan_where = "WHERE lower(order_status) IN ({}) AND (order_id IS NULL OR order_id = '')".format(
-                        ",".join(["?"] * len(st))
-                    )
-                    orphan_params: List[Any] = list(st)
-                    if since_ts:
-                        orphan_where += " AND timestamp >= ?"
-                        orphan_params.append(since_ts)
-                    with sqlite3.connect(self.db_path) as conn:
-                        cur = conn.cursor()
-                        cur.execute(
-                            f"SELECT COUNT(*) FROM trade_records {orphan_where}",
-                            orphan_params,
-                        )
-                        orphan_pending = int(cur.fetchone()[0] or 0)
-                except Exception as oe:
-                    _db_dbg_log("recorder.get_open_orders.ORPHAN_COUNT_FAIL", error=str(oe))
-            _db_dbg_log(
-                "recorder.get_open_orders.OK",
-                caller=_db_dbg_caller(2),
-                since_ts=since_ts,
-                with_order_id=len(out),
-                orphan_pending_no_order_id=orphan_pending,
-                sample_order_ids=[x.get("order_id") for x in out[:5]],
-            )
-            return out
-        except Exception as e:
-            self.logger.error(f"open 주문 조회 실패: {e}")
-            _db_dbg_log("recorder.get_open_orders.FAIL", error=str(e))
-            return []
-    
     def mark_pending_buy_cancelled(self, ticker: str, target_date: Optional[datetime] = None) -> int:
         """
         해당 종목·해당 일자의 pending 매수 기록을 cancelled로 표시 (15시 20분 미체결 취소 시 호출).
@@ -942,6 +831,397 @@ class DataRecorder:
         except Exception as e:
             self.logger.error(f"시장 데이터 조회 실패: {e}")
             return []
+
+    # ───────────────── 주문/체결 리컨실 지원 ─────────────────
+    def update_order_status(
+        self,
+        *,
+        order_id: str,
+        order_status: str,
+        executed_qty: Optional[int] = None,
+        price: Optional[float] = None,
+        profit_loss: Optional[float] = None,
+        sell_reason: Optional[str] = None,
+        reason_code: Optional[str] = None,
+        structured_context: Optional[str] = None,
+    ) -> int:
+        """order_id 기준 상태 갱신. 반환: 업데이트 행 수."""
+        try:
+            order_id = (order_id or "").strip()
+            if not order_id:
+                return 0
+
+            now_iso = datetime.now().isoformat()
+            sets = ["order_status = ?", "last_status_update_ts = ?"]
+            params: List[Any] = [str(order_status).lower(), now_iso]
+
+            if executed_qty is not None:
+                sets.append("executed_qty = ?")
+                params.append(int(executed_qty))
+            if price is not None:
+                sets.append("price = ?")
+                params.append(float(price))
+            if profit_loss is not None:
+                sets.append("profit_loss = ?")
+                params.append(float(profit_loss))
+            if sell_reason:
+                sets.append("sell_reason = ?")
+                params.append(str(sell_reason))
+            if reason_code:
+                sets.append("reason_code = ?")
+                params.append(str(reason_code))
+            if structured_context:
+                sets.append("structured_context = ?")
+                params.append(str(structured_context))
+
+            params.append(order_id)
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    f"UPDATE trade_records SET {', '.join(sets)} WHERE order_id = ?",
+                    params,
+                )
+                n = cursor.rowcount
+                conn.commit()
+                if n and str(order_status).lower() == "executed":
+                    try:
+                        self.recompute_profit_loss_for_order_id(order_id)
+                    except Exception:
+                        pass
+                return n
+        except Exception as e:
+            self.logger.error(f"order_status 업데이트 실패: {e}")
+            return 0
+
+    def get_open_orders(
+        self,
+        *,
+        statuses: Tuple[str, ...] = ("pending", "partial"),
+        since_ts: Optional[str] = None,
+        limit: int = 500,
+    ) -> List[Dict[str, Any]]:
+        """
+        리컨실 대상 주문 조회.
+        - order_id가 있는 pending/partial만 반환.
+        """
+        try:
+            st = tuple(s.lower() for s in statuses)
+            where = "WHERE order_id IS NOT NULL AND order_id != '' AND lower(order_status) IN ({})".format(
+                ",".join(["?"] * len(st))
+            )
+            params: List[Any] = list(st)
+            if since_ts:
+                where += " AND timestamp >= ?"
+                params.append(since_ts)
+            q = f"""
+                SELECT id, timestamp, ticker, action, quantity, price, requested_qty, executed_qty, order_status, order_id
+                FROM trade_records
+                {where}
+                ORDER BY timestamp DESC
+                LIMIT ?
+            """
+            params.append(int(limit))
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute(q, params)
+                rows = cursor.fetchall()
+            out: List[Dict[str, Any]] = []
+            for r in rows:
+                out.append(
+                    {
+                        "id": r[0],
+                        "timestamp": r[1],
+                        "ticker": r[2],
+                        "action": r[3],
+                        "quantity": r[4],
+                        "price": r[5],
+                        "requested_qty": r[6],
+                        "executed_qty": r[7],
+                        "order_status": r[8],
+                        "order_id": r[9],
+                    }
+                )
+            return out
+        except Exception as e:
+            self.logger.error(f"open 주문 조회 실패: {e}")
+            return []
+
+    def get_orphan_trade_records(
+        self,
+        *,
+        since_ts: str,
+        limit: int = 200,
+    ) -> List[Dict[str, Any]]:
+        """order_id가 비어 있는 거래 기록 (backfill 대상)."""
+        try:
+            q = """
+                SELECT id, timestamp, ticker, action, quantity, price, requested_qty, executed_qty, order_status, order_id
+                FROM trade_records
+                WHERE (order_id IS NULL OR order_id = '')
+                  AND timestamp >= ?
+                ORDER BY timestamp DESC
+                LIMIT ?
+            """
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute(q, (since_ts, int(limit)))
+                rows = cursor.fetchall()
+            out: List[Dict[str, Any]] = []
+            for r in rows:
+                out.append(
+                    {
+                        "id": r[0],
+                        "timestamp": r[1],
+                        "ticker": r[2],
+                        "action": r[3],
+                        "quantity": r[4],
+                        "price": r[5],
+                        "requested_qty": r[6],
+                        "executed_qty": r[7],
+                        "order_status": r[8],
+                        "order_id": r[9],
+                    }
+                )
+            return out
+        except Exception as e:
+            self.logger.error(f"orphan 거래 조회 실패: {e}")
+            return []
+
+    def backfill_order_id(
+        self,
+        *,
+        row_id: int,
+        order_id: str,
+        executed_qty: Optional[int] = None,
+        order_status: Optional[str] = None,
+    ) -> int:
+        """빈 order_id 행에 KIS 주문번호·체결 메타 backfill (기존 order_id 있으면 스킵)."""
+        try:
+            order_id = (order_id or "").strip()
+            if not order_id:
+                return 0
+
+            sets = ["order_id = ?", "last_status_update_ts = ?"]
+            params: List[Any] = [order_id, datetime.now().isoformat()]
+
+            if executed_qty is not None:
+                sets.append("executed_qty = ?")
+                params.append(int(executed_qty))
+            if order_status is not None:
+                sets.append("order_status = ?")
+                params.append(str(order_status).lower())
+
+            params.extend([int(row_id)])
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    f"""
+                    UPDATE trade_records
+                    SET {', '.join(sets)}
+                    WHERE id = ? AND (order_id IS NULL OR order_id = '')
+                    """,
+                    params,
+                )
+                n = cursor.rowcount
+                conn.commit()
+            return n
+        except Exception as e:
+            self.logger.error(f"order_id backfill 실패: {e}")
+            return 0
+
+    # ───────────────── 포지션 레벨(진입가 기준) ─────────────────
+    def get_position(self, ticker: str) -> Optional[Dict[str, Any]]:
+        """positions 테이블에서 티커 포지션(레벨) 조회."""
+        try:
+            ticker_str = normalize_ticker_6(ticker, _MARKET())
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    SELECT
+                        ticker, entry_price, stop_price, target_price,
+                        levels_source, levels_updated_at, entry_updated_at,
+                        qty, avg_price, last_seen_at
+                    FROM positions
+                    WHERE ticker = ?
+                    """,
+                    (ticker_str,),
+                )
+                row = cursor.fetchone()
+                if not row:
+                    return None
+                return {
+                    "ticker": row[0],
+                    "entry_price": float(row[1]),
+                    "stop_price": float(row[2]),
+                    "target_price": float(row[3]),
+                    "levels_source": row[4],
+                    "levels_updated_at": row[5],
+                    "entry_updated_at": row[6],
+                    "qty": int(row[7] or 0),
+                    "avg_price": float(row[8] or 0.0),
+                    "last_seen_at": row[9] or "",
+                }
+        except Exception as e:
+            self.logger.error(f"포지션 조회 실패 ({ticker}): {e}")
+            return None
+
+    def upsert_position_levels(
+        self,
+        *,
+        ticker: str,
+        entry_price: float,
+        stop_price: float,
+        target_price: float,
+        levels_source: str,
+        levels_updated_at: str,
+        entry_updated_at: str,
+        qty: int = 0,
+        avg_price: float = 0.0,
+        last_seen_at: str = "",
+    ) -> bool:
+        """positions 테이블에 포지션(레벨) upsert."""
+        try:
+            ticker_str = normalize_ticker_6(ticker, _MARKET())
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    INSERT INTO positions (
+                        ticker, entry_price, stop_price, target_price,
+                        levels_source, levels_updated_at, entry_updated_at,
+                        qty, avg_price, last_seen_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(ticker) DO UPDATE SET
+                        entry_price = excluded.entry_price,
+                        stop_price = excluded.stop_price,
+                        target_price = excluded.target_price,
+                        levels_source = excluded.levels_source,
+                        levels_updated_at = excluded.levels_updated_at,
+                        entry_updated_at = excluded.entry_updated_at,
+                        qty = excluded.qty,
+                        avg_price = excluded.avg_price,
+                        last_seen_at = excluded.last_seen_at
+                    """,
+                    (
+                        ticker_str,
+                        float(entry_price),
+                        float(stop_price),
+                        float(target_price),
+                        str(levels_source or ""),
+                        str(levels_updated_at or ""),
+                        str(entry_updated_at or ""),
+                        int(qty or 0),
+                        float(avg_price or 0.0),
+                        str(last_seen_at or ""),
+                    ),
+                )
+                conn.commit()
+            return True
+        except Exception as e:
+            self.logger.error(f"포지션 upsert 실패 ({ticker}): {e}")
+            return False
+
+    def delete_position(self, ticker: str) -> bool:
+        """전량매도 등으로 오픈 포지션 정리(삭제)."""
+        try:
+            ticker_str = normalize_ticker_6(ticker, _MARKET())
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute("DELETE FROM positions WHERE ticker = ?", (ticker_str,))
+                conn.commit()
+            return True
+        except Exception as e:
+            self.logger.error(f"포지션 삭제 실패 ({ticker}): {e}")
+            return False
+
+    # ───────────────── PnL 재계산(간단 FIFO) ─────────────────
+    def compute_fifo_sell_pnl(
+        self,
+        *,
+        ticker: str,
+        sell_qty: int,
+        sell_price: float,
+        sell_timestamp: Optional[datetime] = None,
+    ) -> Tuple[float, int]:
+        """매도 1건에 대한 FIFO 손익·보유일수 (가장 최근 선행 매수 기준)."""
+        ticker = normalize_ticker_6(ticker, _MARKET())
+        sell_qty = int(sell_qty)
+        sell_price = float(sell_price)
+        if sell_qty <= 0 or sell_price <= 0:
+            return 0.0, 0
+
+        all_trades = self.get_trade_records(ticker=ticker)
+        buys = [
+            t for t in all_trades
+            if str(t.action).upper() == "BUY"
+            and int(t.quantity or 0) > 0
+            and float(t.price or 0) > 0
+        ]
+        if sell_timestamp is not None:
+            buys = [b for b in buys if b.timestamp <= sell_timestamp]
+        if not buys:
+            return 0.0, 0
+
+        last_buy = sorted(buys, key=lambda x: x.timestamp)[-1]
+        buy_price = float(last_buy.price)
+        pnl = (sell_price - buy_price) * sell_qty
+        hold_days = 0
+        if sell_timestamp is not None:
+            hold_days = max(0, (sell_timestamp - last_buy.timestamp).days)
+        return round(pnl, 2), hold_days
+
+    def recompute_profit_loss_for_order_id(self, order_id: str) -> int:
+        """체결 매도 행의 profit_loss·holding_period_days 재계산."""
+        order_id = (order_id or "").strip()
+        if not order_id:
+            return 0
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    SELECT id, timestamp, ticker, action, quantity, price, executed_qty, order_status
+                    FROM trade_records WHERE order_id = ? LIMIT 1
+                    """,
+                    (order_id,),
+                )
+                row = cur.fetchone()
+            if not row:
+                return 0
+            row_id, ts, ticker, action, qty, price, exe_qty, status = row
+            if str(action).upper() != "SELL":
+                return 0
+            if str(status or "").lower() not in ("executed", "completed", "partial"):
+                return 0
+            sell_qty = int(exe_qty or qty or 0)
+            sell_price = float(price or 0)
+            if sell_qty <= 0 or sell_price <= 0:
+                return 0
+            sell_ts = datetime.fromisoformat(ts) if ts else None
+            pnl, hold_days = self.compute_fifo_sell_pnl(
+                ticker=str(ticker),
+                sell_qty=sell_qty,
+                sell_price=sell_price,
+                sell_timestamp=sell_ts,
+            )
+            with sqlite3.connect(self.db_path) as conn:
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    UPDATE trade_records
+                    SET profit_loss = ?, holding_period_days = ?
+                    WHERE id = ?
+                    """,
+                    (pnl, hold_days, int(row_id)),
+                )
+                n = cur.rowcount
+                conn.commit()
+            return n
+        except Exception as e:
+            self.logger.error(f"PnL 재계산 실패 order_id={order_id}: {e}")
+            return 0
     
     def export_data_to_csv(self, output_dir: str = "data/export") -> bool:
         """데이터를 CSV로 내보내기"""
@@ -1345,3 +1625,39 @@ def get_rsi_history(ticker: str, days: int = 30) -> List[Dict[str, Any]]:
     except Exception as e:
         logging.getLogger(__name__).error(f"RSI 이력 조회 실패: {e}")
         return []
+
+
+# ── positions 하위 호환성 헬퍼 ───────────────────────────────────────────
+def get_position(ticker: str) -> Optional[Dict[str, Any]]:
+    return get_recorder().get_position(ticker)
+
+
+def upsert_position_levels(
+    *,
+    ticker: str,
+    entry_price: float,
+    stop_price: float,
+    target_price: float,
+    levels_source: str,
+    levels_updated_at: str,
+    entry_updated_at: str,
+    qty: int = 0,
+    avg_price: float = 0.0,
+    last_seen_at: str = "",
+) -> bool:
+    return get_recorder().upsert_position_levels(
+        ticker=ticker,
+        entry_price=entry_price,
+        stop_price=stop_price,
+        target_price=target_price,
+        levels_source=levels_source,
+        levels_updated_at=levels_updated_at,
+        entry_updated_at=entry_updated_at,
+        qty=qty,
+        avg_price=avg_price,
+        last_seen_at=last_seen_at,
+    )
+
+
+def delete_position(ticker: str) -> bool:
+    return get_recorder().delete_position(ticker)

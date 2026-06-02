@@ -184,6 +184,120 @@ def _fetch_daily_orders(
     return by_id
 
 
+def _db_action_to_kis_side(action: str) -> str:
+    """trade_records.action → KIS 기준 side ('buy'/'sell')."""
+    a = str(action or "").strip().upper()
+    if a in ("BUY", "B"):
+        return "buy"
+    if a in ("SELL", "S"):
+        return "sell"
+    return ""
+
+
+def _row_target_qty(row: Dict[str, Any]) -> int:
+    rq = _safe_int(row.get("requested_qty", 0))
+    if rq > 0:
+        return rq
+    return _safe_int(row.get("quantity", 0))
+
+
+def _match_kis_candidates(
+    row: Dict[str, Any],
+    daily_orders: Dict[str, Dict[str, Any]],
+    *,
+    used_order_ids: set,
+) -> List[Dict[str, Any]]:
+    """DB orphan 행에 대응하는 KIS daily 주문 후보(0~N)."""
+    ticker = norm_ticker(str(row.get("ticker") or ""), os.getenv("MARKET", "SP500"))
+    side = _db_action_to_kis_side(row.get("action") or "")
+    target_qty = _row_target_qty(row)
+    if not ticker or not side or target_qty <= 0:
+        return []
+
+    candidates: List[Dict[str, Any]] = []
+    for oid, kis_o in daily_orders.items():
+        if oid in used_order_ids:
+            continue
+        if norm_ticker(str(kis_o.get("ticker") or ""), os.getenv("MARKET", "SP500")) != ticker:
+            continue
+        if str(kis_o.get("side") or "") != side:
+            continue
+        kis_qty = _safe_int(kis_o.get("quantity", 0))
+        if kis_qty != target_qty:
+            continue
+        kis_exe = _safe_int(kis_o.get("executed_qty", 0))
+        db_status = str(row.get("order_status") or "").lower()
+        if db_status in ("executed", "completed") and kis_exe <= 0:
+            continue
+        candidates.append(kis_o)
+    return candidates
+
+
+def backfill_orphan_order_ids(*, since_hours: int = 24, limit: int = 200) -> Dict[str, int]:
+    """
+    order_id가 비어 있는 DB 행을 KIS 일자별 주문과 매칭해 backfill.
+    유일 매칭(1건)일 때만 UPDATE.
+    """
+    setup_logging()
+    env = settings._config.get("trading_environment", "vps")
+    kis = KIS(env=env)
+    recorder = get_recorder()
+
+    now_kst = datetime.now(KST)
+    since_dt = now_kst - timedelta(hours=since_hours)
+    since_ts = since_dt.isoformat()
+    start_ymd = since_dt.strftime("%Y%m%d")
+    end_ymd = now_kst.strftime("%Y%m%d")
+
+    orphans = recorder.get_orphan_trade_records(since_ts=since_ts, limit=limit)
+    logger.info(f"orphan backfill 대상 {len(orphans)}건 (since={since_ts})")
+
+    daily_orders = _fetch_daily_orders(kis, start_ymd=start_ymd, end_ymd=end_ymd)
+    logger.info(f"KIS 일자별 주문(daily) backfill 조회: {len(daily_orders)}건 ({start_ymd}~{end_ymd})")
+
+    updated = 0
+    skipped_ambiguous = 0
+    skipped_no_match = 0
+    used_order_ids = set()
+
+    for row in orphans:
+        row_id = row.get("id")
+        candidates = _match_kis_candidates(row, daily_orders, used_order_ids=used_order_ids)
+        if len(candidates) == 0:
+            skipped_no_match += 1
+            continue
+        if len(candidates) > 1:
+            skipped_ambiguous += 1
+            continue
+
+        kis_o = candidates[0]
+        order_id = str(kis_o.get("order_id") or "").strip()
+        kis_exe = _safe_int(kis_o.get("executed_qty", 0))
+        kis_status = str(kis_o.get("status") or "executed")
+        if kis_status == "executed" and kis_exe <= 0:
+            kis_exe = _row_target_qty(row)
+
+        n = recorder.backfill_order_id(
+            row_id=int(row_id),
+            order_id=order_id,
+            executed_qty=kis_exe if kis_exe > 0 else None,
+            order_status=kis_status,
+        )
+        if n:
+            updated += n
+            used_order_ids.add(order_id)
+
+    summary = {
+        "backfill_orphans": len(orphans),
+        "backfill_updated": updated,
+        "backfill_skipped_ambiguous": skipped_ambiguous,
+        "backfill_skipped_no_match": skipped_no_match,
+        "kis_daily_orders": len(daily_orders),
+    }
+    logger.info(f"orphan backfill 결과: {summary}")
+    return summary
+
+
 def reconcile_open_orders(*, since_hours: int = 24, limit: int = 500) -> Dict[str, int]:
     """
     DB open(pending/partial) 주문을 KIS 조회 결과로 리컨실.
@@ -389,6 +503,10 @@ def reconcile_open_orders(*, since_hours: int = 24, limit: int = 500) -> Dict[st
             "reconciler.HINT_ORPHAN_PENDING",
             reason="open_rows>0 but updated=0; check recorder.get_open_orders orphan_pending_no_order_id count",
         )
+    backfill_summary = backfill_orphan_order_ids(since_hours=since_hours, limit=min(limit, 200))
+    summary.update(backfill_summary)
+    logger.info(f"리컨실+backfill 통합 결과: {summary}")
+    _db_dbg_log("reconciler.done_with_backfill", **summary)
     return summary
 
 
@@ -396,9 +514,13 @@ def main():
     parser = argparse.ArgumentParser(description="DB pending/partial 주문 리컨실")
     parser.add_argument("--since-hours", type=int, default=24, help="리컨실 대상 조회 범위(시간)")
     parser.add_argument("--limit", type=int, default=500, help="최대 조회 건수")
+    parser.add_argument("--backfill-only", action="store_true", help="orphan order_id backfill만 실행")
     args = parser.parse_args()
 
-    reconcile_open_orders(since_hours=args.since_hours, limit=args.limit)
+    if args.backfill_only:
+        backfill_orphan_order_ids(since_hours=args.since_hours, limit=min(args.limit, 200))
+    else:
+        reconcile_open_orders(since_hours=args.since_hours, limit=args.limit)
 
 
 if __name__ == "__main__":

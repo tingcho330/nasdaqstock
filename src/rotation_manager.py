@@ -11,14 +11,20 @@
 """
 
 import logging
-import os
 import time
 from typing import Dict, List, Tuple, Optional, Any
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
-from utils import normalize_ticker_6, KST, _to_int, _to_float, check_min_holding_period, fmt_money
+from utils import KST, _to_int, _to_float
 from screener_core import MarketAnalyzer, MarketState
+from rotation_policy import (
+    min_holding_days as policy_min_holding_days,
+    pair_passes_budget,
+    pair_passes_economics,
+    resolve_delta_threshold,
+    sell_eligible_for_rotation,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -106,6 +112,15 @@ class RotationManager:
         if not self._is_rotation_enabled():
             logger.info("회전 매매 비활성화됨")
             return False
+
+        # trader가 회전 페어 쿼터를 관리하는 경우(1회 buy 사이클당 상한), 남은 쿼터가 없으면 스킵
+        if self.trader and hasattr(self.trader, "_rotation_quota_remaining"):
+            try:
+                if self.trader._rotation_quota_remaining() <= 0:
+                    logger.info("이번 매수 사이클 회전 한도 소진 → try_rotation 스킵")
+                    return False
+            except Exception:
+                pass
             
         if not candidates or not holdings:
             logger.info("회전 매매 스킵: 후보 또는 보유 종목 없음")
@@ -137,7 +152,7 @@ class RotationManager:
     
     def _is_rotation_enabled(self) -> bool:
         """회전 매매 활성화 여부 확인"""
-        return self.rotation_config.get("enabled", True)
+        return bool(self.rotation_config.get("enabled", False))
     
     def _convert_holdings(self, holdings: List[Dict[str, Any]]) -> List[HoldingInfo]:
         """보유 종목 데이터 변환 (최소 보유기간 체크 포함)"""
@@ -146,13 +161,12 @@ class RotationManager:
             logger.warning("점수 캐시 없음")
             return []
         
-        # 최소 보유기간 설정 (일)
-        min_holding_days = self.rotation_config.get("min_holding_days", 5)
         current_time = datetime.now(KST)
+        min_days = policy_min_holding_days(self.settings)
         
         holding_list = []
         for h in holdings:
-            ticker = normalize_ticker_6(h.get("pdno", ""), os.getenv("MARKET", "SP500"))
+            ticker = str(h.get("pdno", "")).zfill(6)
             name = h.get("prdt_name", "N/A")
             quantity = _to_int(h.get("hldg_qty", 0))
             price = _to_int(h.get("prpr", 0))
@@ -160,8 +174,7 @@ class RotationManager:
             proceeds = price * quantity
             
             if quantity > 0:
-                # 최소 보유기간 체크
-                is_eligible, _ = check_min_holding_period(ticker, min_holding_days, current_time)
+                is_eligible, _ = sell_eligible_for_rotation(ticker, self.settings, current_time)
                 if is_eligible:
                     holding_list.append(HoldingInfo(
                         ticker=ticker,
@@ -172,7 +185,7 @@ class RotationManager:
                         proceeds=proceeds
                     ))
                 else:
-                    logger.debug(f"회전 매매 제외: {name}({ticker}) - 최소 보유기간 {min_holding_days}일 미달")
+                    logger.debug(f"회전 매매 제외: {name}({ticker}) - 최소 보유기간 {min_days}일 미달")
         
         return holding_list
     
@@ -182,7 +195,7 @@ class RotationManager:
         
         candidate_list = []
         for c in candidates:
-            ticker = normalize_ticker_6(c.get("Ticker", ""), os.getenv("MARKET", "SP500"))
+            ticker = str(c.get("Ticker", "")).zfill(6)
             name = c.get("Name", "N/A")
             price = _to_int(c.get("Price", 0))
             score = _to_float(c.get("Score", scores_map.get(ticker, 0.0)), 0.0)
@@ -214,7 +227,6 @@ class RotationManager:
         
         # 동적 임계값 계산
         delta_threshold = self._calculate_dynamic_threshold()
-        buffer = self._calculate_buffer()
         
         # 회전 매매 페어 검색
         for holding in holdings_sorted:
@@ -226,7 +238,7 @@ class RotationManager:
                     continue
                 
                 # 회전 조건 검증
-                if self._validate_rotation_conditions(holding, candidate, usable_cash, delta_threshold, buffer):
+                if self._validate_rotation_conditions(holding, candidate, usable_cash, delta_threshold):
                     # 회전 매매 실행
                     result = self._perform_rotation(holding, candidate, usable_cash)
                     if result:
@@ -236,24 +248,11 @@ class RotationManager:
     
     def _calculate_dynamic_threshold(self) -> float:
         """동적 임계값 계산"""
-        base_threshold = self.rotation_config.get("delta_score_min", 0.08)
-        
-        if self._current_market_state is None:
-            logger.warning("시장 상태 정보 없음, 기본 임계값 사용")
-            return base_threshold
-        
-        # MarketAnalyzer를 통한 동적 임계값 계산
-        dynamic_threshold = self.market_analyzer.calculate_dynamic_threshold(
-            base_threshold, 
-            self._current_market_state
+        return resolve_delta_threshold(
+            self.settings,
+            self._current_market_state,
+            self.market_analyzer,
         )
-        
-        return dynamic_threshold
-    
-    def _calculate_buffer(self) -> float:
-        """거래 비용 버퍼 계산"""
-        trading_params = self.settings.get("trading_params", {})
-        return trading_params.get("fee_buffer_pct", 0.005)
     
     def _should_skip_holding(self, holding: HoldingInfo) -> bool:
         """보유 종목 스킵 여부 확인"""
@@ -281,21 +280,32 @@ class RotationManager:
             return self.trader._is_in_cooldown(ticker)
         return False
     
-    def _validate_rotation_conditions(self, holding: HoldingInfo, candidate: RotationCandidate, 
-                                    usable_cash: int, delta_threshold: float, buffer: float) -> bool:
-        """회전 조건 검증"""
+    def _validate_rotation_conditions(
+        self,
+        holding: HoldingInfo,
+        candidate: RotationCandidate,
+        usable_cash: int,
+        delta_threshold: float,
+    ) -> bool:
+        """회전 조건 검증 (rotation_policy와 동일 기준)"""
         # 점수 차이 확인
         delta_score = candidate.score - holding.score
         if delta_score < delta_threshold:
             return False
         
         # 예산 확인
-        affordable_budget = int((usable_cash + holding.proceeds) * (1 - buffer))
-        if candidate.price > affordable_budget:
+        if not pair_passes_budget(usable_cash, holding.proceeds, candidate.price, self.settings):
             return False
         
-        # 거래 비용 최적화 확인
-        if not self._is_cost_effective(holding, candidate, delta_score):
+        # 거래 비용 대비 경제성 확인(순수익 기반)
+        if not pair_passes_economics(
+            holding.proceeds, candidate.price, holding.score, candidate.score, self.settings
+        ):
+            logger.info(
+                "회전 매매 중단(비용): %s → %s",
+                holding.ticker,
+                candidate.ticker,
+            )
             return False
         
         logger.info(
@@ -305,34 +315,6 @@ class RotationManager:
         )
         
         return True
-    
-    def _is_cost_effective(self, holding: HoldingInfo, candidate: RotationCandidate, delta_score: float) -> bool:
-        """거래 비용 대비 효과성 확인 (순수익 기반)"""
-        from screener_core import calculate_net_profit_rotation
-        
-        # 예상 수익 계산
-        expected_gain = delta_score * holding.proceeds / 100  # 점수 차이를 수익률로 변환
-        
-        # 순수익 기반 회전 매매 판단
-        rotation_judgment = calculate_net_profit_rotation(
-            sell_ticker=holding.ticker,
-            buy_ticker=candidate.ticker,
-            sell_amount=holding.proceeds,
-            buy_amount=candidate.price,
-            expected_gain=expected_gain,
-            settings=self.settings
-        )
-        
-        should_rotate = rotation_judgment.get("should_rotate", False)
-        
-        if not should_rotate:
-            logger.info(
-                f"회전 매매 중단: {holding.ticker} → {candidate.ticker} | "
-                f"순수익: {fmt_money(rotation_judgment.get('net_profit', 0), os.getenv('MARKET', 'NASDAQ100'))} | "
-                f"비용효과: {rotation_judgment.get('cost_effectiveness_ratio', 0):.1f}배"
-            )
-        
-        return should_rotate
     
     def _estimate_transaction_cost(self, holding: HoldingInfo, candidate: RotationCandidate) -> int:
         """거래 비용 추정"""

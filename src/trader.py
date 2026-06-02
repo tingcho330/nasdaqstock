@@ -60,6 +60,7 @@ from recorder import (
     fetch_trades_by_tickers,
     mark_pending_buy_cancelled,
     mark_pending_order_cancelled,
+    get_recorder,
 )
 
 try:
@@ -82,6 +83,8 @@ from gpt_analyzer import (
     get_gpt_enhanced_rebalance_candidates,
     fallback_rebalance_logic
 )
+
+from rotation_policy import apply_rotation_policy, pair_gpt_rebalance_lists, max_pairs_per_run
 
 # ── 디스코드 노티파이어 ───────────────────────────────────────────────
 from notifier import (
@@ -305,6 +308,7 @@ class Trader:
         
         # 회전 매매 관리자 초기화
         self.rotation_manager = RotationManager(self.settings, self)
+        self._rotation_pairs_done_this_run = 0
         self.max_retries_on_reject = int(self.trading_params.get("max_retries", 0))
         self.retry_delay_ms = int(self.trading_params.get("retry_delay_ms", 0))
         self.slippage_bps = float(self.trading_params.get("slippage_bps", 0.0))
@@ -1851,6 +1855,16 @@ class Trader:
             logger.info("회전 매매 비활성화(rotation.enabled=false) → 회전 매매 시도 생략")
             return False
         return self.rotation_manager.try_rotation(candidates, holdings, usable_cash)
+
+    def _rotation_quota_remaining(self) -> int:
+        limit = max_pairs_per_run(self.settings)
+        done = int(getattr(self, "_rotation_pairs_done_this_run", 0) or 0)
+        return max(0, limit - done)
+
+    def _consume_rotation_quota(self, pairs: int) -> None:
+        if pairs <= 0:
+            return
+        self._rotation_pairs_done_this_run = int(getattr(self, "_rotation_pairs_done_this_run", 0) or 0) + int(pairs)
     
     def get_rotation_performance(self) -> Dict[str, Any]:
         """회전 매매 성과 조회"""
@@ -2216,6 +2230,21 @@ class Trader:
 
             # 실시간 레벨/RSI/Price 오버레이
             try:
+                # positions(영속 레벨) 우선 오버레이
+                try:
+                    pos = get_recorder().get_position(ticker)
+                    if pos:
+                        sp = _to_int(pos.get("stop_price", 0))
+                        tp = _to_int(pos.get("target_price", 0))
+                        if sp > 0:
+                            stock_info["손절가"] = sp
+                        if tp > 0:
+                            stock_info["목표가"] = tp
+                        if sp > 0 or tp > 0:
+                            stock_info["source"] = pos.get("levels_source") or "positions"
+                except Exception:
+                    pass
+
                 current_price = 0
                 try:
                     price_df = self.kis.inquire_price(fid_cond_mrkt_div_code="J", fid_input_iscd=ticker)
@@ -2231,9 +2260,10 @@ class Trader:
                 rt_levels = self.risk_manager.compute_realtime_levels(ticker, current_price) or {}
                 if "RSI" in rt_levels and rt_levels["RSI"] is not None:
                     stock_info["RSI"] = float(rt_levels["RSI"])
-                if "손절가" in rt_levels and rt_levels["손절가"] is not None:
+                # positions가 있으면 손절/목표는 positions 우선 (실시간 계산은 보조)
+                if stock_info.get("손절가") in (None, 0, "0") and "손절가" in rt_levels and rt_levels["손절가"] is not None:
                     stock_info["손절가"] = _to_int(rt_levels["손절가"])
-                if "목표가" in rt_levels and rt_levels["목표가"] is not None:
+                if stock_info.get("목표가") in (None, 0, "0") and "목표가" in rt_levels and rt_levels["목표가"] is not None:
                     stock_info["목표가"] = _to_int(rt_levels["목표가"])
                 if "Price" in rt_levels and rt_levels["Price"] is not None:
                     stock_info["Price"] = _to_int(rt_levels["Price"])
@@ -4479,6 +4509,25 @@ class Trader:
             else:
                 # 기존 로직 (하위 호환성)
                 to_buy_plans, to_sell_list = self._determine_rebalance_swaps([], holdings)
+
+            # 공통 회전 정책 적용(페어링/경제성/예산/상한)
+            try:
+                if any(isinstance(s, dict) and ("priority" in s or "confidence" in s) for s in to_sell_list) or any(
+                    isinstance(b, dict) and ("priority" in b or "confidence" in b) for b in to_buy_plans
+                ):
+                    to_sell_list, to_buy_plans = pair_gpt_rebalance_lists(to_sell_list, to_buy_plans)
+                quota = self._rotation_quota_remaining()
+                to_buy_plans, to_sell_list = apply_rotation_policy(
+                    to_sell_list,
+                    to_buy_plans,
+                    self.settings,
+                    usable_cash=int(available_cash),
+                    max_pairs=quota,
+                )
+                if to_sell_list:
+                    self._consume_rotation_quota(len(to_sell_list))
+            except Exception as pe:
+                logger.warning(f"회전 정책 적용 실패(기존 리스트 유지): {pe}")
             if to_sell_list:
                 logger.info(f"회전 매매 대상 발견: 매도 {len(to_sell_list)}건, 매수 {len(to_buy_plans)}건")
                 
