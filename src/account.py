@@ -77,6 +77,9 @@ def build_summary_comments(us_mode: bool = False) -> dict:
             "ord_psbl_frcr_amt": "외화 주문 가능 금액",
             "frcr_buy_amt": "외화 매수 가능/예수금",
             "available_cash": "주문 가능 현금 (USD)",
+            "available_cash_krw": "주문 가능 현금 (원화 환산, 표시용)",
+            "tot_evlu_amt_usd": "총 평가(USD, 가능 시)",
+            "tot_evlu_amt_krw": "총 평가(원화 환산, 표시용)",
         })
     return base
 
@@ -313,9 +316,15 @@ if __name__ == "__main__":
         logger.info("\n--- 계좌 종합 평가(표준화) ---")
         logger.info("보유종목: %d개", hold_cnt)
         if us_mode:
-            logger.info("주문가능: %s", fmt_money(cash_d2, market))
-            logger.info("예수금: %s", fmt_money(cash_tot, market))
-            logger.info("총평가: %s", fmt_money(tot_eval, market))
+            # US 모드: USD(외화) + KRW(원화환산) 분리 표시
+            with open(summary_file, "r", encoding="utf-8") as f:
+                _sum_payload = json.load(f)
+            _sum_row = _denest_first_record(_sum_payload.get("data", []))
+            avail_krw = _to_int(_sum_row.get("available_cash_krw", 0))
+            tot_evlu_krw = _to_int(_sum_row.get("tot_evlu_amt_krw", 0))
+            logger.info("주문가능(원화환산): %s원", f"{avail_krw:,}" if avail_krw > 0 else "0")
+            logger.info("예수금(USD): %s", fmt_money(cash_tot, market))
+            logger.info("총평가(원화환산): %s원", f"{tot_evlu_krw:,}" if tot_evlu_krw > 0 else "0")
         else:
             logger.info(f"D+2 출금가능: {cash_d2:,}원")
             if nxdy_excc:
@@ -327,7 +336,16 @@ if __name__ == "__main__":
         # 디스코드 전송
         try:
             if us_mode:
-                cash_line = f"주문가능: {fmt_money(cash_d2, market)}\n예수금: {fmt_money(cash_tot, market)}\n총평가: {fmt_money(tot_eval, market)}"
+                with open(summary_file, "r", encoding="utf-8") as f:
+                    _sum_payload = json.load(f)
+                _sum_row = _denest_first_record(_sum_payload.get("data", []))
+                avail_krw = _to_int(_sum_row.get("available_cash_krw", 0))
+                tot_evlu_krw = _to_int(_sum_row.get("tot_evlu_amt_krw", 0))
+                cash_line = (
+                    f"주문가능(원화환산): {avail_krw:,}원\n"
+                    f"예수금(USD): {fmt_money(cash_tot, market)}\n"
+                    f"총평가(원화환산): {tot_evlu_krw:,}원"
+                )
             else:
                 cash_line = f"D+2 출금가능: {cash_d2:,}원\n예수금: {cash_tot:,}원\n총평가: {tot_eval:,}원"
             _notify(

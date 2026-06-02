@@ -119,44 +119,52 @@ def build_overseas_summary(
     pres3 = _first_row(df_present_out3) if df_present_out3 is not None else {}
 
     # TTTS3012R output2 + CTRP6504R output2/3 (KIS 공식 필드명)
-    ord_psbl = _pick_positive(
-        pres3,
+    #
+    # ⚠️ 주의: CTRP6504R의 output3 일부 금액은 "원화 환산"으로 내려오는 경우가 있어
+    #         USD(외화)와 KRW(원화환산)를 분리해 저장한다.
+    usd_cash = _pick_positive(
         pres2,
         bal2,
         keys=(
-            "frcr_use_psbl_amt",       # CTRP6504R output3: 외화사용가능금액
-            "frcr_drwg_psbl_amt_1",    # CTRP6504R output2: 외화출금가능금액
+            "frcr_dncl_amt_2",   # CTRP6504R output2: 외화예수금(USD)
+            "frcr_dncl_amt1",
+            "frcr_buy_amt",
+            "frcr_buy_amt_smtl1",
+            "frcr_buy_amt_smtl",
+        ),
+    )
+    usd_order_psbl = _pick_positive(
+        pres2,
+        bal2,
+        keys=(
+            "frcr_drwg_psbl_amt_1",  # CTRP6504R output2: 외화출금가능금액(USD)
             "nxdy_frcr_drwg_psbl_amt",
             "ord_psbl_frcr_amt",
             "frcr_ord_psbl_amt",
             "frcr_gnrl_ord_psbl_amt",
         ),
     )
-    buy_amt = _pick_positive(
-        pres2,
+    krw_order_psbl = _pick_positive(
         pres3,
-        bal2,
         keys=(
-            "frcr_dncl_amt_2",         # CTRP6504R output2: 외화예수금
-            "frcr_dncl_amt1",
-            "dncl_amt",
+            "frcr_use_psbl_amt",  # CTRP6504R output3: (원화환산) 외화사용가능금액
+            "wdrw_psbl_tot_amt",
             "tot_dncl_amt",
-            "frcr_buy_amt",
-            "frcr_buy_amt_smtl1",
-            "frcr_buy_amt_smtl",
         ),
     )
-    tot_evlu = _pick_positive(
+    krw_tot_evlu = _pick_positive(
         pres3,
+        keys=(
+            "tot_asst_amt",
+            "frcr_evlu_tota",
+            "evlu_amt_smtl_amt",
+            "evlu_amt_smtl",
+        ),
+    )
+    usd_tot_evlu = _pick_positive(
         pres2,
         bal2,
-        keys=(
-            "frcr_evlu_tota",
-            "tot_asst_amt",
-            "tot_evlu_amt",
-            "frcr_evlu_amt2",
-            "evlu_amt_smvl",
-        ),
+        keys=("frcr_evlu_amt2", "tot_evlu_amt"),
     )
     pchs_smtl = _pick_positive(bal2, pres3, keys=("frcr_pchs_amt1", "pchs_amt_smtl", "pchs_amt_smtl_amt"))
     pfls_smtl = _pick_positive(
@@ -165,15 +173,18 @@ def build_overseas_summary(
         keys=("frcr_evlu_pfls_amt2", "evlu_pfls_amt_smtl", "tot_evlu_pfls_amt"),
     )
 
-    available = int(round(ord_psbl if ord_psbl > 0 else buy_amt))
+    available_usd = int(round(usd_order_psbl if usd_order_psbl > 0 else usd_cash))
+    available_krw = int(round(krw_order_psbl))
 
-    if available <= 0 and os.getenv("KIS_TRACE", "").strip() == "1":
+    if available_usd <= 0 and os.getenv("KIS_TRACE", "").strip() == "1":
         try:
             logger.info(
-                "[KIS_TRACE] overseas_summary candidates ord_psbl=%s buy_amt=%s tot_evlu=%s keys_bal2=%s keys_pres2=%s keys_pres3=%s",
-                ord_psbl,
-                buy_amt,
-                tot_evlu,
+                "[KIS_TRACE] overseas_summary candidates usd_order_psbl=%s usd_cash=%s usd_tot_evlu=%s krw_order_psbl=%s krw_tot_evlu=%s keys_bal2=%s keys_pres2=%s keys_pres3=%s",
+                usd_order_psbl,
+                usd_cash,
+                usd_tot_evlu,
+                krw_order_psbl,
+                krw_tot_evlu,
                 list(bal2.keys())[:50],
                 list(pres2.keys())[:50],
                 list(pres3.keys())[:50],
@@ -183,15 +194,19 @@ def build_overseas_summary(
 
     return {
         "currency": "USD",
-        "dnca_tot_amt": str(_i(buy_amt if buy_amt > 0 else ord_psbl)),
-        "prvs_rcdl_excc_amt": str(available),
-        "nxdy_excc_amt": str(available),
-        "ord_psbl_frcr_amt": str(_i(ord_psbl)),
-        "frcr_buy_amt": str(_i(buy_amt)),
-        "tot_evlu_amt": str(_i(tot_evlu)),
+        # USD (외화)
+        "dnca_tot_amt": str(_i(usd_cash)),
+        "prvs_rcdl_excc_amt": str(available_usd),
+        "nxdy_excc_amt": str(available_usd),
+        "ord_psbl_frcr_amt": str(_i(usd_order_psbl if usd_order_psbl > 0 else usd_cash)),
+        "frcr_buy_amt": str(_i(usd_cash)),
+        "tot_evlu_amt_usd": str(_i(usd_tot_evlu)),
+        "available_cash": str(available_usd),
+        # KRW 환산(표시용)
+        "available_cash_krw": str(_i(available_krw)),
+        "tot_evlu_amt_krw": str(_i(krw_tot_evlu)),
         "pchs_amt_smtl_amt": str(_i(pchs_smtl)),
         "evlu_pfls_smtl_amt": str(_i(pfls_smtl)),
-        "available_cash": str(available),
         "status": "ok",
     }
 
