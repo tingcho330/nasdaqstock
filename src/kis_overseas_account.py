@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
@@ -39,6 +40,30 @@ def _rows(df: pd.DataFrame) -> List[Dict[str, Any]]:
     if df is None or df.empty:
         return []
     return df.to_dict(orient="records")
+
+
+def _present_usd_row(df_present_out2: Optional[pd.DataFrame]) -> Dict[str, Any]:
+    """CTRP6504R output2: 통화별 행 — USD 행 우선."""
+    if df_present_out2 is None or df_present_out2.empty:
+        return {}
+    for rec in _rows(df_present_out2):
+        cd = str(rec.get("crcy_cd") or "").strip().upper()
+        name = str(rec.get("crcy_cd_name") or "").strip().upper()
+        if cd == "USD" or "USD" in name or "달러" in name:
+            return rec
+    return df_present_out2.iloc[0].to_dict()
+
+
+def _pick_positive(*sources: Dict[str, Any], keys: Tuple[str, ...]) -> float:
+    """여러 dict에서 첫 번째 양수 금액 필드."""
+    for src in sources:
+        if not src:
+            continue
+        for k in keys:
+            v = _f(src.get(k))
+            if v > 0:
+                return v
+    return 0.0
 
 
 def normalize_overseas_holdings(df_hold: pd.DataFrame, market: str) -> pd.DataFrame:
@@ -90,28 +115,55 @@ def build_overseas_summary(
     금액 단위: USD (정수 달러, 소수 반올림).
     """
     bal2 = _first_row(df_bal_out2)
-    pres2 = _first_row(df_present_out2) if df_present_out2 is not None else {}
+    pres2 = _present_usd_row(df_present_out2)
     pres3 = _first_row(df_present_out3) if df_present_out3 is not None else {}
 
-    ord_psbl = _f(
-        bal2.get("ord_psbl_frcr_amt")
-        or bal2.get("frcr_ord_psbl_amt")
-        or pres2.get("frcr_gnrl_ord_psbl_amt")
-        or pres3.get("frcr_gnrl_ord_psbl_amt")
+    # TTTS3012R output2 + CTRP6504R output2/3 (KIS 공식 필드명)
+    ord_psbl = _pick_positive(
+        pres3,
+        pres2,
+        bal2,
+        keys=(
+            "frcr_use_psbl_amt",       # CTRP6504R output3: 외화사용가능금액
+            "frcr_drwg_psbl_amt_1",    # CTRP6504R output2: 외화출금가능금액
+            "nxdy_frcr_drwg_psbl_amt",
+            "ord_psbl_frcr_amt",
+            "frcr_ord_psbl_amt",
+            "frcr_gnrl_ord_psbl_amt",
+        ),
     )
-    buy_amt = _f(
-        bal2.get("frcr_buy_amt")
-        or bal2.get("frcr_dncl_amt1")
-        or pres2.get("frcr_dncl_amt1")
+    buy_amt = _pick_positive(
+        pres2,
+        pres3,
+        bal2,
+        keys=(
+            "frcr_dncl_amt_2",         # CTRP6504R output2: 외화예수금
+            "frcr_dncl_amt1",
+            "dncl_amt",
+            "tot_dncl_amt",
+            "frcr_buy_amt",
+            "frcr_buy_amt_smtl1",
+            "frcr_buy_amt_smtl",
+        ),
     )
-    tot_evlu = _f(
-        bal2.get("tot_evlu_amt")
-        or bal2.get("frcr_evlu_tota")
-        or pres3.get("tot_evlu_amt")
-        or pres3.get("evlu_amt_smvl")
+    tot_evlu = _pick_positive(
+        pres3,
+        pres2,
+        bal2,
+        keys=(
+            "frcr_evlu_tota",
+            "tot_asst_amt",
+            "tot_evlu_amt",
+            "frcr_evlu_amt2",
+            "evlu_amt_smvl",
+        ),
     )
-    pchs_smtl = _f(bal2.get("frcr_pchs_amt1") or pres3.get("pchs_amt_smtl"))
-    pfls_smtl = _f(bal2.get("frcr_evlu_pfls_amt2") or pres3.get("evlu_pfls_amt_smtl"))
+    pchs_smtl = _pick_positive(bal2, pres3, keys=("frcr_pchs_amt1", "pchs_amt_smtl", "pchs_amt_smtl_amt"))
+    pfls_smtl = _pick_positive(
+        bal2,
+        pres3,
+        keys=("frcr_evlu_pfls_amt2", "evlu_pfls_amt_smtl", "tot_evlu_pfls_amt"),
+    )
 
     available = int(round(ord_psbl if ord_psbl > 0 else buy_amt))
 
