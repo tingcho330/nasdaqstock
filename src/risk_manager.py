@@ -40,7 +40,7 @@ from notifier import (
 # ── 계산 전용 코어 모듈 사용 ───────────────────────────────────────────
 from screener_core import (
     _compute_levels,          # 손절/목표가 계산 (ATR/스윙 기반, 퍼센트 백업)
-    get_historical_prices,    # 과거 시세 조회 (pykrx 우선, fdr 백업)
+    get_historical_prices,    # 과거 시세 (KIS 우선, KR만 pykrx/fdr 백업)
     calculate_rsi,            # RSI 계산
 )
 
@@ -317,6 +317,12 @@ class RiskManager:
         tp = self.config.get("trading_params", {}) or {}
         mkt = _market()
         self.session_windows: List[str] = risk_session_windows(mkt, self.config)
+        # risk_params에 없으면 trading_params / US 세션 기본값으로 매도 시간대 통일
+        if not self.rules.time_windows_for_sells:
+            self.rules.time_windows_for_sells = (
+                tp.get("sell_time_windows")
+                or (list(self.session_windows) if is_us_market(mkt) and self.session_windows else None)
+            )
         self.buy_time_windows: List[str] = (
             tp.get("buy_time_windows")
             or rp.get("buy_time_windows")
@@ -358,7 +364,50 @@ class RiskManager:
         logger.info(f"RiskManager 초기화 완료 (env={self.env}, strategy_mode={self.strategy_mode})")
         # [NEW] 전일 종가 캐시(세션 단위)
         self._prev_close_cache: Dict[str, int] = {}
-        
+
+    def _effective_sell_time_windows(self) -> Optional[List[str]]:
+        """매도 판단·즉시매도 공통 시간대 (risk_params → trading_params → US 세션)."""
+        if self.rules.time_windows_for_sells:
+            return self.rules.time_windows_for_sells
+        tp = self.config.get("trading_params", {}) or {}
+        if tp.get("sell_time_windows"):
+            return tp.get("sell_time_windows")
+        if is_us_market(_market()) and self.session_windows:
+            return list(self.session_windows)
+        return None
+
+    def _resolve_holding_current_price(self, holding: Dict) -> int:
+        """보유 현재가 — 잔고 prpr=0이면 KIS 실시간 시세로 보정 (US/국내 공통)."""
+        cur = _to_int(holding.get("prpr", 0))
+        if cur > 0:
+            return cur
+        ticker = normalize_ticker_6(holding.get("pdno", ""), _market())
+        if not ticker or self._kis is None:
+            return 0
+        try:
+            info = self._kis.get_realtime_price_with_quotes(ticker, market=_market())
+            if info and _to_int(info.get("current_price", 0)) > 0:
+                px = _to_int(info["current_price"])
+                logger.info(
+                    "[가격보정] %s(%s) 잔고 prpr=0 → 시세 %s",
+                    holding.get("prdt_name", ticker),
+                    ticker,
+                    _money(px),
+                )
+                return px
+        except Exception as e:
+            logger.debug("[가격보정] %s 시세 조회 실패: %s", ticker, e)
+        return 0
+
+    def _quote_price_for_record(self, ticker: str) -> int:
+        if self._kis is None:
+            return 0
+        try:
+            info = self._kis.get_realtime_price_with_quotes(ticker, market=_market())
+            return _to_int(info.get("current_price")) if info else 0
+        except Exception:
+            return 0
+
     def _load_holdings(self) -> Dict[str, Dict]:
         """보유 종목 정보 로드 (백그라운드 모니터링용)"""
         try:
@@ -438,8 +487,7 @@ class RiskManager:
         if not is_market_open_day(market=_market()):
             logger.debug(f"[DIRECT_SELL] skip: non-trading day (ticker={ticker})")
             return False
-        tp = self.config.get("trading_params", {}) or {}
-        sell_wins = self.rules.time_windows_for_sells or tp.get("sell_time_windows")
+        sell_wins = self._effective_sell_time_windows()
         sell_win_ok = True if not sell_wins else in_time_windows(now_kst, sell_wins, tz=KST)
         if not sell_win_ok:
             logger.debug(f"[DIRECT_SELL] skip: outside sell window (ticker={ticker}, now={now_kst.strftime('%H:%M:%S')})")
@@ -455,7 +503,12 @@ class RiskManager:
                 return False
             logger.info(f"[DIRECT_SELL] try submit: {name}({ticker}) qty={qty}, reason={reason_meta.get('type','')}")
             df = self._kis.order_cash(
-                ord_dv="01", pdno=ticker, ord_dvsn="01", ord_qty=str(qty), ord_unpr="0"
+                ord_dv="01",
+                pdno=ticker,
+                ord_dvsn="01",
+                ord_qty=int(qty),
+                ord_unpr=0,
+                market=_market(),
             )
             from utils import extract_broker_order_id
             odno = extract_broker_order_id(df)
@@ -472,15 +525,7 @@ class RiskManager:
             if ok:
                 logger.info(f"[DIRECT_SELL] ✅ submitted: {name}({ticker}) {qty}주 (ODNO={odno or 'N/A'})")
                 try:
-                    # 가격 조회 시도
-                    current_price = 0
-                    try:
-                        price_df = self._kis.inquire_price(fid_cond_mrkt_div_code="J", fid_input_iscd=ticker)
-                        if price_df is not None and not price_df.empty and 'stck_prpr' in price_df.columns:
-                            current_price = int(price_df['stck_prpr'].iloc[0])
-                    except Exception:
-                        pass
-                    
+                    current_price = self._quote_price_for_record(ticker)
                     from recorder import record_trade
                     try:
                         from db_debug import log_trade_in as _db_dbg_trade_in
@@ -606,7 +651,15 @@ class RiskManager:
                 raise ValueError(f"Invalid current price: {ep}")
             
             # Phase 1: strategy_params 전달
-            levels = _compute_levels(t, safe_ep, date_str, risk_params, strategy_params)
+            levels = _compute_levels(
+                t,
+                safe_ep,
+                date_str,
+                risk_params,
+                strategy_params,
+                market=_market(),
+                kis=self._kis,
+            )
             if isinstance(levels, dict):
                 if "손절가" in levels and "목표가" in levels:
                     stop_loss = _to_float(levels["손절가"], out["손절가"])
@@ -626,7 +679,13 @@ class RiskManager:
         try:
             end_dt = datetime.now(KST)
             start_dt = end_dt - timedelta(days=365)
-            df = get_historical_prices(t, start_dt.strftime("%Y%m%d"), end_dt.strftime("%Y%m%d"))
+            df = get_historical_prices(
+                t,
+                start_dt.strftime("%Y%m%d"),
+                end_dt.strftime("%Y%m%d"),
+                market=_market(),
+                kis=self._kis,
+            )
             if df is not None and not df.empty:
                 # 컬럼명 정규화
                 df = self._normalize_column_names(df)
@@ -672,12 +731,18 @@ class RiskManager:
                 # 이동평균선 계산 (MA50, MA200)
                 end_dt = datetime.now(KST)
                 start_dt = end_dt - timedelta(days=400)  # MA200을 위해 충분한 데이터
-                df = get_historical_prices(t, start_dt.strftime("%Y%m%d"), end_dt.strftime("%Y%m%d"))
-                
+                df = get_historical_prices(
+                    t,
+                    start_dt.strftime("%Y%m%d"),
+                    end_dt.strftime("%Y%m%d"),
+                    market=_market(),
+                    kis=self._kis,
+                )
+
                 if df is not None and not df.empty:
                     # 컬럼명 정규화
                     df = self._normalize_column_names(df)
-                    
+
                     # Close 컬럼 찾기 (정규화 후)
                     close_col = None
                     if "Close" in df.columns:
@@ -748,11 +813,17 @@ class RiskManager:
                 # MA20 및 기울기 계산
                 end_dt = datetime.now(KST)
                 start_dt = end_dt - timedelta(days=60)  # MA20 + 기울기 계산을 위한 충분한 데이터
-                df = get_historical_prices(t, start_dt.strftime("%Y%m%d"), end_dt.strftime("%Y%m%d"))
-                
+                df = get_historical_prices(
+                    t,
+                    start_dt.strftime("%Y%m%d"),
+                    end_dt.strftime("%Y%m%d"),
+                    market=_market(),
+                    kis=self._kis,
+                )
+
                 if df is not None and not df.empty:
                     df = self._normalize_column_names(df)
-                    
+
                     # Close 컬럼 찾기
                     close_col = None
                     if "Close" in df.columns:
@@ -794,7 +865,13 @@ class RiskManager:
         try:
             end_dt = datetime.now(KST)
             start_dt = end_dt - timedelta(days=10)  # 주말 포함 여유
-            df = get_historical_prices(t, start_dt.strftime("%Y%m%d"), end_dt.strftime("%Y%m%d"))
+            df = get_historical_prices(
+                t,
+                start_dt.strftime("%Y%m%d"),
+                end_dt.strftime("%Y%m%d"),
+                market=_market(),
+                kis=self._kis,
+            )
             if df is None or len(df) < 2:
                 return None
             close_col = "Close" if "Close" in df.columns else [c for c in df.columns if c.lower() == "close"][0]
@@ -1057,10 +1134,11 @@ class RiskManager:
 
         # 공통: 시간대 허용 여부
         now_kst = datetime.now(KST)
-        sell_win_ok = True if not self.rules.time_windows_for_sells else in_time_windows(now_kst, self.rules.time_windows_for_sells)
-        tp_base = self.rules.time_windows_for_take_profit or self.rules.time_windows_for_sells
+        sell_wins = self._effective_sell_time_windows()
+        sell_win_ok = True if not sell_wins else in_time_windows(now_kst, sell_wins, tz=KST)
+        tp_base = self.rules.time_windows_for_take_profit or sell_wins
         tp_win_ok = True if not tp_base else in_time_windows(now_kst, tp_base)
-        logger.debug(f"[{ticker}] 시간대 체크: 현재={now_kst.strftime('%H:%M:%S')}, 매도허용={sell_win_ok}, 이익실현허용={tp_win_ok}, 매도시간대={self.rules.time_windows_for_sells}")
+        logger.debug(f"[{ticker}] 시간대 체크: 현재={now_kst.strftime('%H:%M:%S')}, 매도허용={sell_win_ok}, 이익실현허용={tp_win_ok}, 매도시간대={sell_wins}")
         
         # 판단 조건 요약 로그
         logger.info(
@@ -1686,11 +1764,15 @@ class RiskManager:
         # B. 약세 다이버전스 (설정에서 활성화된 경우만)
         if rsi_strategy.get("check_divergence", True):
             try:
-                from screener_core import get_historical_prices
-                from datetime import datetime, timedelta
                 end_dt = datetime.now(KST)
                 start_dt = end_dt - timedelta(days=30)
-                df = get_historical_prices(ticker, start_dt.strftime("%Y%m%d"), end_dt.strftime("%Y%m%d"))
+                df = get_historical_prices(
+                    ticker,
+                    start_dt.strftime("%Y%m%d"),
+                    end_dt.strftime("%Y%m%d"),
+                    market=_market(),
+                    kis=self._kis,
+                )
                 if df is not None and self._check_bearish_divergence(ticker, df):
                     satisfied_conditions.append("BEARISH_DIVERGENCE")
             except Exception as e:
@@ -1908,7 +1990,7 @@ def _run_cycle(rm: RiskManager, *, notify_summary: bool = True) -> None:
         
         if skipped_count > 0:
             skipped_tickers = [
-                f"{h.get('prdt_name', 'N/A')}({normalize_ticker_6(h.get('pdno', ''), os.getenv('MARKET', 'NASDAQ100'))})"
+                f"{h.get('prdt_name', 'N/A')}({normalize_ticker_6(h.get('pdno', ''), _market())})"
                 for h in holds
                 if _to_int(h.get("hldg_qty", 0)) <= 0
             ]
@@ -1932,26 +2014,27 @@ def _run_cycle(rm: RiskManager, *, notify_summary: bool = True) -> None:
         if valid_holdings:
             logger.info(f"[리스크체크] 보유 종목 {len(valid_holdings)}개 모니터링 시작")
             for idx, h in enumerate(valid_holdings, 1):
-                ticker = normalize_ticker_6(h.get("pdno", ""), os.getenv("MARKET", "SP500"))
+                ticker = normalize_ticker_6(h.get("pdno", ""), _market())
                 name = h.get("prdt_name", "N/A")
                 qty = _to_int(h.get("hldg_qty", 0))
-                cur_price = _to_float(h.get("prpr"), 0.0)
-            
+                cur_price = rm._resolve_holding_current_price(h)
+
                 logger.info(f"[리스크체크] [{idx}/{len(valid_holdings)}] {name}({ticker}) 시작 - 수량={qty:,}주, 현재가={_money(cur_price)}")
-                
+
                 if cur_price <= 0:
                     logger.warning(f"[리스크체크] [{idx}/{len(valid_holdings)}] {name}({ticker}) 현재가 정보 없음 → 스킵")
                     continue
 
+                holding_for_check = {**h, "prpr": str(cur_price)}
                 logger.debug(f"[리스크체크] [{idx}/{len(valid_holdings)}] {ticker} 실시간 레벨 계산 시작")
-                stock_info = rm.compute_realtime_levels(ticker, cur_price)
+                stock_info = rm.compute_realtime_levels(ticker, float(cur_price))
                 logger.debug(f"[리스크체크] [{idx}/{len(valid_holdings)}] {ticker} 매도 조건 판단 시작")
-                decision, reason, structured_context = rm.check_sell_condition(h, stock_info)
+                decision, reason, structured_context = rm.check_sell_condition(holding_for_check, stock_info)
                 if decision == "SELL":
                     log_msg = f" 매도 판단: {reason}"
                     logger.warning(f"[리스크체크] [{idx}/{len(valid_holdings)}] {name}({ticker}) ⚠️ {log_msg}")
                     # 하이라이트된 embed 메시지 전송
-                    _notify_sell_embed(h, reason, "SELL", structured_context, 
+                    _notify_sell_embed(holding_for_check, reason, "SELL", structured_context,
                                      key="risk_sell", cooldown_sec=300)
                     
                     # 매도 타입 확인
@@ -1962,7 +2045,7 @@ def _run_cycle(rm: RiskManager, *, notify_summary: bool = True) -> None:
                     if rm._can_direct_sell_now(ticker):
                         qty = int(h.get("hldg_qty", 0))
                         logger.info(f"[리스크체크] [{idx}/{len(valid_holdings)}] {ticker} [DIRECT_SELL] 즉시 매도 시도: {name} {qty:,}주")
-                        ok = rm._direct_execute_sell(ticker, h.get("prdt_name", ""), qty, {
+                        ok = rm._direct_execute_sell(ticker, holding_for_check.get("prdt_name", ""), qty, {
                             "type": sell_type,
                             "reason": reason,
                             "time_window": rm.rules.time_windows_for_sells or 'ALL',
@@ -1979,7 +2062,7 @@ def _run_cycle(rm: RiskManager, *, notify_summary: bool = True) -> None:
                     log_msg = f" 부분 익절 판단: {reason}"
                     logger.info(f"[리스크체크] [{idx}/{len(valid_holdings)}] {name}({ticker}) ℹ️ {log_msg}")
                     # 하이라이트된 embed 메시지 전송
-                    _notify_sell_embed(h, reason, "PARTIAL_SELL", structured_context, 
+                    _notify_sell_embed(holding_for_check, reason, "PARTIAL_SELL", structured_context,
                                      key="risk_partial_sell", cooldown_sec=300)
                     
                     # 부분 익절 타입 확인

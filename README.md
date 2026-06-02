@@ -54,11 +54,13 @@
 - **SP500 유니버스** — `frgn_code.mst`(S&P500=1) ∩ NAS/NYS/AMS 해외 마스터 (~500종, 티커별 거래소)
 - **US 스크리닝** — 5일 평균 거래대금(`min_trading_value_5d_avg_us`), 최소 점수·모멘텀·변동성 필터, 섹터 다양화
 - **티커 정규화** — `utils.normalize_ticker_6()` / `norm_ticker` (`MARKET` 기준: US 심볼·KR 6자리). `trader`는 `self._t()` 헬퍼 사용
-- **KIS 해외 시세** — `overseas_daily_price`, `overseas_price_detail` 등 (`api/overseas_stock/`)
+- **KIS 해외 시세·일봉** — `overseas_price`(실시간), `overseas_daily_price`(일봉), `overseas_price_detail`(PER/PBR) (`api/overseas_stock/`)
+- **US 시세 라우팅** — `KIS.get_realtime_price_with_quotes()` / `inquire_price()`가 `MARKET=SP500`이면 해외 TR(`HHDFS00000300`)로 자동 분기 (`trader`·`risk_manager` 공통)
+- **RSI·손절/목표·ATR** — `kis_market_data.py`가 KIS 일봉 우선 (`get_historical_prices` → US는 pykrx/fdr 미사용)
 - **GPT / 휴리스틱 분석** — `MARKET=SP500` 시 US 전용 프롬프트(초기필터·전술·리밸런싱), 가격·예산 **USD** (`fmt_money`), `gpt_params.budget_guard` / `initial_filter` 연동
 - **스케줄 오케스트레이션** — `integrated_manager.py`가 평일 잡·스크리너·파이프라인·잔액·체결확인·리컨실·요약 담당
 - **해외 잔고·주문** — `account.py` → `kis_overseas_account` (USD), `KIS.order_cash()` → `overseas_order` (NASD)
-- **장중 리스크** — `background_risk_manager` (US: `sell_time_windows` / NYSE 거래일, KR: 09:00–15:30 KST)
+- **장중 리스크** — `background_risk_manager` (US: `sell_time_windows`·`direct_execute`·NYSE 거래일; 잔고 `prpr=0` 시 KIS 실시간 시세 보정)
 - **주문 정합성** — `order_reconciler.py` (pending/partial 상태 리컨실 + `--backfill-only`로 `order_id` 누락 레코드 backfill)
 - **영속 손절/목표(positions)** — `recorder.py`의 `positions` 테이블에 `stop_price/target_price`를 저장하고, `trader.run_sell_logic()`에서 **positions 레벨을 우선 적용**
 - **회전 정책 모듈화** — `rotation_policy.py`에서 최소 보유일·Δscore·예산/경제성·페어 상한(`max_pairs_per_run`)을 공통 정책으로 적용
@@ -153,8 +155,18 @@ Git에는 `output/.gitkeep`만 추적합니다.
 api/kis_auth.KIS (DomesticStock + OverseasStock)
   ├── DomesticStock   — 국내 시세·잔고·주문
   ├── OverseasStock   — 해외 시세·일별시세·PER/PBR·잔고·주문 TR
-  └── order_cash()    — MARKET에 따라 국내 order_cash / 해외 overseas_order 자동 라우팅
+  ├── order_cash()              — MARKET → 국내 order_cash / 해외 overseas_order
+  ├── get_realtime_price_with_quotes()  — US: overseas_price / KR: 국내 inquire-price
+  └── inquire_price()           — US: 해외 시세를 stck_prpr 형식 DataFrame으로 호환 반환
 ```
+
+**해외 시세·일봉 TR (예: NASDAQ `EXCD=NAS`, `SYMB=NVDA`):**
+
+| TR | 용도 |
+|----|------|
+| `HHDFS00000300` | 해외 현재가·호가 (`overseas_price`) |
+| `HHDFS76240000` | 해외 기간별 일봉 (`overseas_daily_price` → `kis_market_data`) |
+| `HHDFS76200200` | 현재가 상세·PER/PBR (`overseas_price_detail`) |
 
 **해외 계좌·주문 TR (미국 NASDAQ, `OVRS_EXCG_CD=NASD`):**
 
@@ -164,7 +176,15 @@ api/kis_auth.KIS (DomesticStock + OverseasStock)
 | `CTRP6504R` / `VTRP6504R` | 체결기준 현재잔고 (`inquire_overseas_present_balance`) |
 | `TTTT1002U` / `TTTT1006U` | 미국 매수·매도 (`overseas_order`, 모의는 `V` 접두) |
 
-정규화: `kis_overseas_account.py` → `balance_*.json` / `summary_*.json` (USD, `currency` 필드)
+정규화: `kis_overseas_account.py` → `balance_*.json` / `summary_*.json`  
+- **예수금·주문가능:** `available_cash`(USD), `available_cash_krw` / `tot_evlu_amt_krw`(원화환산) 분리 저장  
+- Discord·로그: 예수금 USD, 주문가능/총평가 원화환산 표기
+
+**과거 OHLCV (`kis_market_data.py`):**
+
+- `get_historical_prices_kis()` — US: `overseas_daily_price` BYMD 페이지네이션 → `Open/High/Low/Close/Volume`
+- `screener_core.get_historical_prices()` — **KIS 우선**, US 실패 시 fdr/pykrx **미사용**, KR만 레거시 백업
+- 사용처: `risk_manager` RSI·손절/목표·MA, `_compute_levels` ATR·스윙, `MarketAnalyzer` SPY 레짐
 
 - **마스터:** `kis_master.load_kis_master("SP500")` — `frgn_code.mst`(S&P500) ∩ (nasmst+nysmst+amsmst)
 - **레이트 리밋:** `config.json` → `kis_limits.max_rps=2`, `max_concurrency=1`
@@ -179,8 +199,10 @@ api/kis_auth.KIS (DomesticStock + OverseasStock)
 |------|------|
 | `integrated_manager.py` | 스케줄, subprocess 파이프라인, `MARKET` 기본 `SP500` |
 | `run_integrated_manager.py` | Docker / 로컬 진입점 |
-| `risk_manager.py` | 장중 리스크 사이클 |
-| `run_background_risk_manager.py` | 리스크 전용 컨테이너 |
+| `risk_manager.py` | 장중 리스크 사이클·`check_sell_condition`·옵션 `direct_execute` 즉시매도 |
+| `run_background_risk_manager.py` | 리스크 전용 컨테이너 (`config/.env.risk`) |
+| `kis_market_data.py` | KIS 일봉 OHLCV·RSI/ATR 입력용 정규화 |
+| `rotation_policy.py` | 회전(리밸런싱) 공통 정책 (`trader`·`rotation_manager`) |
 
 ### 파이프라인
 
@@ -194,7 +216,8 @@ api/kis_auth.KIS (DomesticStock + OverseasStock)
 | `gpt_analyzer.py` | GPT·휴리스틱; US/KR 프롬프트·시스템 메시지 분기, USD Budget Guard |
 | `account.py` | 잔고·요약 JSON (`MARKET`에 따라 국내/해외 분기) |
 | `kis_overseas_account.py` | 해외 잔고 TR → 국내 JSON 호환 정규화 (USD) |
-| `trader.py` | 매수/매도 (`KIS.order_cash` 해외 자동 라우팅) |
+| `trader.py` | 매수/매도·`positions` 손절/목표 우선·회전 (`KIS.order_cash` 해외 자동 라우팅) |
+| `recorder.py` | `trading_log.db`·`positions`·거래 기록·정합성 API |
 
 ### 공통·API
 
@@ -213,7 +236,7 @@ api/kis_auth.KIS (DomesticStock + OverseasStock)
 |------|------|
 | 언어 | Python 3.11 (`Dockerfile`) |
 | 스케줄 | `schedule` |
-| 데이터 | `pandas`, `numpy`, `FinanceDataReader` (차트), `pykrx` (KR 레거시) |
+| 데이터 | `pandas`, `numpy` — **US 일봉·RSI: KIS** (`kis_market_data`); KR 백업: `FinanceDataReader`, `pykrx` |
 | HTTP | `requests`, `httpx` |
 | AI | `openai` (선택, HTTP 폴백 지원) |
 | 설정 | `python-dotenv`, `PyYAML` |
@@ -248,7 +271,7 @@ api/kis_auth.KIS (DomesticStock + OverseasStock)
 발급: [KIS Developers](https://apiportal.koreainvestment.com/) — **해외주식 거래 권한·계좌** 필요
 
 **SP500 실매매 시:** 해외증권 계좌에 **USD 예수금**(또는 원화 → 외화 환전)이 있어야 합니다.  
-`account.py`는 `MARKET=SP500`일 때 해외 잔고 TR을 조회하며, `summary_*.json`의 금액은 **USD**이고 `currency: "USD"`가 포함됩니다. `gpt_analyzer` Budget Guard·`trader` 주문 가능 금액도 이 값을 사용합니다.
+`account.py`는 `MARKET=SP500`일 때 해외 잔고 TR을 조회하며, `summary_*.json`에 `currency: "USD"`와 함께 **USD 예수금**(`available_cash`)·**원화환산 주문가능/총평가**(`available_cash_krw`, `tot_evlu_amt_krw`)를 구분 저장합니다. `gpt_analyzer` Budget Guard·`trader` 가용 현금은 `extract_cash_from_summary()`로 USD 우선 해석합니다.
 
 로컬 해외 잔고 확인:
 
@@ -314,6 +337,18 @@ KIS_TOKEN_FILE=./output/cache/kis_token.json
 | `analysis_expansion.max_total_analysis` | `15` | GPT 상세 분석 최대 종목 수 |
 
 US 프롬프트는 점수 **0.0–1.0**, 손절/목표·MA를 **$X.XX USD**로 안내합니다. `account.py`로 `summary_YYYYMMDD.json`이 없으면 Budget Guard가 비활성화됩니다.
+
+### 6.5 장중 리스크 (`risk_params` · `trading_params`)
+
+| 키 | 기본 | 설명 |
+|----|------|------|
+| `risk_params.auto_sell.direct_execute` | `true` | SELL 판단 시 `risk_manager`가 즉시 `order_cash` 매도 |
+| `risk_params.auto_sell.cooldown_sec_per_ticker` | `20` | 종목별 즉시매도 쿨다운 |
+| `trading_params.sell_time_windows` | `["23:15-06:00"]` | 매도·즉시매도 허용 KST 구간 (판단·실행 공통) |
+| `trading_params.min_holding_hours` | `72` | 매수 후 N시간 미만이면 매도 보류 |
+| `trading_params.buy_enabled` | `false` | `true`일 때만 `trader` 매수 실행 |
+
+손절/목표·RSI는 `kis_market_data` + `compute_realtime_levels()`로 계산하며, DB `positions`에 저장된 레벨이 있으면 `trader` 매도 시 우선합니다.
 
 ---
 
@@ -408,7 +443,8 @@ python3 trader.py --date ${DATE}
 |------|------|
 | `LOG_LEVEL` | `DEBUG` / `INFO` |
 | `SCREENER_TIMEOUT_SEC` | 스크리너 subprocess 타임아웃 |
-| `HEALTH_CHECK_TICKER` | US 헬스체크 심볼 (기본 `AAPL`) |
+| `HEALTH_CHECK_TICKER_NAS` / `_NYS` | US 헬스체크 (기본 `AAPL`, `JPM`) |
+| `KIS_TRACE` | `1` 시 해외 잔고·시세 파싱 디버그 로그 |
 | `DB_RECORD_DEBUG` | `1` 시 DB 디버그 로그 |
 
 ---
@@ -435,10 +471,11 @@ trading_bot_260530_NASDAQ/
 │   ├── news_collector.py / gpt_analyzer.py
 │   ├── kis_overseas_account.py  # 해외 잔고 → balance/summary JSON (USD)
 │   ├── trader.py / risk_manager.py / account.py
+│   ├── kis_market_data.py       # KIS 일봉 OHLCV (RSI·손절/목표·ATR)
 │   ├── order_reconciler.py
-│   ├── rotation_policy.py        # 회전(리밸런싱) 공통 정책
+│   ├── rotation_policy.py / rotation_manager.py
 │   ├── integrated_manager.py
-│   └── utils.py                 # norm_ticker, normalize_ticker_6, fmt_money
+│   └── utils.py                 # norm_ticker, fmt_money, is_us_market, …
 ├── run_integrated_manager.py
 ├── run_background_risk_manager.py
 ├── docker-compose.yml
@@ -455,21 +492,27 @@ trading_bot_260530_NASDAQ/
 |------|------|
 | SP500 마스터·1·2차 스크리닝 | ✅ 동작 확인 |
 | 해외 시세·Amount5D·PER/PBR | ✅ KIS TR |
+| US 실시간 시세·호가 (`trader`·`risk_manager`) | ✅ `overseas_price` (국내 `inquire-price` 미사용) |
+| US 일봉·RSI·손절/ATR (`kis_market_data`) | ✅ `HHDFS76240000`; US fdr/pykrx 백업 없음 |
 | Google News RSS (US) | ✅ |
 | GPT 분석·`gpt_trades_*.json` | ✅ (US 프롬프트·USD 표기) |
 | 티커 정규화 (`normalize_ticker_6`) | ✅ trader·GPT·recorder·리컨실 등 |
 | `Ticker` US 심볼 저장 | ✅ `AMZN` 형식 (zfill 미사용) |
 | 해외 실주문 (`KIS.order_cash` → `overseas_order`) | ✅ 코드 연동 (`vps`/`prod`에서 검증 필요) |
-| 해외 잔고 (`account.py` + `kis_overseas_account`) | ✅ USD `summary_*.json` |
-| USD 예수금 (`extract_cash_from_summary`) | ✅ `ord_psbl_frcr_amt` 우선 |
+| 해외 잔고 (`account.py` + `kis_overseas_account`) | ✅ USD·KRW 환산 필드 분리 |
+| USD 예수금 (`extract_cash_from_summary`) | ✅ `frcr_dncl_amt_2` 등 CTRP6504R 필드 매핑 |
+| `positions` 손절/목표·매도 우선 | ✅ `recorder` + `trader.run_sell_logic` |
+| 회전 정책 (`rotation_policy`) | ✅ `trader` 리밸런스·`max_pairs_per_run` |
 | 파이프라인 E2E (health → news → GPT) | ✅ 로컬 검증 (§7.3) |
-| 장중 리스크 US 장 시간 | ✅ `is_regular_session` + `trading_params.sell_time_windows` |
-| `order_reconciler` 스케줄 | ✅ 06:10 KST (`order_reconcile` / US 장 마감 후) |
+| 장중 리스크·즉시매도 (`direct_execute`) | ✅ `sell_time_windows` 통일·KIS 시세 보정 |
+| `order_reconciler`·`--backfill-only` | ✅ pending 정합 + `order_id` 백필 |
 | 휴장일 판단 | ✅ US: NYSE(XNYS) / KR: 주말 (`is_market_open_day`) |
 | `Marcap` (US) | 마스터 미제공 → 0, 시총 필터 스킵 |
 | `investor_flow` (US) | 0 (국내 수급 API 경로) |
+| `dynamic_cash_management` | ⚠️ 보유 0·현금 100% 시 가용금 축소 가능 → 설정 확인 |
 
-실전 미국 매매 전: **`vps` → 스크리너 → 뉴스 → account → GPT → (선택) trader** 순으로 로컬·모의 검증을 권장합니다.
+실전 미국 매매 전: **`vps` → health_check → account → 스크리너 → 뉴스 → GPT → (선택) trader** 순으로 검증하세요.  
+`trading_params.buy_enabled=false`로 매도·리스크만 먼저 검증하는 것을 권장합니다.
 
 ---
 

@@ -67,7 +67,16 @@ from recorder import DataRecorder
 
 logger = logging.getLogger(__name__)
 
-def _compute_levels(ticker: str, current_price: float, date_str: str, risk_params: Dict[str, Any], strategy_params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def _compute_levels(
+    ticker: str,
+    current_price: float,
+    date_str: str,
+    risk_params: Dict[str, Any],
+    strategy_params: Optional[Dict[str, Any]] = None,
+    *,
+    market: Optional[str] = None,
+    kis: Optional[Any] = None,
+) -> Dict[str, Any]:
     """
     손절/목표가 계산 (통합 함수)
     우선순위: strategy_params → risk_params → 기본값
@@ -124,7 +133,9 @@ def _compute_levels(ticker: str, current_price: float, date_str: str, risk_param
             start_dt = datetime.strptime(date_str, "%Y%m%d") - timedelta(days=60)
             start_date = start_dt.strftime("%Y%m%d")
             
-            df = get_historical_prices(ticker, start_date, end_date)
+            df = get_historical_prices(
+                ticker, start_date, end_date, market=market, kis=kis
+            )
             if df is not None and len(df) > 20:
                 # ATR 계산
                 atr = calculate_atr(df, period=14)
@@ -207,23 +218,62 @@ def _compute_levels(ticker: str, current_price: float, date_str: str, risk_param
                 "source": "error"
             }
 
-def get_historical_prices(symbol: str, start_date: str, end_date: str, retries: int = 3) -> Optional[pd.DataFrame]:
+def get_historical_prices(
+    symbol: str,
+    start_date: str,
+    end_date: str,
+    retries: int = 3,
+    *,
+    market: Optional[str] = None,
+    kis: Optional[Any] = None,
+) -> Optional[pd.DataFrame]:
     """
-    과거 시세 조회 (다단계 fallback 메커니즘)
+    과거 시세 조회 — KIS 우선, 실패 시 pykrx/fdr (US는 KIS만).
     
     Args:
         symbol: 종목 코드
         start_date: 시작일 (YYYYMMDD)
         end_date: 종료일 (YYYYMMDD)
         retries: 재시도 횟수
+        market: MARKET (미지정 시 환경변수)
+        kis: KIS 인스턴스 (risk_manager 등에서 주입)
     
     Returns:
         DataFrame with OHLCV data or None if failed
     """
+    import os
     import time
-    
+    from utils import is_us_market
+
     if not symbol or not str(symbol).strip():
         logger.debug("get_historical_prices: empty symbol, skipping")
+        return None
+
+    mkt = (market or os.getenv("MARKET", "SP500")).upper().strip()
+
+    try:
+        from kis_market_data import get_historical_prices_kis
+
+        df_kis = get_historical_prices_kis(
+            symbol,
+            start_date,
+            end_date,
+            market=mkt,
+            kis=kis,
+            retries=retries,
+        )
+        if df_kis is not None and not df_kis.empty:
+            return df_kis
+    except Exception as e:
+        logger.debug("KIS get_historical_prices 실패(%s): %s", symbol, e)
+
+    if is_us_market(mkt):
+        logger.warning(
+            "US 일봉 KIS 조회 실패 — pykrx/fdr 미사용: %s (%s~%s)",
+            symbol,
+            start_date,
+            end_date,
+        )
         return None
 
     for attempt in range(retries):
@@ -356,7 +406,7 @@ class MarketAnalyzer:
                 start_dt = (
                     datetime.strptime(end_dt, "%Y%m%d") - timedelta(days=500)
                 ).strftime("%Y%m%d")
-                df = get_historical_prices(sym, start_dt, end_dt)
+                df = get_historical_prices(sym, start_dt, end_dt, market=self.market, kis=self.kis)
                 if df is not None and not df.empty and "Close" in df.columns:
                     close = pd.to_numeric(df["Close"], errors="coerce").dropna()
                     if close is not None and len(close) >= 60:

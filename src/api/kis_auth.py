@@ -332,6 +332,38 @@ class KIS(DomesticStock, OverseasStock):
         """서버시간과 로컬시간의 차이를 반영한 현재시간을 반환"""
         return datetime.utcnow() + timedelta(seconds=self.get_time_diff_ratio())
 
+    def get_realtime_price_with_quotes(self, ticker: str, market=None):
+        """국내/해외 실시간 시세·호가 (MARKET 또는 market 인자로 분기)."""
+        import os
+        from utils import is_us_market
+
+        mkt = market or os.getenv("MARKET", "SP500")
+        if is_us_market(mkt):
+            return OverseasStock.get_realtime_price_with_quotes(self, ticker, mkt)
+        return DomesticStock.get_realtime_price_with_quotes(self, ticker)
+
+    def inquire_price(self, fid_cond_mrkt_div_code: str, fid_input_iscd: str, market=None):
+        """주식 현재가 — US는 해외 시세 API, KR은 국내 inquire-price."""
+        import os
+        from utils import is_us_market, norm_ticker
+
+        mkt = market or os.getenv("MARKET", "SP500")
+        if is_us_market(mkt):
+            sym = norm_ticker(fid_input_iscd, mkt)
+            info = OverseasStock.get_realtime_price_with_quotes(self, sym, mkt)
+            if not info:
+                return pd.DataFrame()
+            return pd.DataFrame(
+                [
+                    {
+                        "stck_prpr": info["current_price"],
+                        "bidp": info.get("bid_price", info["current_price"]),
+                        "askp": info.get("ask_price", info["current_price"]),
+                    }
+                ]
+            )
+        return DomesticStock.inquire_price(self, fid_cond_mrkt_div_code, fid_input_iscd)
+
     def order_cash(self, ord_dv: str, pdno: str, ord_dvsn: str, ord_qty: int, ord_unpr: int, market=None):
         """
         국내/해외 주문 라우팅.

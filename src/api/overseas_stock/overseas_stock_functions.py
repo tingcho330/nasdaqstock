@@ -37,6 +37,83 @@ class OverseasStock:
             return pd.DataFrame([out])
         return pd.DataFrame()
 
+    @staticmethod
+    def _parse_overseas_quote_row(row: Any) -> Optional[Dict[str, Any]]:
+        """해외 현재가 API output → domestic get_realtime_price_with_quotes 호환 dict."""
+
+        def _pf(val: Any) -> float:
+            try:
+                if val is None or val == "":
+                    return 0.0
+                return float(str(val).replace(",", "").strip())
+            except (TypeError, ValueError):
+                return 0.0
+
+        px_f = _pf(
+            row.get("last")
+            or row.get("last_pr")
+            or row.get("stck_prpr")
+            or row.get("prpr")
+        )
+        if px_f <= 0:
+            return None
+        px = int(round(px_f))
+        bid_f = _pf(row.get("bidp") or row.get("bid") or row.get("basp") or row.get("bidp1"))
+        ask_f = _pf(row.get("askp") or row.get("ask") or row.get("bastp") or row.get("askp1"))
+        bid = int(round(bid_f)) if bid_f > 0 else px
+        ask = int(round(ask_f)) if ask_f > 0 else px
+        chg_f = _pf(row.get("rate") or row.get("prdy_ctrt") or row.get("prdy_vrss_ctrt"))
+        chg_amt_f = _pf(row.get("diff") or row.get("prdy_vrss") or row.get("change"))
+        return {
+            "current_price": px,
+            "bid_price": bid,
+            "ask_price": ask,
+            "volume": int(_pf(row.get("acml_vol") or row.get("tvol") or row.get("vol"))),
+            "change_rate": chg_f,
+            "change_amount": int(round(chg_amt_f)) if chg_amt_f else 0,
+            "high_price": int(round(_pf(row.get("high") or row.get("stck_hgpr")))) or px,
+            "low_price": int(round(_pf(row.get("low") or row.get("stck_lwpr")))) or px,
+            "open_price": int(round(_pf(row.get("open") or row.get("stck_oprc")))) or px,
+            "prev_close": int(round(_pf(row.get("base") or row.get("stck_sdpr") or row.get("pvol")))) or px,
+        }
+
+    def get_realtime_price_with_quotes(self, ticker: str, market: Optional[str] = None):
+        """해외주식 실시간 현재가·호가 (HHDFS00000300)."""
+        import os
+        from utils import is_us_market, norm_ticker, resolve_us_excd
+
+        mkt = market or os.getenv("MARKET", "SP500")
+        if not is_us_market(mkt):
+            return None
+        symb = norm_ticker(ticker, mkt)
+        if not symb:
+            return None
+        excd = resolve_us_excd(symb, mkt)
+        df = self.overseas_price(excd, symb)
+        if df is None or df.empty:
+            logger.warning("해외 실시간 시세 빈 응답: %s@%s", symb, excd)
+            return None
+        row = df.iloc[0]
+        info = self._parse_overseas_quote_row(row.to_dict() if hasattr(row, "to_dict") else dict(row))
+        if not info:
+            logger.warning(
+                "해외 실시간 시세 파싱 실패: %s@%s keys=%s",
+                symb,
+                excd,
+                list(row.index) if hasattr(row, "index") else [],
+            )
+            return None
+        if os.getenv("KIS_TRACE", "").strip() in ("1", "true", "yes"):
+            logger.info(
+                "KIS_TRACE overseas quote %s@%s px=%s bid=%s ask=%s",
+                symb,
+                excd,
+                info.get("current_price"),
+                info.get("bid_price"),
+                info.get("ask_price"),
+            )
+        return info
+
     def overseas_price_detail(self, excd: str, symb: str) -> pd.DataFrame:
         """해외주식 현재가상세 — HHDFS76200200 (PER/PBR 등)"""
         url = f"{self.url_base}/uapi/overseas-price/v1/quotations/price-detail"
