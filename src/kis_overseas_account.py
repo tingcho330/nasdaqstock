@@ -54,6 +54,33 @@ def _present_usd_row(df_present_out2: Optional[pd.DataFrame]) -> Dict[str, Any]:
     return df_present_out2.iloc[0].to_dict()
 
 
+def _resolve_overseas_avg_price(rec: Dict[str, Any], qty: float) -> float:
+    """
+    해외 잔고 output1 평균매입단가.
+    - pchs_avg_pric / avg_unpr3 등: 이미 주당 단가(USD) → qty로 나누지 않음
+    - frcr_pchs_amt1 등: 총 매입금액(USD) → qty로 나눠 주당 단가 산출
+    """
+    qty_f = max(_f(qty), 1.0)
+    per_share_keys = (
+        "pchs_avg_pric",
+        "avg_unpr3",
+        "ovrs_avg_unpr",
+        "pchs_avg_pric1",
+        "avg_unpr",
+    )
+    for key in per_share_keys:
+        v = _f(rec.get(key))
+        if v > 0:
+            return v
+
+    total_keys = ("frcr_pchs_amt1", "frcr_pchs_amt", "pchs_amt", "ovrs_pchs_amt")
+    for key in total_keys:
+        total = _f(rec.get(key))
+        if total > 0:
+            return total / qty_f
+    return 0.0
+
+
 def _pick_positive(*sources: Dict[str, Any], keys: Tuple[str, ...]) -> float:
     """여러 dict에서 첫 번째 양수 금액 필드."""
     for src in sources:
@@ -80,9 +107,20 @@ def normalize_overseas_holdings(df_hold: pd.DataFrame, market: str) -> pd.DataFr
         if qty <= 0:
             continue
         prpr = _f(rec.get("now_pric2") or rec.get("prpr") or rec.get("ovrs_now_pric1"))
+        avg_px = _resolve_overseas_avg_price(rec, qty)
         evlu = _f(rec.get("frcr_evlu_amt2") or rec.get("evlu_amt") or rec.get("ovrs_stck_evlu_amt"))
         if evlu <= 0 and prpr > 0:
             evlu = prpr * qty
+        if os.getenv("KIS_TRACE", "").strip() in ("1", "true", "yes") and avg_px > 0:
+            logger.info(
+                "[KIS_TRACE] %s avg_px=%s qty=%s raw_pchs_avg=%s raw_frcr_pchs=%s prpr=%s",
+                sym,
+                avg_px,
+                qty,
+                rec.get("pchs_avg_pric"),
+                rec.get("frcr_pchs_amt1"),
+                prpr,
+            )
         rows.append(
             {
                 "pdno": sym,
@@ -93,7 +131,7 @@ def normalize_overseas_holdings(df_hold: pd.DataFrame, market: str) -> pd.DataFr
                     or sym
                 ),
                 "hldg_qty": str(int(qty)),
-                "pchs_avg_pric": str(_f(rec.get("pchs_avg_pric") or rec.get("frcr_pchs_amt1")) / max(qty, 1)),
+                "pchs_avg_pric": str(avg_px),
                 "prpr": str(prpr),
                 "evlu_amt": str(evlu),
                 "evlu_pfls_amt": str(_f(rec.get("frcr_evlu_pfls_amt2") or rec.get("evlu_pfls_amt"))),
