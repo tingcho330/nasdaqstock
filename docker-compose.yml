@@ -15,7 +15,7 @@ x-common: &common
 services:
   integrated_manager:
     <<: *common
-    container_name: my_trading_bot_integrated
+    container_name: SP500_trading_bot_integrated
     command: python /app/run_integrated_manager.py
     deploy:
       resources:
@@ -26,7 +26,7 @@ services:
 
   background_risk_manager:
     <<: *common
-    container_name: my_trading_bot_risk_manager
+    container_name: SP500_trading_bot_risk_manager
     env_file:
       - ./config/.env
       - ./config/.env.risk
