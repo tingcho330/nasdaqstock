@@ -304,6 +304,41 @@ def _extract_listing_date_from_kis_df(df: pd.DataFrame) -> Optional[datetime]:
     # 후보 컬럼에서 타당한 상장일을 찾지 못하면 '데이터 없음'으로 처리(스킵 방지)
     return None
 
+
+def _screener_ticker_key(ticker: str, market: Optional[str] = None) -> str:
+    """스크리너 캐시/API 공통 티커 키 (US: AAPL, KR: 6자리)."""
+    return norm_ticker(ticker, market or os.getenv("MARKET", "SP500"))
+
+
+def _kis_quote_for_screener_meta(
+    kis: KIS,
+    ticker: str,
+    market: str,
+    *,
+    retries: int = 4,
+) -> Optional[pd.DataFrame]:
+    """섹터/상장일 메타: US=해외 price-detail, KR=국내 inquire_price."""
+    code = _screener_ticker_key(ticker, market)
+    if not code:
+        return None
+    if is_us_market(market):
+        for attempt in range(max(1, retries)):
+            try:
+                if _KIS_RATE_LIMITER:
+                    _KIS_RATE_LIMITER.wait()
+                df = kis.overseas_price_detail(resolve_us_excd(code, market), code)
+                return df if df is not None and not df.empty else None
+            except Exception as e:
+                if _is_kis_ratelimit_error(e) and attempt < retries - 1:
+                    backoff = min(1.0 * (attempt + 1), 3.0) + random.uniform(0, 0.25)
+                    time.sleep(backoff)
+                    continue
+                logger.debug("KIS overseas price-detail 실패(%s): %s", code, str(e))
+                return None
+        return None
+    return _kis_inquire_price_safe(kis, code, retries=retries)
+
+
 def _kis_inquire_price_safe(kis: KIS, code: str, retries: int = 4) -> Optional[pd.DataFrame]:
     """KIS API 호출(상장일/섹터) - 레이트 리미터 + 지수 백오프"""
     code = str(code).zfill(6)
@@ -450,15 +485,17 @@ def kis_fetch_sector_and_listing_batch(
     codes: List[str],
     date_str: str,
     workers: int = 4,
+    market: Optional[str] = None,
 ) -> None:
     """
-    inquire_price 1회당 섹터·상장일을 동시에 추출해
+    inquire_price(국내) 또는 overseas price-detail(US) 1회당 섹터·상장일 추출.
     kis_sector_map 캐시와 _LISTING_DATES_CACHE/kis_listing 캐시를 채운다.
-    이후 섹터 보강·상장일 프리패치 단계는 캐시만 사용하므로 KIS 호출이 없어진다.
     """
     if not codes:
         return
-    uniq = [str(c).zfill(6) for c in pd.unique(pd.Series(codes))]
+    mkt = (market or os.getenv("MARKET", "SP500")).upper().strip()
+    uniq = [_screener_ticker_key(c, mkt) for c in pd.unique(pd.Series(codes))]
+    uniq = [c for c in uniq if c]
 
     # 이미 두 캐시가 모두 찼으면 스킵 (파일 캐시 기준)
     sector_cached = cache_load(CACHE_PREFIX_SECTOR_MAP, date_str)
@@ -467,7 +504,7 @@ def kis_fetch_sector_and_listing_batch(
     if isinstance(listing_cached, dict) and listing_cached:
         with _LISTING_LOCK:
             for k, v in listing_cached.items():
-                key = str(k).zfill(6)
+                key = _screener_ticker_key(k, mkt)
                 if key not in _LISTING_DATES_CACHE or _LISTING_DATES_CACHE[key] is None:
                     if isinstance(v, str):
                         try:
@@ -486,20 +523,28 @@ def kis_fetch_sector_and_listing_batch(
     sector_map: Dict[str, str] = dict(sector_cached) if isinstance(sector_cached, dict) else {}
 
     def _fetch_one(code: str) -> Tuple[str, Optional[str], Optional[datetime]]:
-        df = _kis_inquire_price_safe(kis, code)
+        df = _kis_quote_for_screener_meta(kis, code, mkt)
         if df is None or df.empty:
             return code, None, None
         sec = _extract_sector_from_kis_df(df)
-        dt = _extract_listing_date_from_kis_df(df)
+        dt = _extract_listing_date_from_kis_df(df) if not is_us_market(mkt) else None
         return code, _normalize_sector_name(sec) if sec else "N/A", dt
 
     actual_workers = max(1, min(workers, _KIS_MAX_CONCURRENCY))
     total = len(targets)
-    logger.info("KIS 통합 조회(섹터+상장일) 시작 (대상 %d종목, 1회 호출당 2정보)", total)
+    api_label = "overseas price-detail" if is_us_market(mkt) else "inquire_price"
+    logger.info(
+        "KIS 통합 조회(섹터+상장일) 시작 (대상 %d종목, %s, market=%s)",
+        total, api_label, mkt,
+    )
     with ThreadPoolExecutor(max_workers=actual_workers) as ex:
         futs = {ex.submit(_fetch_one, c): c for c in targets}
         for i, fut in enumerate(as_completed(futs), start=1):
-            code, sec, dt = fut.result()
+            try:
+                code, sec, dt = fut.result()
+            except Exception as e:
+                logger.warning("KIS 통합 조회 실패(%s): %s", futs.get(fut), e)
+                continue
             sector_map[code] = sec or "N/A"
             with _LISTING_LOCK:
                 _LISTING_DATES_CACHE[code] = dt
@@ -517,7 +562,13 @@ def kis_fetch_sector_and_listing_batch(
     logger.info("KIS 통합 조회 완료: 섹터 %d건, 상장일 캐시 갱신", len(sector_map))
 
 # === 신규 추가: 공개 API ===
-def get_listing_date_kis_prefetch(kis: KIS, codes: List[str], date_str: str, workers: int = 4) -> None:
+def get_listing_date_kis_prefetch(
+    kis: KIS,
+    codes: List[str],
+    date_str: str,
+    workers: int = 4,
+    market: Optional[str] = None,
+) -> None:
     """
     요청한 날짜 키(date_str) 기준으로 KIS 상장일을 일괄 프리패치해
     - 메모리 캐시(_LISTING_DATES_CACHE)
@@ -526,7 +577,9 @@ def get_listing_date_kis_prefetch(kis: KIS, codes: List[str], date_str: str, wor
     """
     if not codes:
         return
-    uniq = [str(c).zfill(6) for c in pd.unique(pd.Series(codes))]
+    mkt = (market or os.getenv("MARKET", "SP500")).upper().strip()
+    uniq = [_screener_ticker_key(c, mkt) for c in pd.unique(pd.Series(codes))]
+    uniq = [c for c in uniq if c]
 
     # 파일 캐시가 있으면 먼저 로딩
     cached = cache_load(CACHE_PREFIX_LISTING, date_str)
@@ -541,7 +594,7 @@ def get_listing_date_kis_prefetch(kis: KIS, codes: List[str], date_str: str, wor
                         cached_dt = _parse_listing_date_value(v)
                 else:
                     cached_dt = v
-                _LISTING_DATES_CACHE[str(k).zfill(6)] = cached_dt
+                _LISTING_DATES_CACHE[_screener_ticker_key(k, mkt)] = cached_dt
 
     # 아직 없는 코드만 병렬 조회
     targets = []
@@ -556,7 +609,9 @@ def get_listing_date_kis_prefetch(kis: KIS, codes: List[str], date_str: str, wor
     logger.info("상장일(KIS) 일괄 조회 시작 (대상 %d종목)", len(targets))
 
     def _fetch(code: str) -> Tuple[str, Optional[datetime]]:
-        df = _kis_inquire_price_safe(kis, code)
+        if is_us_market(mkt):
+            return code, None
+        df = _kis_quote_for_screener_meta(kis, code, mkt)
         dt = _extract_listing_date_from_kis_df(df) if df is not None else None
         return code, dt
 
@@ -566,7 +621,11 @@ def get_listing_date_kis_prefetch(kis: KIS, codes: List[str], date_str: str, wor
         futs = {ex.submit(_fetch, c): c for c in targets}
         total = len(futs)
         for i, fut in enumerate(as_completed(futs), start=1):
-            code, dt = fut.result()
+            try:
+                code, dt = fut.result()
+            except Exception as e:
+                logger.warning("상장일 조회 실패(%s): %s", futs.get(fut), e)
+                continue
             with _LISTING_LOCK:
                 _LISTING_DATES_CACHE[code] = dt
             done += 1
@@ -584,16 +643,19 @@ def prefetch_listing_dates_kis(codes: List[str], kis: KIS, workers: int = 4):
     date_key = datetime.now().strftime("%Y%m%d")
     return get_listing_date_kis_prefetch(kis, codes, date_key, workers)
 
-def get_listing_date(ticker: str) -> Optional[datetime]:
+def get_listing_date(ticker: str, market: Optional[str] = None) -> Optional[datetime]:
     """상장일을 캐시에서 반환. 없으면 KIS 단건 조회(조용히)."""
-    code = str(ticker).zfill(6)
+    mkt = (market or os.getenv("MARKET", "SP500")).upper().strip()
+    code = _screener_ticker_key(ticker, mkt)
     with _LISTING_LOCK:
         if code in _LISTING_DATES_CACHE:
             return _LISTING_DATES_CACHE[code]
     kis = _KIS_INSTANCE
     if kis is None:
         return None
-    df = _kis_inquire_price_safe(kis, code)
+    if is_us_market(mkt):
+        return None
+    df = _kis_quote_for_screener_meta(kis, code, mkt)
     dt = _extract_listing_date_from_kis_df(df) if df is not None else None
     with _LISTING_LOCK:
         _LISTING_DATES_CACHE[code] = dt
@@ -743,7 +805,7 @@ def _get_us_benchmark_close(date_str: str, min_bars: int = 60) -> Optional[pd.Se
         end_dt = datetime.strptime(date_str, "%Y%m%d")
         start_dt = (end_dt - timedelta(days=max(400, int(min_bars * 1.8)))).strftime("%Y%m%d")
         sym = us_regime_benchmark("SP500") or "SPY"
-        df = get_historical_prices(sym, start_dt, date_str)
+        df = get_historical_prices(sym, start_dt, date_str, market="SP500", kis=_KIS_INSTANCE)
         if df is None or df.empty or "Close" not in df.columns:
             return None
         close = pd.to_numeric(df["Close"], errors="coerce").dropna()
@@ -893,23 +955,32 @@ def _extract_sector_from_kis_df(df: pd.DataFrame) -> Optional[str]:
     return None
 
 # ─────────── KIS 호출 & 섹터 보강 ───────────
-def _get_kis_sector_map(codes: List[str], kis: KIS, cache_key: Optional[str] = None, workers: int = 4) -> Dict[str, str]:
+def _get_kis_sector_map(
+    codes: List[str],
+    kis: KIS,
+    cache_key: Optional[str] = None,
+    workers: int = 4,
+    market: Optional[str] = None,
+) -> Dict[str, str]:
     if cache_key:
         cached = cache_load(CACHE_PREFIX_SECTOR_MAP, cache_key)
         if isinstance(cached, dict) and cached:
             logger.info("kis 섹터맵 캐시 사용: %s_%s.pkl", CACHE_PREFIX_SECTOR_MAP, cache_key)
             return cached
 
+    mkt = (market or os.getenv("MARKET", "SP500")).upper().strip()
+
     def _fetch_one(code: str) -> Tuple[str, str]:
+        key = _screener_ticker_key(code, mkt)
         try:
-            df = _kis_inquire_price_safe(kis, code)
+            df = _kis_quote_for_screener_meta(kis, code, mkt)
             if df is not None and not df.empty:
                 sec = _extract_sector_from_kis_df(df)
-                return (str(code).zfill(6), _normalize_sector_name(sec) if sec else "N/A")
-            return (str(code).zfill(6), "N/A")
+                return (key, _normalize_sector_name(sec) if sec else "N/A")
+            return (key, "N/A")
         except Exception as e:
-            logger.debug("KIS 섹터 조회 실패(%s): %s", code, str(e))
-            return (str(code).zfill(6), "N/A")
+            logger.debug("KIS 섹터 조회 실패(%s): %s", key, str(e))
+            return (key, "N/A")
 
     sectors: Dict[str, str] = {}
     actual_workers = max(1, min(workers, _KIS_MAX_CONCURRENCY))
@@ -925,7 +996,13 @@ def _get_kis_sector_map(codes: List[str], kis: KIS, cache_key: Optional[str] = N
         cache_save(CACHE_PREFIX_SECTOR_MAP, cache_key, sectors)
     return sectors
 
-def _enrich_sector_with_kis_api(df_base: pd.DataFrame, kis: KIS, workers: int, cache_key: Optional[str] = None) -> pd.DataFrame:
+def _enrich_sector_with_kis_api(
+    df_base: pd.DataFrame,
+    kis: KIS,
+    workers: int,
+    cache_key: Optional[str] = None,
+    market: Optional[str] = None,
+) -> pd.DataFrame:
     if df_base is None or df_base.empty:
         out = df_base.copy()
         out["Sector"] = out.get("Sector", "N/A")
@@ -950,7 +1027,9 @@ def _enrich_sector_with_kis_api(df_base: pd.DataFrame, kis: KIS, workers: int, c
     ck = cache_key or datetime.now().strftime("%Y%m%d")
     
     try:
-        kis_map = _get_kis_sector_map([str(x).zfill(6) for x in target_idx.tolist()], kis, ck, workers)
+        kis_map = _get_kis_sector_map(
+            target_idx.tolist(), kis, ck, workers, market=market
+        )
         
         # KIS 맵 결과 검증
         if kis_map and len(kis_map) > 0:
@@ -1174,7 +1253,9 @@ def _apply_sector_source_order(
     missing_idx = df.index[df["Sector"].isna() | df["Sector"].eq("N/A")]
     if len(missing_idx) > 0 and kis is not None:
         logger.info("섹터 보강(KIS) 대상: %d 종목", len(missing_idx))
-        kis_df = _enrich_sector_with_kis_api(df.loc[missing_idx].copy(), kis, workers, cache_key=date_str)
+        kis_df = _enrich_sector_with_kis_api(
+            df.loc[missing_idx].copy(), kis, workers, cache_key=date_str, market=market
+        )
         if kis_df is not None and not kis_df.empty and "Sector" in kis_df.columns:
             common_idx = missing_idx.intersection(kis_df.index)
             if len(common_idx) > 0:
@@ -1574,7 +1655,9 @@ def update_holdings_scores(holdings: List[Dict[str, Any]], date_str: str, market
         kis = _KIS_INSTANCE
         if kis:
             logger.info("보유 종목 섹터 정보 보강 중...")
-            df_holdings = _enrich_sector_with_kis_api(df_holdings, kis, workers=2, cache_key=date_str)
+            df_holdings = _enrich_sector_with_kis_api(
+                df_holdings, kis, workers=2, cache_key=date_str, market=market
+            )
     except Exception as e:
         logger.debug("보유 종목 섹터 보강 실패: %s", str(e))
     
@@ -2087,7 +2170,9 @@ def _calculate_scores_for_ticker(
             df_price = df_price.tail(calc_window_days)
 
         # --- 신규상장 우선 스킵 ---
-        listing_dt = _LISTING_DATES_CACHE.get(str(code).zfill(6)) or get_listing_date(code)
+        listing_dt = _LISTING_DATES_CACHE.get(
+            _screener_ticker_key(code, market)
+        ) or get_listing_date(code, market)
         newly_days = int(cfg.get("exclude_newly_listed_days", 60))
         if listing_dt is not None and newly_days > 0 and is_newly_listed(listing_dt, datetime.now(), newly_days):
             with _fail_lock:
@@ -2570,7 +2655,9 @@ def run_screener(
 
     # KIS 1회 호출로 섹터+상장일 동시 조회 → 이후 섹터 보강/상장일 프리패치는 캐시만 사용
     with stage("KIS 통합 조회(섹터+상장일)", notify_key=None):
-        kis_fetch_sector_and_listing_batch(kis, list(df_filtered.index), fixed_date, workers)
+        kis_fetch_sector_and_listing_batch(
+            kis, list(df_filtered.index), fixed_date, workers, market=market
+        )
 
     with stage("섹터 보강", notify_key="screener_sector"):
         # 기본 우선순위: pykrx 우선, FDR/캐시 다음, 실시간은 KIS 우선
@@ -2639,7 +2726,9 @@ def run_screener(
 
     # ✅ KIS 상장일 사전 캐싱 (로그 1회, 스코어링 전)
     with stage("상장일(KIS) 프리패치", notify_key=None):
-        get_listing_date_kis_prefetch(kis, list(df_filtered.index), fixed_date, workers)
+        get_listing_date_kis_prefetch(
+            kis, list(df_filtered.index), fixed_date, workers, market=market
+        )
 
     with stage("상세 분석(스코어링)", notify_key="screener_scoring"):
         # 빈/무효 티커 제거 (All attempts failed for "" 방지)
@@ -3102,12 +3191,18 @@ def parse_args():
     return parser.parse_args()
 
 if __name__ == "__main__":
+    import sys
+
     args = parse_args()
-    run_screener(
-        args.date,
-        args.market,
-        args.config,
-        max(1, min(args.workers, MAX_WORKERS_HARD_CAP)),
-        args.debug,
-        pipeline_session=args.session,
-    )
+    try:
+        run_screener(
+            args.date,
+            args.market,
+            args.config,
+            max(1, min(args.workers, MAX_WORKERS_HARD_CAP)),
+            args.debug,
+            pipeline_session=args.session,
+        )
+    except Exception as e:
+        logger.critical("스크리너 치명적 오류: %s", e, exc_info=True)
+        sys.exit(1)
