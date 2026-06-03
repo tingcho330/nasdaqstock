@@ -37,6 +37,9 @@ from utils import (
     normalize_ticker_6,
     fmt_money,
     fmt_money_signed,
+    resolve_pipeline_context,
+    pipeline_artifact_path,
+    format_pipeline_artifact,
 )
 
 # 디스코드 노티파이어
@@ -758,15 +761,65 @@ def _tail(text: str, n: int = 12) -> str:
     lines = text.strip().splitlines()
     return "\n".join(lines[-n:])
 
-def run_script(script_name: str, run_id: str) -> Tuple[bool, bool, float]:
+def _apply_pipeline_env(run_id: str) -> Dict[str, str]:
+    """파이프라인 AM/PM·거래일을 환경변수로 고정 (자정 넘김 시 산출물 짝 유지)."""
+    cfg = getattr(settings, "_config", None) or {}
+    ctx = resolve_pipeline_context(market=MARKET, config=cfg)
+    os.environ["PIPELINE_SESSION"] = ctx["session"]
+    os.environ["PIPELINE_TRADE_DATE"] = ctx["trade_date"]
+    logger.info(
+        "[%s] pipeline context: session=%s trade_date=%s kst_date=%s",
+        run_id,
+        ctx["session"],
+        ctx["trade_date"],
+        ctx["kst_date"],
+    )
+    return ctx
+
+
+def _resolve_screener_input_for_news(ctx: Dict[str, str]) -> Optional[Path]:
+    """news_collector가 읽을 스크리너 결과 (세션·거래일 우선, 레거시 폴백)."""
+    for sess in (ctx.get("session"), None):
+        p = pipeline_artifact_path(
+            "screener_candidates",
+            ctx["trade_date"],
+            MARKET,
+            session=sess,
+        )
+        if p.exists():
+            return p
+    return None
+
+
+def run_script(script_name: str, run_id: str, pipeline_ctx: Optional[Dict[str, str]] = None) -> Tuple[bool, bool, float]:
     """주어진 파이썬 스크립트를 실행 (자동 복구 포함)"""
     timeout_sec = SCREENER_TIMEOUT_SEC if script_name == "screener.py" else SCRIPT_TIMEOUT_SEC
+    ctx = pipeline_ctx or {
+        "session": os.environ.get("PIPELINE_SESSION", ""),
+        "trade_date": os.environ.get("PIPELINE_TRADE_DATE", ""),
+    }
+    trade_date = ctx.get("trade_date") or ""
+    session = ctx.get("session") or ""
 
     args = []
     if script_name == "screener.py":
-        args = ["--market", MARKET]
+        args = ["--market", MARKET, "--date", trade_date]
+        if session:
+            args.extend(["--session", session])
     elif script_name == "gpt_analyzer.py":
-        args = ["--market", MARKET, "--slots", SLOTS]
+        args = ["--market", MARKET, "--slots", SLOTS, "--date", trade_date]
+        if session:
+            args.extend(["--session", session])
+    elif script_name == "news_collector.py":
+        screener_path = _resolve_screener_input_for_news(ctx)
+        if screener_path:
+            args = ["--file", str(screener_path)]
+        else:
+            logger.warning(
+                "[%s] 세션 스크리너 없음 (%s) → news_collector 자동 탐색",
+                run_id,
+                format_pipeline_artifact("screener_candidates", trade_date, MARKET, session),
+            )
 
     command = ["python", f"/app/src/{script_name}"] + args
     cmd_str = " ".join(command)
@@ -836,12 +889,16 @@ def run_screener_job():
         run_id = datetime.now(KST).strftime("%Y%m%d-%H%M%S")
         os.environ["RUN_ID"] = run_id
         os.environ["RUN_STARTED_AT"] = str(time.time())
+        pipeline_ctx = _apply_pipeline_env(run_id)
 
-        start = f"🔍 스크리너 실행 시작 (MARKET={MARKET})"
+        start = (
+            f"🔍 스크리너 실행 시작 (MARKET={MARKET}, "
+            f"session={pipeline_ctx['session']}, trade_date={pipeline_ctx['trade_date']})"
+        )
         logger.info(f"[{run_id}] KST {datetime.now(KST):%Y-%m-%d %H:%M:%S} - {start}")
         _notify(start, key=f"{run_id}:screener_start", cooldown_sec=30)
 
-        ok, warned, dur = run_script("screener.py", run_id)
+        ok, warned, dur = run_script("screener.py", run_id, pipeline_ctx)
         status = "✅ 완료" if ok else "❌ 실패"
         warn_tag = " (⚠️ slow)" if (ok and warned) else ""
         _notify(f"🔍 스크리너 {status}{warn_tag} - {dur:.1f}초", key=f"{run_id}:screener_end", cooldown_sec=30)
@@ -1022,6 +1079,7 @@ def run_trading_pipeline():
         run_id = datetime.now(KST).strftime("%Y%m%d-%H%M%S")
         os.environ["RUN_ID"] = run_id
         os.environ["RUN_STARTED_AT"] = str(time.time())
+        pipeline_ctx = _apply_pipeline_env(run_id)
 
         # 파이프라인 상태 관리자 초기화
         state_manager = PipelineStateManager(run_id)
@@ -1034,7 +1092,10 @@ def run_trading_pipeline():
             if saved_state.get('failed_step'):
                 logger.info(f"실패한 단계부터 재시작: {saved_state['failed_step']}")
 
-        start_msg = f"🤖 자동매매 파이프라인 시작 (MARKET={MARKET}, SLOTS={SLOTS})"
+        start_msg = (
+            f"🤖 자동매매 파이프라인 시작 (MARKET={MARKET}, SLOTS={SLOTS}, "
+            f"session={pipeline_ctx['session']}, trade_date={pipeline_ctx['trade_date']})"
+        )
         logger.info(f"[{run_id}] KST {datetime.now(KST):%Y-%m-%d %H:%M:%S} - {start_msg}")
         _notify(msg=start_msg, key=f"{run_id}:pipeline_start", cooldown_sec=30)
 
@@ -1075,7 +1136,7 @@ def run_trading_pipeline():
                         continue
                     
                     logger.info(f"[{run_id}] 단계 실행: {script}")
-                    ok, warned, dur = run_script(script, run_id)
+                    ok, warned, dur = run_script(script, run_id, pipeline_ctx)
                     
                     # 상태 저장
                     state_manager.save_state(script, ok, dur)

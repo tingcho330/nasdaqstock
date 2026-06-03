@@ -17,6 +17,9 @@ from utils import (
     OUTPUT_DIR,
     load_config,
     find_latest_file,
+    format_pipeline_artifact,
+    pipeline_artifact_path,
+    parse_pipeline_artifact_stem,
     get_account_snapshot_cached,
     extract_cash_from_summary,
     convert_screener_data_to_trader_format,
@@ -518,22 +521,34 @@ def _read_json(p: Path) -> Any:
     with open(p, "r", encoding="utf-8") as f:
         return json.load(f)
 
-def _detect_files(fixed_date: str, market: str):
-    preferred = OUTPUT_DIR / f"screener_candidates_{fixed_date}_{market}.json"
+def _detect_files(fixed_date: str, market: str, session: Optional[str] = None):
+    sess = (session or os.getenv("PIPELINE_SESSION", "")).lower().strip()
+    if sess not in ("am", "pm"):
+        sess = None
+
+    def _news_path() -> Path:
+        return pipeline_artifact_path("collected_news", fixed_date, market, sess)
+
+    preferred = pipeline_artifact_path("screener_candidates", fixed_date, market, sess)
     if preferred.exists():
-        return preferred, OUTPUT_DIR / f"collected_news_{fixed_date}_{market}.json"
+        return preferred, _news_path()
 
     fallbacks = [
+        pipeline_artifact_path("screener_candidates_full", fixed_date, market, sess),
+        pipeline_artifact_path("screener_rank", fixed_date, market, sess),
+        pipeline_artifact_path("screener_rank_full", fixed_date, market, sess),
+        OUTPUT_DIR / f"screener_candidates_{fixed_date}_{market}.json",
         OUTPUT_DIR / f"screener_candidates_full_{fixed_date}_{market}.json",
-        OUTPUT_DIR / f"screener_rank_{fixed_date}_{market}.json",
-        OUTPUT_DIR / f"screener_rank_full_{fixed_date}_{market}.json",
     ]
     for fb in fallbacks:
         if fb.exists():
-            return fb, OUTPUT_DIR / f"collected_news_{fixed_date}_{market}.json"
+            news = _news_path()
+            if not news.exists():
+                news = OUTPUT_DIR / f"collected_news_{fixed_date}_{market}.json"
+            return fb, news
 
     legacy = OUTPUT_DIR / f"screener_results_{fixed_date}_{market}.json"
-    return legacy, OUTPUT_DIR / f"collected_news_{fixed_date}_{market}.json"
+    return legacy, _news_path()
 
 def _detect_latest_screener_file() -> Optional[Path]:
     patterns = [
@@ -1239,9 +1254,18 @@ def analyze_candidates_and_create_plans(
 def run_pipeline(
     fixed_date: Optional[str] = None,
     market: str = "SP500",
-    available_slots: int = 3
+    available_slots: int = 3,
+    pipeline_session: Optional[str] = None,
 ) -> Optional[Path]:
-    start_msg = f"▶ GPT 분석 시작 (date={fixed_date or 'auto'}, market={market}, slots={available_slots})"
+    sess = (pipeline_session or os.getenv("PIPELINE_SESSION", "")).lower().strip()
+    if sess not in ("am", "pm"):
+        sess = None
+    elif sess:
+        os.environ["PIPELINE_SESSION"] = sess
+    start_msg = (
+        f"▶ GPT 분석 시작 (date={fixed_date or 'auto'}, session={sess or 'auto'}, "
+        f"market={market}, slots={available_slots})"
+    )
     logger.info(start_msg)
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -1253,15 +1277,20 @@ def run_pipeline(
             logger.error(msg)
             _notify(f"❌ {msg}", key="gpt_analyzer_missing_screener", cooldown_sec=120)
             return None
-        parts = latest.stem.split("_")
-        fixed_date, market = (parts[-2], parts[-1]) if len(parts) >= 4 else (None, market)
+        meta = parse_pipeline_artifact_stem(latest.stem)
+        fixed_date = meta.get("date")
+        if meta.get("market"):
+            market = meta["market"]
+        if meta.get("session"):
+            sess = meta["session"]
+            os.environ["PIPELINE_SESSION"] = sess
         if not fixed_date:
             msg = f"파일명에서 날짜/시장 추출 실패: {latest.name}"
             logger.error(msg)
             _notify(f"❌ {msg}", key="gpt_analyzer_parse_fail", cooldown_sec=120)
             return None
 
-    screener_file, news_file = _detect_files(fixed_date, market)
+    screener_file, news_file = _detect_files(fixed_date, market, sess if sess in ("am", "pm") else None)
     if not screener_file.exists():
         msg = f"스크리너 결과 없음: {screener_file.name}"
         logger.error(msg)
@@ -1305,7 +1334,7 @@ def run_pipeline(
     _pretty_print_plans(plans, market=market)
 
     # 메타데이터 포함 출력
-    out_path = OUTPUT_DIR / f"gpt_trades_{fixed_date}_{market}.json"
+    out_path = pipeline_artifact_path("gpt_trades", fixed_date, market, sess if sess in ("am", "pm") else None)
     from datetime import datetime
     from utils import KST
     wrapped = {
@@ -1313,6 +1342,7 @@ def run_pipeline(
         "generated_at": datetime.now(KST).isoformat(),
         "market": market,
         "date": fixed_date,
+        "session": sess,
         "plans": plans or []
     }
     # 경량 스키마 검증: 필수 키 확인
@@ -1376,7 +1406,9 @@ def run_pipeline(
                             "priority": round(cur_w - per_ticker_max, 6)
                         })
 
-                rot_path = OUTPUT_DIR / f"gpt_rotations_{fixed_date}_{market}.json"
+                rot_path = pipeline_artifact_path(
+                    "gpt_rotations", fixed_date, market, sess
+                )
                 json_payload = {
                     "schema_version": "1.0",
                     "generated_at": datetime.now(KST).isoformat(),
@@ -1715,6 +1747,7 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Screener + News + GPT Analyzer Pipeline")
     parser.add_argument("--date", help="YYYYMMDD (미지정 시 최신 파일 자동 탐색)")
+    parser.add_argument("--session", choices=["am", "pm"], help="파이프라인 세션 (미지정 시 환경변수·파일명)")
     parser.add_argument(
         "--market",
         default=os.getenv("MARKET", "SP500"),
@@ -1723,4 +1756,9 @@ if __name__ == "__main__":
     parser.add_argument("--slots", type=int, default=3, help="생성할 최대 매수 계획 개수")
     args = parser.parse_args()
 
-    run_pipeline(fixed_date=args.date, market=args.market, available_slots=args.slots)
+    run_pipeline(
+        fixed_date=args.date,
+        market=args.market,
+        available_slots=args.slots,
+        pipeline_session=args.session,
+    )

@@ -25,6 +25,8 @@ from utils import (
     find_latest_file,
     is_us_market,
     norm_ticker,
+    parse_pipeline_artifact_stem,
+    format_pipeline_artifact,
 )
 
 # ───────────────── 로깅 설정 ─────────────────
@@ -382,12 +384,10 @@ def run_news_collection_from_results_file(
         logger.error(f"결과 파일({results_file})이 존재하지 않습니다.")
         return
 
-    stem = results_file.stem  # e.g., "screener_candidates_YYYYMMDD_KOSPI"
-    parts = stem.split("_")
-    if len(parts) >= 4:
-        fixed_date, market = parts[-2], parts[-1]
-    else:
-        fixed_date, market = "unknown", "UNKNOWN"
+    meta = parse_pipeline_artifact_stem(results_file.stem)
+    fixed_date = meta.get("date") or "unknown"
+    market = meta.get("market") or "UNKNOWN"
+    session = meta.get("session")
 
     logger.info(f"결과 파일 로드 → {results_file}")
     try:
@@ -422,7 +422,9 @@ def run_news_collection_from_results_file(
     if not news_data:
         news_data = {s["Ticker"]: "[NO_NEWS] 데이터 부족(수집 0건)" for s in stocks_for_news}
 
-    out_file = results_file.parent / f"collected_news_{fixed_date}_{market}.json"
+    out_file = results_file.parent / format_pipeline_artifact(
+        "collected_news", fixed_date, market, session
+    )
     logger.info(f"저장 → {out_file}")
 
     # ✅ 저장 직전: 모든 티커에 대해 구조화 포맷 보장 + 빈 값은 NO_NEWS 채움
@@ -451,10 +453,10 @@ if __name__ == "__main__":
     else:
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         latest = (
-            find_latest_file("screener_candidates_*.json")
-            or find_latest_file("screener_candidates_full_*.json")
-            or find_latest_file("screener_rank_*.json")
-            or find_latest_file("screener_rank_full_*.json")
+            find_latest_file("screener_candidates_*.json", market=os.getenv("MARKET"))
+            or find_latest_file("screener_candidates_full_*.json", market=os.getenv("MARKET"))
+            or find_latest_file("screener_rank_*.json", market=os.getenv("MARKET"))
+            or find_latest_file("screener_rank_full_*.json", market=os.getenv("MARKET"))
         )
         if latest is None:
             logger.error("output/ 폴더에 screener_candidates_*.json 또는 screener_rank_*.json 파일이 없습니다.")

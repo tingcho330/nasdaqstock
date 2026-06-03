@@ -43,6 +43,8 @@ from utils import (
     resolve_us_excd,
     set_us_ticker_excd_map,
     set_us_ticker_ovrs_excg_map,
+    format_pipeline_artifact,
+    resolve_pipeline_context,
     us_regime_benchmark,
 )
 
@@ -2459,9 +2461,23 @@ def diversify_by_sector(df_sorted: pd.DataFrame, top_n: int, sector_cap: float) 
     return final_df.head(top_n)
 
 # ─────────── 메인 실행 ───────────
-def run_screener(date_str: str, market: str, config_path: Optional[str], workers: int, debug: bool):
+def run_screener(
+    date_str: str,
+    market: str,
+    config_path: Optional[str],
+    workers: int,
+    debug: bool,
+    pipeline_session: Optional[str] = None,
+):
     global _KIS_INSTANCE, _KIS_RATE_LIMITER, _KIS_MAX_CONCURRENCY, _CURRENT_MARKET_STATE
-    start_msg = f"▶ 스크리너 시작 (date={date_str}, market={market}, workers={workers}, debug={debug})"
+    sess = (pipeline_session or os.getenv("PIPELINE_SESSION", "")).lower().strip()
+    if sess not in ("am", "pm"):
+        sess = resolve_pipeline_context(market=market).get("session", "pm")
+    os.environ["PIPELINE_SESSION"] = sess
+    start_msg = (
+        f"▶ 스크리너 시작 (date={date_str}, session={sess}, market={market}, "
+        f"workers={workers}, debug={debug})"
+    )
     logger.info(start_msg)
     _notify(start_msg, key="screener_start", cooldown_sec=60)
 
@@ -2594,7 +2610,9 @@ def run_screener(date_str: str, market: str, config_path: Optional[str], workers
                 "market_score": float(market_score) if market_score is not None else None,
                 "market_trend": market_trend,
             }
-            p = OUTPUT_DIR / f"market_state_{fixed_date}_{market}.json"
+            p = OUTPUT_DIR / format_pipeline_artifact(
+                "market_state", fixed_date, market, sess
+            )
             with open(p, "w", encoding="utf-8") as f:
                 json.dump(out, f, ensure_ascii=False, indent=2)
             logger.info("시장 상태 저장: %s", p)
@@ -2974,10 +2992,18 @@ def run_screener(date_str: str, market: str, config_path: Optional[str], workers
             df_["affordability_filter_requested"] = aff_req
 
         # 파일 경로 (실제 사용되는 파일만)
-        cands_full_json  = OUTPUT_DIR / f"screener_candidates_full_{fixed_date}_{market}.json"
-        cands_slim_json  = OUTPUT_DIR / f"screener_candidates_{fixed_date}_{market}.json"
-        scores_json      = OUTPUT_DIR / f"screener_scores_{fixed_date}_{market}.json"
-        holdings_json    = OUTPUT_DIR / f"screener_holdings_{fixed_date}_{market}.json"
+        cands_full_json  = OUTPUT_DIR / format_pipeline_artifact(
+            "screener_candidates_full", fixed_date, market, sess
+        )
+        cands_slim_json  = OUTPUT_DIR / format_pipeline_artifact(
+            "screener_candidates", fixed_date, market, sess
+        )
+        scores_json      = OUTPUT_DIR / format_pipeline_artifact(
+            "screener_scores", fixed_date, market, sess
+        )
+        holdings_json    = OUTPUT_DIR / format_pipeline_artifact(
+            "screener_holdings", fixed_date, market, sess
+        )
 
         # 저장 (실제 사용되는 파일만)
         final_candidates_full.to_json(cands_full_json, orient="records", indent=2, force_ascii=False)
@@ -3064,6 +3090,7 @@ def run_screener(date_str: str, market: str, config_path: Optional[str], workers
 def parse_args():
     parser = argparse.ArgumentParser(description="KOSPI/KOSDAQ/KONEX 스크리너")
     parser.add_argument("--date", default=datetime.now().strftime("%Y%m%d"))
+    parser.add_argument("--session", choices=["am", "pm"], help="파이프라인 세션 (미지정 시 KST·MARKET 기준 자동)")
     parser.add_argument(
         "--market",
         default=os.getenv("MARKET", "SP500"),
@@ -3076,4 +3103,11 @@ def parse_args():
 
 if __name__ == "__main__":
     args = parse_args()
-    run_screener(args.date, args.market, args.config, max(1, min(args.workers, MAX_WORKERS_HARD_CAP)), args.debug)
+    run_screener(
+        args.date,
+        args.market,
+        args.config,
+        max(1, min(args.workers, MAX_WORKERS_HARD_CAP)),
+        args.debug,
+        pipeline_session=args.session,
+    )

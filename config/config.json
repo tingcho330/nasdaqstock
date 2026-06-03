@@ -198,6 +198,10 @@
     "screener_time": "22:30",
     "pipeline_time": "23:40"
   },
+  "pipeline_sessions": {
+    "pm_start": "22:00",
+    "am_end": "06:30"
+  },
   "monthly_maintenance": {
     "day": 1,
     "time": "16:00"

@@ -34,6 +34,10 @@ __all__ = [
     "risk_session_windows",
     "is_regular_session",
     "next_session_open_kst",
+    "resolve_pipeline_context",
+    "format_pipeline_artifact",
+    "pipeline_artifact_path",
+    "parse_pipeline_artifact_stem",
     "find_latest_file",
     "cache_save",
     "cache_load",
@@ -404,6 +408,135 @@ def next_session_open_kst(
     return now + timedelta(hours=1)
 
 # ────────────────────────────────
+# 파이프라인 AM/PM 세션 · 거래일 (KST 스케줄 ↔ US ET 세션 정렬)
+# ────────────────────────────────
+_PIPELINE_SESSION_RE = re.compile(r"_(?P<session>am|pm)_", re.IGNORECASE)
+
+
+def _resolve_pipeline_session(
+    now_kst: datetime,
+    market: str,
+    config: Optional[dict] = None,
+) -> str:
+    """KST 시각 기준 파이프라인 슬롯: am(장전·새벽·장후) / pm(저녁 준비)."""
+    forced = os.getenv("PIPELINE_SESSION", "").lower().strip()
+    if forced in ("am", "pm"):
+        return forced
+
+    cfg = config or {}
+    slots = cfg.get("pipeline_sessions") if isinstance(cfg.get("pipeline_sessions"), dict) else {}
+    pm_from = _parse_schedule_hhmm(slots.get("pm_start", "22:00"))
+    am_until = _parse_schedule_hhmm(slots.get("am_end", "06:30"))
+
+    t = now_kst.time()
+    if is_us_market(market):
+        # 22:00~06:30 KST = 동일 US 야간 사이클(스크리너 22:30 · 파이프라인 23:40·자정 이후 포함)
+        if t >= pm_from or t < am_until:
+            return "pm"
+        return "am"
+
+    if t < dt_time(12, 0):
+        return "am"
+    return "pm"
+
+
+def _parse_schedule_hhmm(raw: str) -> dt_time:
+    m = re.match(r"^(\d{1,2}):(\d{2})$", str(raw or "").strip())
+    if not m:
+        return dt_time(0, 0)
+    return _parse_hhmm(m.group(1), m.group(2))
+
+
+def _resolve_pipeline_trade_date(now_kst: datetime, market: str) -> str:
+    """산출물·GPT·트레이더가 공유할 거래일(YYYYMMDD). US는 ET 세션 기준."""
+    forced = os.getenv("PIPELINE_TRADE_DATE", "").strip()
+    if re.fullmatch(r"\d{8}", forced):
+        return forced
+
+    if is_us_market(market):
+        et_now = now_kst.astimezone(_ET)
+        et_d = et_now.date()
+        t_kst = now_kst.time()
+        if t_kst >= dt_time(22, 0) or t_kst < dt_time(6, 30):
+            if is_market_open_day(et_d, market):
+                return et_d.strftime("%Y%m%d")
+            return previous_trading_day(et_d, market).strftime("%Y%m%d")
+        return previous_trading_day(et_d, market).strftime("%Y%m%d")
+
+    d = now_kst.date()
+    if is_market_open_day(d, market):
+        return d.strftime("%Y%m%d")
+    return previous_trading_day(d, market).strftime("%Y%m%d")
+
+
+def resolve_pipeline_context(
+    now: Optional[datetime] = None,
+    market: Optional[str] = None,
+    config: Optional[dict] = None,
+) -> Dict[str, str]:
+    """
+    파이프라인/스크리너 실행 컨텍스트.
+    - session: am | pm
+    - trade_date: 산출물 접미사용 거래일
+    - kst_date: KST 달력일
+    """
+    m = (market or os.getenv("MARKET", "KOSPI")).upper().strip()
+    if now is None:
+        now = datetime.now(KST)
+    elif now.tzinfo is None:
+        now = now.replace(tzinfo=KST)
+    else:
+        now = now.astimezone(KST)
+
+    session = _resolve_pipeline_session(now, m, config)
+    trade_date = _resolve_pipeline_trade_date(now, m)
+    return {
+        "session": session,
+        "trade_date": trade_date,
+        "kst_date": now.strftime("%Y%m%d"),
+    }
+
+
+def format_pipeline_artifact(
+    prefix: str,
+    trade_date: str,
+    market: str,
+    session: Optional[str] = None,
+    suffix: str = ".json",
+) -> str:
+    """예: screener_candidates_20260602_pm_SP500.json"""
+    mkt = (market or os.getenv("MARKET", "SP500")).upper().strip()
+    td = str(trade_date).strip()
+    sess = (session or os.getenv("PIPELINE_SESSION") or "").lower().strip()
+    if sess in ("am", "pm"):
+        return f"{prefix}_{td}_{sess}_{mkt}{suffix}"
+    return f"{prefix}_{td}_{mkt}{suffix}"
+
+
+def pipeline_artifact_path(
+    prefix: str,
+    trade_date: str,
+    market: str,
+    session: Optional[str] = None,
+) -> Path:
+    return OUTPUT_DIR / format_pipeline_artifact(prefix, trade_date, market, session)
+
+
+def parse_pipeline_artifact_stem(stem: str) -> Dict[str, Optional[str]]:
+    """스크리너/뉴스/GPT 산출물 stem에서 date·session·market 추출."""
+    meta: Dict[str, Optional[str]] = {"date": None, "session": None, "market": None}
+    mm = _market_pattern.search(stem)
+    if mm:
+        meta["market"] = mm.group(0).upper()
+    dm = re.search(r"(\d{8})", stem)
+    if dm:
+        meta["date"] = dm.group(1)
+    sm = _PIPELINE_SESSION_RE.search(stem)
+    if sm:
+        meta["session"] = sm.group("session").lower()
+    return meta
+
+# ────────────────────────────────
 # 내부: 파일명에서 날짜/시장/런ID 추출
 # ────────────────────────────────
 _date_patterns = [
@@ -556,7 +689,7 @@ def fmt_money_signed(amount: float, market: Optional[str] = None) -> str:
 
 
 def _extract_meta_from_name(name: str) -> Dict[str, Any]:
-    meta: Dict[str, Any] = {"date": None, "hms": None, "market": None}
+    meta: Dict[str, Any] = {"date": None, "hms": None, "market": None, "session": None}
     for pat in _date_patterns:
         m = pat.search(name)
         if m:
@@ -567,9 +700,29 @@ def _extract_meta_from_name(name: str) -> Dict[str, Any]:
     mm = _market_pattern.search(name)
     if mm:
         meta["market"] = mm.group(0).upper()
+    sm = _PIPELINE_SESSION_RE.search(name)
+    if sm:
+        meta["session"] = sm.group("session").lower()
     return meta
 
-def _score_file(p: Path, prefer_date: bool = True) -> Tuple[int, int, float]:
+
+def _session_rank(meta: Dict[str, Any], preferred_session: Optional[str]) -> int:
+    """정렬 우선순위: 세션 일치(2) > 레거시(1) > 불일치(0)."""
+    if not preferred_session:
+        return 1
+    fs = meta.get("session")
+    if fs == preferred_session:
+        return 2
+    if not fs:
+        return 1
+    return 0
+
+
+def _score_file(
+    p: Path,
+    prefer_date: bool = True,
+    preferred_session: Optional[str] = None,
+) -> Tuple[int, int, int, float]:
     """
     스코어: (date_int, hms_int, mtime)
     - 날짜가 없으면 0 취급
@@ -590,8 +743,13 @@ def _score_file(p: Path, prefer_date: bool = True) -> Tuple[int, int, float]:
     except Exception:
         mtime = 0.0
 
-    # 날짜 우선 정렬: (date, hms, mtime)
-    return (date_int if prefer_date else 0, hms_int if prefer_date else 0, mtime)
+    sess_rank = _session_rank(meta, preferred_session)
+    return (
+        date_int if prefer_date else 0,
+        sess_rank,
+        hms_int if prefer_date else 0,
+        mtime,
+    )
 
 def _iter_globs(patterns: Union[str, Iterable[str]]) -> List[Path]:
     pats: List[str] = []
@@ -613,12 +771,15 @@ def find_latest_file(
     *,
     market: Optional[str] = None,
     prefer_date_over_mtime: bool = True,
+    trade_date: Optional[str] = None,
+    session: Optional[str] = None,
 ) -> Optional[Path]:
     """
     OUTPUT_DIR에서 patterns에 매칭되는 파일 중 '최신' 하나를 반환합니다.
     - patterns: 문자열 패턴 또는 패턴 리스트/튜플
     - market: "KOSPI" 등 필터(대소문자 무시). 파일명에 시장명이 포함된 경우에만 필터 적용.
     - prefer_date_over_mtime: 파일명 날짜 우선, 동일/부재시 mtime 기준.
+    - trade_date / session: PIPELINE_TRADE_DATE·PIPELINE_SESSION 환경변수와 동일 규칙.
     """
     logger = logging.getLogger(__name__)
     candidates = _iter_globs(patterns)
@@ -626,15 +787,34 @@ def find_latest_file(
         return None
 
     mkt = (market or os.getenv("MARKET", "")).upper().strip()
-    filtered: List[Tuple[Tuple[int, int, float], Path]] = []
+    td = (trade_date or os.getenv("PIPELINE_TRADE_DATE", "")).strip()
+    sess = (session or os.getenv("PIPELINE_SESSION", "")).lower().strip()
+    if sess not in ("am", "pm"):
+        sess = None
 
-    for p in candidates:
-        meta = _extract_meta_from_name(p.name)
-        # 마켓 필터: 파일명에 마켓 문자열이 있는 경우에만 필터링
-        if mkt and meta.get("market") and meta["market"] != mkt:
-            continue
-        score = _score_file(p, prefer_date=prefer_date_over_mtime)
-        filtered.append((score, p))
+    def _collect(*, require_trade_date: bool) -> List[Tuple[Tuple[int, int, int, float], Path]]:
+        out: List[Tuple[Tuple[int, int, int, float], Path]] = []
+        for p in candidates:
+            meta = _extract_meta_from_name(p.name)
+            if mkt and meta.get("market") and meta["market"] != mkt:
+                continue
+            if require_trade_date and td and meta.get("date") and meta["date"] != td:
+                continue
+            score = _score_file(
+                p,
+                prefer_date=prefer_date_over_mtime,
+                preferred_session=sess,
+            )
+            out.append((score, p))
+        return out
+
+    filtered = _collect(require_trade_date=bool(td))
+    if not filtered and td:
+        logger.debug(
+            "find_latest_file: trade_date=%s 매칭 없음 → 날짜 필터 완화",
+            td,
+        )
+        filtered = _collect(require_trade_date=False)
 
     if not filtered:
         logger.debug(
@@ -646,7 +826,6 @@ def find_latest_file(
         except Exception:
             return None
 
-    # 날짜/시간/mtime 우선 순위 정렬
     latest = max(filtered, key=lambda t: t[0])[1]
     return latest
 
