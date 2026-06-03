@@ -31,6 +31,7 @@ from utils import (
     in_time_windows,
     get_account_snapshot_cached,
     is_market_open_day,
+    previous_trading_day,
     is_us_market,
     is_regular_session,
     normalize_ticker_6,
@@ -359,6 +360,113 @@ def _run_account_snapshot():
         logger.error(f"account.py 실행 중 오류: {e}")
 
 # ───────────────── 잔액 캡처 및 비교 ─────────────────
+def _parse_amount(val) -> int:
+    try:
+        if val is None or val == "":
+            return 0
+        return int(round(float(str(val).replace(",", "").strip())))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _holdings_detail_from_rows(holdings: List[Dict]) -> List[Dict]:
+    """보유 종목 상세 (USD 소수 현재가 허용)."""
+    mkt = MARKET
+    out: List[Dict] = []
+    for h in holdings:
+        qty = _parse_amount(h.get("hldg_qty", 0))
+        if qty <= 0:
+            continue
+        price = _parse_amount(h.get("prpr", 0))
+        evlu = _parse_amount(h.get("evlu_amt", 0))
+        if evlu <= 0 and price > 0:
+            evlu = qty * price
+        out.append({
+            "ticker": normalize_ticker_6(h.get("pdno", ""), mkt),
+            "name": h.get("prdt_name", "N/A"),
+            "qty": qty,
+            "price": price,
+            "value": evlu,
+        })
+    return out
+
+
+def _total_balance_from_cash_map(cash_map: Dict, holdings: List[Dict]) -> Tuple[int, int]:
+    """(총평가, 예수금) — SP500은 USD 필드 우선."""
+    if is_us_market(MARKET):
+        total = _parse_amount(cash_map.get("tot_evlu_amt_usd"))
+        if total <= 0:
+            total = _parse_amount(cash_map.get("tot_evlu_amt"))
+        if total <= 0:
+            hv = sum(_parse_amount(h.get("evlu_amt")) for h in holdings)
+            if hv <= 0:
+                hv = sum(
+                    _parse_amount(h.get("hldg_qty")) * _parse_amount(h.get("prpr"))
+                    for h in holdings
+                )
+            total = _parse_amount(cash_map.get("available_cash")) + hv
+        cash = _parse_amount(cash_map.get("dnca_tot_amt"))
+        if cash <= 0:
+            cash = _parse_amount(cash_map.get("available_cash"))
+        return total, cash
+    total = _parse_amount(cash_map.get("tot_evlu_amt"))
+    cash = _parse_amount(cash_map.get("dnca_tot_amt"))
+    return total, cash
+
+
+def _iter_open_snapshot_dates(close_date: str) -> List[str]:
+    """
+    종료일(close)에 맞는 장시작(open) 스냅샷 파일 날짜 후보.
+    US: 23:25(KST) 전일 캡처 → balance_open_{전일}.json + balance_close_{당일}.json
+    KR: 동일 일자 open/close
+    """
+    d = datetime.strptime(close_date, "%Y%m%d").date()
+    seen: set = set()
+    out: List[str] = []
+
+    def _add(ds: str) -> None:
+        if ds not in seen:
+            seen.add(ds)
+            out.append(ds)
+
+    if is_us_market(MARKET):
+        _add((d - timedelta(days=1)).strftime("%Y%m%d"))
+        probe = d - timedelta(days=1)
+        for _ in range(10):
+            if is_market_open_day(probe, MARKET):
+                _add(probe.strftime("%Y%m%d"))
+                break
+            probe -= timedelta(days=1)
+        probe2 = previous_trading_day(d - timedelta(days=1), MARKET)
+        _add(probe2.strftime("%Y%m%d"))
+    _add(close_date)
+    probe = d
+    for _ in range(10):
+        probe -= timedelta(days=1)
+        _add(probe.strftime("%Y%m%d"))
+    return out
+
+
+def load_daily_balance_pair(
+    session_close_date: str,
+) -> Tuple[Optional[Dict], Optional[Dict], Optional[str]]:
+    """(open_snapshot, close_snapshot, open_file_date) — close는 session_close_date 고정."""
+    close_balance = load_balance_snapshot(session_close_date, "close")
+    if not close_balance:
+        return None, None, None
+    for open_date in _iter_open_snapshot_dates(session_close_date):
+        open_balance = load_balance_snapshot(open_date, "open")
+        if open_balance:
+            if open_date != session_close_date:
+                logger.info(
+                    "일일 요약 open 스냅샷: close=%s ← open_%s (US 세션)",
+                    session_close_date,
+                    open_date,
+                )
+            return open_balance, close_balance, open_date
+    return None, close_balance, None
+
+
 def capture_balance_snapshot(snapshot_type: str) -> Optional[Dict]:
     """잔액 스냅샷 캡처 (open/close)"""
     try:
@@ -379,28 +487,29 @@ def capture_balance_snapshot(snapshot_type: str) -> Optional[Dict]:
             ttl_sec=5
         )
         
-        # 총평가금액 계산
-        total_balance = int(str(cash_map.get("tot_evlu_amt", 0)).replace(",", ""))
-        cash = int(str(cash_map.get("dnca_tot_amt", 0)).replace(",", ""))
-        holdings_value = total_balance - cash
-        
-        # 보유종목 상세 정보
-        holdings_detail = []
-        for h in holdings:
-            qty = int(str(h.get("hldg_qty", 0)).replace(",", ""))
-            if qty > 0:
-                holdings_detail.append({
-                    "ticker": normalize_ticker_6(h.get("pdno", ""), os.getenv("MARKET", "SP500")),
-                    "name": h.get("prdt_name", "N/A"),
-                    "qty": qty,
-                    "price": int(h.get("prpr", 0)),
-                    "value": qty * int(h.get("prpr", 0))
-                })
-        
+        total_balance, cash = _total_balance_from_cash_map(cash_map, holdings)
+        holdings_detail = _holdings_detail_from_rows(holdings)
+        holdings_value = sum(h["value"] for h in holdings_detail)
+        if holdings_value <= 0 and total_balance > cash:
+            holdings_value = total_balance - cash
+
+        now = datetime.now(KST)
+        snap_date = now.strftime("%Y%m%d")
+        # US 장시작(23:25): 다음 KST 아침 종료일에 세션 귀속 (요약 시 open/close 짝 맞춤)
+        session_close_date = snap_date
+        if is_us_market(MARKET) and snapshot_type == "open":
+            nxt = now.date() + timedelta(days=1)
+            for _ in range(5):
+                if is_market_open_day(nxt, MARKET):
+                    session_close_date = nxt.strftime("%Y%m%d")
+                    break
+                nxt += timedelta(days=1)
+
         # 스냅샷 데이터 구성
         snapshot = {
-            "date": datetime.now(KST).strftime("%Y%m%d"),
-            "timestamp": datetime.now(KST).isoformat(),
+            "date": snap_date,
+            "session_close_date": session_close_date,
+            "timestamp": now.isoformat(),
             "type": snapshot_type,
             "total_balance": total_balance,
             "cash": cash,
@@ -411,13 +520,22 @@ def capture_balance_snapshot(snapshot_type: str) -> Optional[Dict]:
             "balance_file": str(balance_path) if balance_path else None
         }
         
-        # 파일 저장
-        filename = f"balance_{snapshot_type}_{snapshot['date']}.json"
-        filepath = BALANCE_STORAGE_PATH / filename
-        with open(filepath, 'w', encoding='utf-8') as f:
-            json.dump(snapshot, f, ensure_ascii=False, indent=2)
-        
-        logger.info(f"잔액 스냅샷 저장: {filepath}")
+        # 파일 저장 (US open: session_close_date 키로도 저장 → 06:15 요약과 짝)
+        save_dates = {snap_date}
+        if is_us_market(MARKET) and snapshot_type == "open" and session_close_date != snap_date:
+            save_dates.add(session_close_date)
+        for save_date in save_dates:
+            filename = f"balance_{snapshot_type}_{save_date}.json"
+            filepath = BALANCE_STORAGE_PATH / filename
+            snap_copy = {**snapshot, "file_date": save_date}
+            with open(filepath, "w", encoding="utf-8") as f:
+                json.dump(snap_copy, f, ensure_ascii=False, indent=2)
+            logger.info(
+                "잔액 스냅샷 저장: %s (capture=%s session_close=%s)",
+                filepath,
+                snap_date,
+                session_close_date,
+            )
         return snapshot
         
     except Exception as e:
@@ -506,13 +624,22 @@ def send_daily_trading_summary():
     """장종료시 당일 매매 내역을 디스코드로 전송"""
     try:
         today = datetime.now(KST).strftime("%Y%m%d")
-        
-        # 장시작/종료 잔액 로드
-        open_balance = load_balance_snapshot(today, "open")
-        close_balance = load_balance_snapshot(today, "close")
-        
-        if not open_balance or not close_balance:
-            _notify(f"⚠️ {today} 잔액 데이터가 없어 일일 요약을 생성할 수 없습니다.", key="daily_summary_error")
+        open_balance, close_balance, open_date = load_daily_balance_pair(today)
+
+        if not close_balance:
+            _notify(
+                f"⚠️ {today} 일일 요약: 장종료 스냅샷 없음 "
+                f"(balance_close_{today}.json, 06:00 캡처 확인)",
+                key="daily_summary_error",
+            )
+            return
+        if not open_balance:
+            tried = ", ".join(_iter_open_snapshot_dates(today)[:5])
+            _notify(
+                f"⚠️ {today} 일일 요약: 장시작 스냅샷 없음 "
+                f"(balance_open_*.json, 23:25 캡처 확인 / 후보: {tried})",
+                key="daily_summary_error",
+            )
             return
         
         # 잔액 비교 분석
@@ -584,9 +711,14 @@ def send_daily_trading_summary():
             })
         
         # 임베드 전송
+        session_note = (
+            f"open_{open_date} → close_{today}"
+            if open_date and open_date != today
+            else today
+        )
         embed = {
             "type": "rich",
-            "title": f"📊 {today} 당일 매매 성과",
+            "title": f"📊 {today} 당일 매매 성과 ({session_note})",
             "description": f"⏰ {open_balance['timestamp'][:19]} → {close_balance['timestamp'][:19]}",
             "fields": fields,
             "color": 0x00ff00 if total_change > 0 else 0xff0000 if total_change < 0 else 0x808080,
