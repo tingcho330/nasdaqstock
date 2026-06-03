@@ -625,11 +625,22 @@ def send_daily_trading_summary():
     try:
         today = datetime.now(KST).strftime("%Y%m%d")
         open_balance, close_balance, open_date = load_daily_balance_pair(today)
+        late_close_capture = False
+
+        if not close_balance:
+            logger.warning(
+                "%s 장종료 스냅샷 없음 → account 즉시 캡처 시도 (06:00 스케줄 누락·컨테이너 중단 가능)",
+                today,
+            )
+            if capture_balance_snapshot("close"):
+                late_close_capture = True
+                open_balance, close_balance, open_date = load_daily_balance_pair(today)
 
         if not close_balance:
             _notify(
                 f"⚠️ {today} 일일 요약: 장종료 스냅샷 없음 "
-                f"(balance_close_{today}.json, 06:00 캡처 확인)",
+                f"({BALANCE_STORAGE_PATH}/balance_close_{today}.json). "
+                f"`docker compose exec integrated_manager python /app/run_integrated_manager.py --capture-close` 실행 후 재시도.",
                 key="daily_summary_error",
             )
             return
@@ -716,10 +727,13 @@ def send_daily_trading_summary():
             if open_date and open_date != today
             else today
         )
+        desc = f"⏰ {open_balance['timestamp'][:19]} → {close_balance['timestamp'][:19]}"
+        if late_close_capture:
+            desc += " | ⚠️ close는 요약 시점 즉시 캡처(06:00 스냅샷 누락)"
         embed = {
             "type": "rich",
             "title": f"📊 {today} 당일 매매 성과 ({session_note})",
-            "description": f"⏰ {open_balance['timestamp'][:19]} → {close_balance['timestamp'][:19]}",
+            "description": desc,
             "fields": fields,
             "color": 0x00ff00 if total_change > 0 else 0xff0000 if total_change < 0 else 0x808080,
             "footer": {
