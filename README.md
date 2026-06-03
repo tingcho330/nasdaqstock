@@ -78,13 +78,23 @@
 | 서비스 | 진입점 | 역할 |
 |--------|--------|------|
 | `integrated_manager` | `run_integrated_manager.py` | 평일 스케줄·스크리너·매매 파이프라인·잔액/요약·체결확인·리컨실 |
-| `background_risk_manager` | `run_background_risk_manager.py` | 장중 약 5분 주기 `risk_manager._run_cycle()` (`config/.env.risk` 추가 로드) |
+| `background_risk_manager` | `run_background_risk_manager.py` | 장중 약 5분 주기 `risk_manager._run_cycle()` (`config/.env`의 `DISCORD_WEBHOOK_URL_RISK`) |
 
-공통: `env_file: ./config/.env`, 볼륨 `./src`, `./config`, `./output`
+공통: **`env_file: ./config/.env`만** (두 서비스 동일), 볼륨 `./src`, `./config`, `./output`  
+`config/.env.risk`는 **사용하지 않습니다.**
+
+**Discord 웹훅 분리**
+
+| 변수 | 사용처 |
+|------|--------|
+| `DISCORD_WEBHOOK_URL` | `integrated_manager`·파이프라인·스크리너 (`notifier`) |
+| `DISCORD_WEBHOOK_URL_RISK` | `background_risk_manager` — `run_background_risk_manager.py`가 기동 시 이 값을 `DISCORD_WEBHOOK_URL`로 주입 후 `risk_manager` 로드 |
+
+리스크 채널을 분리하려면 `config/.env`에 두 URL을 모두 넣으세요. `DISCORD_WEBHOOK_URL_RISK`가 비어 있으면 `DISCORD_WEBHOOK_URL`로 폴백합니다.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
-│  config/config.json + config/.env (Git 제외)                             │
+│  config/config.json + config/.env (Git 제외, DISCORD_* 포함)            │
 │  output/  ← screener_*_{date}_{am|pm}_SP500.json, gpt_trades_*, trading_data.db │
 └─────────────────────────────────────────────────────────────────────────┘
          ▲                              ▲
@@ -245,7 +255,7 @@ api/kis_auth.KIS (DomesticStock + OverseasStock)
 | `integrated_manager.py` | 스케줄, AM/PM·`trade_date` 컨텍스트, subprocess 파이프라인, 일일 잔액·요약 |
 | `run_integrated_manager.py` | Docker / 로컬 진입점 |
 | `risk_manager.py` | 장중 리스크 사이클·`check_sell_condition`·옵션 `direct_execute` 즉시매도 |
-| `run_background_risk_manager.py` | 리스크 전용 컨테이너 (`config/.env.risk`) |
+| `run_background_risk_manager.py` | 리스크 전용 컨테이너 (`DISCORD_WEBHOOK_URL_RISK` → notifier) |
 | `kis_market_data.py` | KIS 일봉 OHLCV·RSI/ATR 입력용 정규화 |
 | `rotation_policy.py` | 회전(리밸런싱) 공통 정책 (`trader`·`rotation_manager`) |
 
@@ -359,8 +369,15 @@ KIS_TOKEN_FILE=./output/cache/kis_token.json
 
 | 변수 | 설명 |
 |------|------|
-| `DISCORD_WEBHOOK_URL` | 통합 매니저 |
-| `DISCORD_WEBHOOK_URL_RISK` | 리스크 (`config/.env.risk`, 미설정 시 위 URL) |
+| `DISCORD_WEBHOOK_URL` | 통합 매니저·스크리너·파이프라인 |
+| `DISCORD_WEBHOOK_URL_RISK` | `background_risk_manager` 전용 — **`config/.env`에만 설정** (`config/.env.risk` 미사용). 비어 있으면 `DISCORD_WEBHOOK_URL` 폴백 |
+
+예시 (`config/.env`):
+
+```env
+DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/.../integrated
+DISCORD_WEBHOOK_URL_RISK=https://discord.com/api/webhooks/.../risk
+```
 
 ### 6.3 스크리너 주요 설정 (`config.json` → `screener_params`)
 
@@ -414,7 +431,7 @@ cp config/.env.example config/.env
 
 # 선택
 cp config/kis_devlp.yaml.example config/kis_devlp.yaml
-cp config/.env.risk.example config/.env.risk
+# 리스크 Discord: config/.env 에 DISCORD_WEBHOOK_URL_RISK 추가 (별도 .env.risk 파일 불필요)
 ```
 
 `config/config.json`에서 `trading_environment` 확인. 처음에는 **`vps`** 권장.
@@ -521,7 +538,7 @@ trading_bot_260530_NASDAQ/
 ├── config/
 │   ├── config.json              # 전략·스케줄 (Git OK)
 │   ├── .env.example
-│   ├── .env.risk.example
+│   ├── .env.risk.example        # (참고용, 미사용 — 웹훅은 .env 에 설정)
 │   ├── kis_devlp.yaml.example
 │   └── .env                     # 비밀값 (Git 제외)
 ├── output/                      # 런타임 (Git 제외)
@@ -572,6 +589,7 @@ trading_bot_260530_NASDAQ/
 | 파이프라인 AM/PM·`trade_date` 연동 | ✅ 산출물 `_{date}_{am\|pm}_SP500`·env 전달 |
 | 파이프라인 E2E (health → news → GPT) | ✅ 로컬 검증 (§7.3) |
 | 장중 리스크·즉시매도 (`direct_execute`) | ✅ `pending` DB 기록 → 리컨실 `executed` |
+| 리스크 Discord (`DISCORD_WEBHOOK_URL_RISK`) | ✅ `config/.env` 단일 로드 (`docker-compose`에 `.env.risk` 없음) |
 | `order_reconciler`·`--backfill-only` | ✅ 미체결 0건·일자별 주문으로 체결 해소 |
 | US 일일 요약 open/close 짝 | ✅ `session_close_date`·`--capture-close` |
 | 해외 평단 (`pchs_avg_pric`) | ✅ 수량으로 재나누지 않음 (주당 평단) |

@@ -27,9 +27,6 @@ services:
   background_risk_manager:
     <<: *common
     container_name: SP500_trading_bot_risk_manager
-    env_file:
-      - ./config/.env
-      - ./config/.env.risk
     command: python /app/run_background_risk_manager.py
     deploy:
       resources:

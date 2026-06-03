@@ -23,10 +23,19 @@ from env_loader import load_project_env
 
 load_project_env()
 
-# 리스크 매니저 전용 Discord 웹훅 (config/.env 의 DISCORD_WEBHOOK_URL_RISK)
+# 리스크 전용 Discord: config/.env 의 DISCORD_WEBHOOK_URL_RISK (config/.env.risk 미사용)
 _risk_webhook = os.getenv("DISCORD_WEBHOOK_URL_RISK", "").strip()
+if not _risk_webhook:
+    _risk_webhook = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
+    if _risk_webhook:
+        print(
+            "경고: DISCORD_WEBHOOK_URL_RISK 미설정 → DISCORD_WEBHOOK_URL 사용 "
+            "(리스크 전용 채널을 쓰려면 config/.env 에 DISCORD_WEBHOOK_URL_RISK 설정)"
+        )
 if _risk_webhook:
     os.environ["DISCORD_WEBHOOK_URL"] = _risk_webhook
+else:
+    print("경고: Discord 웹훅 없음 (DISCORD_WEBHOOK_URL_RISK 또는 DISCORD_WEBHOOK_URL)")
 
 print("=== 백그라운드 RiskManager 시작 ===")
 
