@@ -710,11 +710,58 @@ def standardize_ohlcv(df: pd.DataFrame) -> Tuple[Optional[pd.DataFrame], Optiona
             out[key.capitalize()] = d[found]
 
     std = pd.DataFrame(out, index=d.index)
+    # KIS OHLCV: Date 컬럼 → DatetimeIndex (차트 index·패턴 분석 호환)
+    date_key = _find(["date", "xymd", "stck_bsop_date", "bsop_date"])
+    if date_key and date_key in d.columns:
+        try:
+            dt_idx = pd.to_datetime(
+                d[date_key].astype(str).str.replace(r"[^0-9]", "", regex=True).str[:8],
+                format="%Y%m%d",
+                errors="coerce",
+            )
+            if dt_idx.notna().any():
+                std.index = dt_idx
+                std = std[~std.index.isna()]
+        except Exception:
+            pass
     try:
         std = std.sort_index()
     except Exception:
         pass
     return std, None
+
+
+def _chart_bar_index_ms(row_index: Any, date_col: Any = None) -> int:
+    """일봉 차트용 epoch ms (DatetimeIndex·YYYYMMDD·정수 인덱스 호환)."""
+    if date_col is not None and not (isinstance(date_col, float) and pd.isna(date_col)):
+        s = str(date_col).replace("-", "").strip()[:8]
+        if len(s) == 8 and s.isdigit():
+            try:
+                return int(datetime.strptime(s, "%Y%m%d").timestamp() * 1000)
+            except Exception:
+                pass
+    if hasattr(row_index, "timestamp"):
+        try:
+            return int(row_index.timestamp() * 1000)
+        except Exception:
+            pass
+    try:
+        n = int(row_index)
+        if 19000101 <= n <= 21001231:
+            return int(datetime.strptime(str(n), "%Y%m%d").timestamp() * 1000)
+    except Exception:
+        pass
+    return int(row_index) if isinstance(row_index, (int, np.integer)) else 0
+
+
+def _default_investor_flow_df(date_str: str, days: int = 10) -> pd.DataFrame:
+    end_date = datetime.strptime(date_str, "%Y%m%d")
+    dates = [end_date - timedelta(days=i) for i in range(days, 0, -1)]
+    return pd.DataFrame({
+        "Date": dates,
+        "기관합계": [0] * days,
+        "외국인합계": [0] * days,
+    })
 
 def get_stock_listing(market: str = "KOSPI") -> pd.DataFrame:
     """
@@ -2072,14 +2119,14 @@ def _calculate_scores_for_holdings_ticker(
             
             # 일봉 차트 데이터 (최근 30일)
             daily_chart_data = []
-            for i, (_, row) in enumerate(df_price.tail(30).iterrows()):
+            for _, row in df_price.tail(30).iterrows():
                 daily_chart_data.append({
-                    "index": int(row.name.timestamp() * 1000),
-                    "Open": int(row["Open"]),
-                    "High": int(row["High"]),
-                    "Low": int(row["Low"]),
-                    "Close": int(row["Close"]),
-                    "Volume": int(row["Volume"])
+                    "index": _chart_bar_index_ms(row.name),
+                    "Open": round(float(row["Open"]), 4),
+                    "High": round(float(row["High"]), 4),
+                    "Low": round(float(row["Low"]), 4),
+                    "Close": round(float(row["Close"]), 4),
+                    "Volume": int(float(row["Volume"] or 0)),
                 })
             
             # 투자자별 매매동향 (최근 10일) - 일시적으로 비활성화
@@ -2099,7 +2146,7 @@ def _calculate_scores_for_holdings_ticker(
                 "Name": str(fin_info.get("Name", "")),
                 "Sector": sector_name,
                 "SectorSource": str(fin_info.get("SectorSource", "unknown")),
-                "Price": int(round(float(current_price))),
+                "Price": round(float(current_price), 4),
                 "Score": round(float(total_score), 4),
                 "FinScore": round(float(fin_score), 4),
                 "TechScore": round(float(tech_score), 4),
@@ -2143,7 +2190,9 @@ def _calculate_scores_for_ticker(
     market_score: float,
     sector_trends: Dict[str, float],
     risk_params: Dict[str, Any],
+    market: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
+    mkt = (market or os.getenv("MARKET", "SP500")).upper().strip()
     try:
         # 조기 반환 조건들
         if not code or pd.isna(code):
@@ -2283,34 +2332,16 @@ def _calculate_scores_for_ticker(
                 _fail_stats["up_streak_calc"] += 1
                 _fail_rows.append({"Ticker": code, "reason": "up_streak_calc", "msg": f"{type(e).__name__}:{str(e)[:160]}"})
 
-        # 투자자별 수급 데이터 조회 (안전한 방식)
-        df_investor_flow = None
-        try:
-            df_investor_flow = get_investor_flow(code, date_str)
-            if df_investor_flow is not None and not df_investor_flow.empty:
-                # 데이터 정규화
-                df_investor_flow = df_investor_flow.fillna(0)
-                # 컬럼명 정리
-                df_investor_flow.columns = [col.strip() for col in df_investor_flow.columns]
-            else:
-                # 기본 투자자 흐름 데이터 생성 (실제 데이터가 없을 때)
-                end_date = datetime.strptime(date_str, "%Y%m%d")
-                dates = [end_date - timedelta(days=i) for i in range(10, 0, -1)]
-                df_investor_flow = pd.DataFrame({
-                    'Date': dates,
-                    '기관합계': [0] * 10,
-                    '외국인합계': [0] * 10
-                })
-        except Exception as e:
-            logger.debug(f"[{code}] 투자자 흐름 데이터 조회 실패: {e}")
-            # 기본 데이터 생성
-            end_date = datetime.strptime(date_str, "%Y%m%d")
-            dates = [end_date - timedelta(days=i) for i in range(10, 0, -1)]
-            df_investor_flow = pd.DataFrame({
-                'Date': dates,
-                '기관합계': [0] * 10,
-                '외국인합계': [0] * 10
-            })
+        # 투자자별 수급 (US는 KIS 국내 API 미사용 → 기본값)
+        df_investor_flow = _default_investor_flow_df(date_str)
+        if not is_us_market(mkt):
+            try:
+                flow = get_investor_flow(code, date_str)
+                if flow is not None and not flow.empty:
+                    df_investor_flow = flow.fillna(0)
+                    df_investor_flow.columns = [col.strip() for col in df_investor_flow.columns]
+            except Exception as e:
+                logger.debug("[%s] 투자자 흐름 데이터 조회 실패: %s", code, e)
         
         # --- 차트 데이터 준비 ---
         close_series = df_price["Close"] if "Close" in df_price.columns else None
@@ -2353,7 +2384,7 @@ def _calculate_scores_for_ticker(
         # (과거: 0/음수를 '매우 저평가'로 보아 만점을 줘서 결측주·적자기업이 상위에 오던 버그)
         per_missing = pd.isna(per_val) or (per_val == 0)
         pbr_missing = pd.isna(pbr_val) or (pbr_val == 0)
-        marcap = fin_info.get("Marcap", 0)
+        marcap = float(pd.to_numeric(fin_info.get("Marcap", 0), errors="coerce") or 0)
 
         # PER 결측 시 시가총액 기반 추정값으로 대체
         if per_missing:
@@ -2481,7 +2512,7 @@ def _calculate_scores_for_ticker(
             "Name": str(name_val) if pd.notna(name_val) else "",
             "Sector": sector_name,
             "SectorSource": str(sector_src) if pd.notna(sector_src) else "unknown",
-            "Price": int(round(float(close))),
+            "Price": round(float(close), 4) if is_us_market(mkt) else int(round(float(close))),
             "Score": round(float(total_score), 4),
 
             "FinScore": round(float(fin_score), 4),
@@ -2767,7 +2798,11 @@ def run_screener(
         
         results = []
         total = len(df_filtered)
-        actual_workers = max(1, min(workers, MAX_WORKERS_HARD_CAP))
+        kis_conc = int((settings.get("kis_limits") or {}).get("max_concurrency", 2) or 2)
+        if is_us_market(market):
+            actual_workers = max(1, min(workers, kis_conc, MAX_WORKERS_HARD_CAP))
+        else:
+            actual_workers = max(1, min(workers, MAX_WORKERS_HARD_CAP))
         
         logger.info("스코어링 시작: %d 종목, %d 워커", total, actual_workers)
         
@@ -2782,6 +2817,7 @@ def run_screener(
                     market_score,
                     sector_trends,
                     risk_params,
+                    market,
                 ): code
                 for code, row in df_filtered.iterrows()
             }

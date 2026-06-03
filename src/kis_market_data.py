@@ -135,7 +135,12 @@ def _fetch_overseas_daily_pages(
     prev_oldest: Optional[str] = None
 
     for _ in range(max(1, max_pages)):
-        raw = kis.overseas_daily_price(excd, symb, bymd=bymd, gubn="0", modp="0")
+        raw = pd.DataFrame()
+        for attempt in range(4):
+            raw = kis.overseas_daily_price(excd, symb, bymd=bymd, gubn="0", modp="0")
+            if raw is not None and not raw.empty:
+                break
+            time.sleep(0.35 * (attempt + 1))
         if raw is None or raw.empty:
             break
         chunks.append(raw)
@@ -150,7 +155,7 @@ def _fetch_overseas_daily_pages(
             bymd = (datetime.strptime(oldest, "%Y%m%d") - timedelta(days=1)).strftime("%Y%m%d")
         except Exception:
             break
-        time.sleep(0.05)
+        time.sleep(0.2)
 
     if not chunks:
         return pd.DataFrame()
@@ -158,8 +163,20 @@ def _fetch_overseas_daily_pages(
     norm = normalize_kis_ohlcv(merged)
     if norm.empty:
         return norm
-    mask = (norm["Date"] >= start_date) & (norm["Date"] <= end_date)
-    return norm.loc[mask].reset_index(drop=True)
+    if "Date" in norm.columns:
+        mask = (norm["Date"] >= start_date) & (norm["Date"] <= end_date)
+        return norm.loc[mask].reset_index(drop=True)
+    try:
+        idx = pd.to_datetime(norm.index, errors="coerce")
+        norm = norm.copy()
+        norm.index = idx
+        norm = norm[~norm.index.isna()]
+        norm = norm.sort_index()
+        start_ts = pd.Timestamp(datetime.strptime(start_date, "%Y%m%d"))
+        end_ts = pd.Timestamp(datetime.strptime(end_date, "%Y%m%d"))
+        return norm.loc[(norm.index >= start_ts) & (norm.index <= end_ts)]
+    except Exception:
+        return norm
 
 
 def _iter_date_chunks(
