@@ -163,6 +163,52 @@ class OverseasStock:
             return pd.DataFrame()
         return pd.DataFrame(rows)
 
+    def overseas_daily_chart_price(
+        self,
+        market_code: str,
+        symbol: str,
+        date_from: str,
+        date_to: str,
+        *,
+        period: str = "D",
+    ) -> pd.DataFrame:
+        """해외주식 종목/지수/환율 기간별시세 — FHKST03030100 (output2 일봉).
+
+        미국 지수: FID_COND_MRKT_DIV_CODE=N, FID_INPUT_ISCD=SPX 등.
+        """
+        url = f"{self.url_base}/uapi/overseas-price/v1/quotations/inquire-daily-chartprice"
+        params = {
+            "FID_COND_MRKT_DIV_CODE": str(market_code or "N").strip(),
+            "FID_INPUT_ISCD": str(symbol or "").strip().upper(),
+            "FID_INPUT_DATE_1": str(date_from or "").strip(),
+            "FID_INPUT_DATE_2": str(date_to or "").strip(),
+            "FID_PERIOD_DIV_CODE": str(period or "D").strip().upper()[:1],
+        }
+        res = self.request_get(url, headers=self._quote_headers("FHKST03030100"), params=params)
+        if res.status_code != 200:
+            logger.warning(
+                "해외 지수/차트 일봉 실패 status=%s %s %s~%s: %s",
+                res.status_code,
+                symbol,
+                date_from,
+                date_to,
+                (res.text or "")[:200],
+            )
+            return pd.DataFrame()
+        body = res.json()
+        if str(body.get("rt_cd", "0")) not in ("0", ""):
+            logger.warning(
+                "해외 지수/차트 일봉 rt_cd=%s %s: %s",
+                body.get("rt_cd"),
+                symbol,
+                str(body.get("msg1") or "")[:120],
+            )
+            return pd.DataFrame()
+        rows = body.get("output2") or []
+        if not rows:
+            return pd.DataFrame()
+        return pd.DataFrame(rows)
+
     # ── 주문/계좌 ─────────────────────────────────────────────
 
     def _trading_headers(self, tr_id: str) -> Dict[str, str]:

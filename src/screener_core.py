@@ -397,16 +397,20 @@ class MarketAnalyzer:
         try:
             current_time = datetime.now()
 
-            from utils import is_us_market, us_regime_benchmark
+            from utils import get_us_regime_config, is_us_market, us_regime_benchmark
 
-            # US: SPY 일봉 (fdr) — S&P500 레짐
+            # US: SPX 해외지수 일봉 (FHKST03030100), SPY@AMS 폴백
             if is_us_market(self.market):
+                from kis_market_data import get_us_regime_ohlcv
+
                 end_dt = self.date_str or current_time.strftime("%Y%m%d")
-                sym = us_regime_benchmark(self.market) or "SPY"
+                sym = us_regime_benchmark(self.market) or "SPX"
+                rc = get_us_regime_config()
+                lookback = int(rc.get("lookback_calendar_days") or 500)
                 start_dt = (
-                    datetime.strptime(end_dt, "%Y%m%d") - timedelta(days=500)
+                    datetime.strptime(end_dt, "%Y%m%d") - timedelta(days=lookback)
                 ).strftime("%Y%m%d")
-                df = get_historical_prices(sym, start_dt, end_dt, market=self.market, kis=self.kis)
+                df, _meta = get_us_regime_ohlcv(start_dt, end_dt, kis=self.kis)
                 if df is not None and not df.empty and "Close" in df.columns:
                     close = pd.to_numeric(df["Close"], errors="coerce").dropna()
                     if close is not None and len(close) >= 60:
@@ -456,7 +460,12 @@ class MarketAnalyzer:
                         confidence = 0.50 + min(0.40, abs(score - 0.5) * 0.8)
                         if regime == MarketRegime.VOLATILE:
                             confidence = max(0.50, confidence - 0.10)
-                        self.logger.info("US market state from %s (%d bars)", sym, len(close))
+                        self.logger.info(
+                            "US market state from %s (%d bars, source=%s)",
+                            sym,
+                            len(close),
+                            _meta.get("benchmark_source"),
+                        )
                         return MarketState(
                             regime=regime,
                             volatility_level=volatility_level,

@@ -46,6 +46,7 @@ from utils import (
     format_pipeline_artifact,
     resolve_pipeline_context,
     us_regime_benchmark,
+    get_us_regime_config,
     _to_float,
 )
 
@@ -801,12 +802,17 @@ def get_fundamentals(
 
 
 def _get_us_benchmark_close(date_str: str, min_bars: int = 60) -> Optional[pd.Series]:
-    """US 레짐/추세: SPY 일봉 종가 (FinanceDataReader)."""
+    """US 레짐/추세: SPX 해외지수 일봉(FHKST03030100), 실패 시 SPY@AMS 폴백."""
     try:
+        from kis_market_data import get_us_regime_ohlcv
+
         end_dt = datetime.strptime(date_str, "%Y%m%d")
-        start_dt = (end_dt - timedelta(days=max(400, int(min_bars * 1.8)))).strftime("%Y%m%d")
-        sym = us_regime_benchmark("SP500") or "SPY"
-        df = get_historical_prices(sym, start_dt, date_str, market="SP500", kis=_KIS_INSTANCE)
+        rc = get_us_regime_config()
+        lookback = int(rc.get("lookback_calendar_days") or 500)
+        start_dt = (
+            end_dt - timedelta(days=max(lookback, int(min_bars * 1.8)))
+        ).strftime("%Y%m%d")
+        df, _meta = get_us_regime_ohlcv(start_dt, date_str, kis=_KIS_INSTANCE)
         if df is None or df.empty or "Close" not in df.columns:
             return None
         close = pd.to_numeric(df["Close"], errors="coerce").dropna()
@@ -818,7 +824,7 @@ def _get_us_benchmark_close(date_str: str, min_bars: int = 60) -> Optional[pd.Se
 def get_market_trend(date_str: str, market: str = "KOSPI") -> str:
     """
     시장 추세(단기): MA5 vs MA20
-    - KR: KIS 업종 일자별 / US: SPY (fdr)
+    - KR: KIS 업종 일자별 / US: SPX 지수 일봉 (KIS FHKST03030100)
     """
     try:
         if is_us_market(market):
@@ -1565,7 +1571,7 @@ def _get_market_regime_components(date_str: str, market: str) -> Dict[str, float
                 "above_ma50": 1.0 if (not pd.isna(ma50) and close.iloc[-1] > ma50) else 0.0,
                 "ma50_gt_ma200": 0.5 if pd.isna(ma200) else (1.0 if ma50 > ma200 else 0.0),
                 "rsi_term": max(0.0, 1 - abs(rsi - 50) / 50) if not pd.isna(rsi) else 0.5,
-                "benchmark": us_regime_benchmark(market) or "SPY",
+                "benchmark": us_regime_benchmark(market) or "SPX",
             }
 
         kis = _KIS_INSTANCE
@@ -2671,6 +2677,14 @@ def run_screener(
         market_score = 0.7 * regime + 0.3 * 0.5
         comps = _get_market_regime_components(fixed_date, market)
         market_trend = get_market_trend(fixed_date)
+        regime_meta: Dict[str, Any] = {}
+        if is_us_market(market):
+            try:
+                from kis_market_data import get_last_us_regime_meta
+
+                regime_meta = get_last_us_regime_meta()
+            except Exception:
+                regime_meta = {}
         logger.info("시장 레짐 스코어 (가중치 적용): %.3f", market_score)
         logger.info(
             "레짐 구성요소: above_ma50=%.2f, ma50>ma200=%.2f, rsi_term=%.2f",
@@ -2697,6 +2711,10 @@ def run_screener(
                 "regime_score": float(regime) if regime is not None else None,
                 "market_score": float(market_score) if market_score is not None else None,
                 "market_trend": market_trend,
+                "benchmark_source": regime_meta.get("benchmark_source"),
+                "benchmark_symbol": regime_meta.get("benchmark_symbol"),
+                "benchmark_market_code": regime_meta.get("benchmark_market_code"),
+                "benchmark_bars": regime_meta.get("benchmark_bars"),
             }
             p = OUTPUT_DIR / format_pipeline_artifact(
                 "market_state", fixed_date, market, sess

@@ -100,6 +100,18 @@
     },
     "sell_threshold": 1.0
   },
+  "us_market_regime": {
+    "source": "index",
+    "index_market_code": "N",
+    "index_symbol": "SPX",
+    "lookback_calendar_days": 500,
+    "min_bars": 200,
+    "etf_fallback": {
+      "enabled": true,
+      "symbol": "SPY",
+      "excd": "AMS"
+    }
+  },
   "market_hours": {
     "SP500": {
       "risk_poll_windows": ["23:15-06:00"]

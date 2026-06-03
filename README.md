@@ -34,7 +34,7 @@
 
 | 단계 | 설명 (SP500) |
 |------|------------------|
-| 스크리닝 | KIS `frgn_code.mst`(S&P500) + NAS/NYS/AMS 마스터 → 유동성·재무·기술·**SPY 레짐**·섹터 트렌드 |
+| 스크리닝 | KIS `frgn_code.mst`(S&P500) + NAS/NYS/AMS 마스터 → 유동성·재무·기술·**SPX 레짐**·섹터 트렌드 |
 | 뉴스 수집 | Google News RSS (KR 시장은 네이버 검색 API) |
 | 분석 | OpenAI GPT(US 프롬프트·USD 표기) 또는 휴리스틱 (`OPENAI_API_KEY` 없을 때) |
 | 매매 | KIS Open API — `MARKET=SP500` 시 **해외 잔고·주문** (`TTTS3012R`, `TTTT1002U` 등) |
@@ -221,6 +221,7 @@ api/kis_auth.KIS (DomesticStock + OverseasStock)
 |----|------|
 | `HHDFS00000300` | 해외 현재가·호가 (`overseas_price`) |
 | `HHDFS76240000` | 해외 기간별 일봉 (`overseas_daily_price` → `kis_market_data`) |
+| `FHKST03030100` | 해외지수·환율 기간별 일봉 (`overseas_daily_chart_price` → US 레짐 SPX) |
 | `HHDFS76200200` | 현재가 상세·PER/PBR (`overseas_price_detail`) |
 
 **해외 계좌·주문 TR (미국 NASDAQ, `OVRS_EXCG_CD=NASD`):**
@@ -237,9 +238,11 @@ api/kis_auth.KIS (DomesticStock + OverseasStock)
 
 **과거 OHLCV (`kis_market_data.py`):**
 
-- `get_historical_prices_kis()` — US: `overseas_daily_price` BYMD 페이지네이션 → `Open/High/Low/Close/Volume`
+- `get_historical_prices_kis()` — US 개별종목: `overseas_daily_price` (HHDFS76240000) BYMD 페이지네이션
+- `get_us_regime_ohlcv()` — US 레짐: `overseas_daily_chart_price` (FHKST03030100) **SPX 지수**, 실패 시 SPY@AMS (HHDFS76240000)
+- `config.json` → `us_market_regime` (`index_symbol`, `etf_fallback`)
 - `screener_core.get_historical_prices()` — **KIS 우선**, US 실패 시 fdr/pykrx **미사용**, KR만 레거시 백업
-- 사용처: `risk_manager` RSI·손절/목표·MA, `_compute_levels` ATR·스윙, `MarketAnalyzer` SPY 레짐
+- 사용처: `risk_manager` RSI·손절/목표·MA, `_compute_levels` ATR·스윙 / 레짐·`MarketAnalyzer` → `get_us_regime_ohlcv`
 
 - **마스터:** `kis_master.load_kis_master("SP500")` — `frgn_code.mst`(S&P500) ∩ (nasmst+nysmst+amsmst)
 - **레이트 리밋:** `config.json` → `kis_limits.max_rps=2`, `max_concurrency=1`

@@ -8,12 +8,13 @@ KIS API 헬스체크
 import os
 import sys
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from api.kis_auth import KIS
 from utils import (
     setup_logging,
     is_us_market,
+    get_us_regime_config,
     resolve_us_excd,
     set_us_ticker_excd_map,
     set_us_ticker_ovrs_excg_map,
@@ -80,6 +81,19 @@ def main():
                 row = price_df.iloc[0]
                 price = row.get("last") or row.get("last_pr") or row.get("stck_prpr") or row.get("prpr")
                 parts.append(f"{symb}@{excd}={price}")
+
+            rc = get_us_regime_config()
+            idx_sym = str(rc.get("index_symbol") or "SPX").strip().upper()
+            idx_mc = str(rc.get("index_market_code") or "N").strip().upper()
+            end_d = datetime.now(KST).strftime("%Y%m%d")
+            start_d = (datetime.now(KST) - timedelta(days=14)).strftime("%Y%m%d")
+            idx_df = kis.overseas_daily_chart_price(idx_mc, idx_sym, start_d, end_d, period="D")
+            if idx_df is None or idx_df.empty:
+                raise ValueError(
+                    f"해외지수 일봉 API 빈 응답: {idx_sym} (market_code={idx_mc})"
+                )
+            parts.append(f"{idx_sym}(index,{len(idx_df)}bars)")
+
             msg = "✅ API 헬스체크 통과 (US " + ", ".join(parts) + ")"
         else:
             price_df = kis.inquire_price(fid_cond_mrkt_div_code="J", fid_input_iscd="005930")

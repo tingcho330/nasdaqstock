@@ -68,6 +68,7 @@ __all__ = [
     "set_us_ticker_excd_map",
     "set_us_ticker_ovrs_excg_map",
     "us_regime_benchmark",
+    "get_us_regime_config",
     "min_trading_value_5d_avg",
     "fmt_money",
     "fmt_money_signed",
@@ -600,9 +601,42 @@ def set_us_ticker_ovrs_excg_map(mapping: Dict[str, str]) -> None:
     }
 
 
+_DEFAULT_US_MARKET_REGIME: Dict[str, Any] = {
+    "source": "index",
+    "index_market_code": "N",
+    "index_symbol": "SPX",
+    "lookback_calendar_days": 500,
+    "min_bars": 200,
+    "etf_fallback": {
+        "enabled": True,
+        "symbol": "SPY",
+        "excd": "AMS",
+    },
+}
+
+
+def get_us_regime_config(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """config.json us_market_regime 병합 (기본: SPX 지수 + SPY@AMS 폴백)."""
+    merged = dict(_DEFAULT_US_MARKET_REGIME)
+    raw = (cfg if cfg is not None else get_cfg()).get("us_market_regime")
+    if isinstance(raw, dict):
+        merged.update({k: v for k, v in raw.items() if k != "etf_fallback"})
+        fb = dict(merged.get("etf_fallback") or {})
+        if isinstance(raw.get("etf_fallback"), dict):
+            fb.update(raw["etf_fallback"])
+        merged["etf_fallback"] = fb
+    return merged
+
+
 def us_regime_benchmark(market: Optional[str] = None) -> str:
-    """US 시장 레짐·추세 벤치마크 심볼."""
-    return "SPY" if is_us_market(market) else ""
+    """US 시장 레짐·추세 벤치마크 심볼 (config: SPX 지수 기본)."""
+    if not is_us_market(market):
+        return ""
+    rc = get_us_regime_config()
+    if str(rc.get("source") or "index").strip().lower() == "index":
+        return str(rc.get("index_symbol") or "SPX").strip().upper()
+    fb = rc.get("etf_fallback") if isinstance(rc.get("etf_fallback"), dict) else {}
+    return str(fb.get("symbol") or "SPY").strip().upper()
 
 
 def resolve_us_excd(ticker: str, market: Optional[str] = None) -> str:
