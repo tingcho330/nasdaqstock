@@ -34,6 +34,7 @@ from utils import (
     previous_trading_day,
     is_us_market,
     is_regular_session,
+    next_session_open_kst,
     normalize_ticker_6,
     fmt_money,
     fmt_money_signed,
@@ -85,15 +86,18 @@ class BackgroundRiskManager:
         
     def start(self):
         """백그라운드 RiskManager 시작"""
-        if self.is_running:
+        if self.thread and self.thread.is_alive():
             logger.warning("백그라운드 RiskManager가 이미 실행 중입니다.")
             return
-            
+
         self.stop_event.clear()
         self.thread = threading.Thread(target=self._run_background, daemon=True)
         self.thread.start()
         self.is_running = True
         logger.info("백그라운드 RiskManager 시작됨")
+
+    def is_thread_alive(self) -> bool:
+        return self.thread is not None and self.thread.is_alive()
         
     def stop(self):
         """백그라운드 RiskManager 중지"""
@@ -114,19 +118,13 @@ class BackgroundRiskManager:
             
             while not self.stop_event.is_set():
                 try:
-                    # 장중 시간 확인
                     now = datetime.now(KST)
                     if self._is_trading_hours(now):
-                        # 리스크 체크 실행
                         self._run_risk_check()
-                        
-                        # 5분마다 실행
-                        if self.stop_event.wait(300):  # 5분 = 300초
+                        if self.stop_event.wait(300):  # 장중 5분 주기
                             break
                     else:
-                        # 장외 시간에는 30분마다 체크
-                        if self.stop_event.wait(1800):  # 30분 = 1800초
-                            break
+                        self._wait_until_session_or_stop(now)
                             
                 except Exception as e:
                     logger.error(f"백그라운드 RiskManager 실행 중 오류: {e}")
@@ -139,9 +137,32 @@ class BackgroundRiskManager:
             self.is_running = False
             
     def _is_trading_hours(self, now: datetime) -> bool:
-        """장중 세션 (US: sell_time_windows + NYSE 거래일 / KR: 09:00-15:30)."""
+        """장중 세션 (US: risk_poll_windows + NYSE 거래일 / KR: 09:00-15:30)."""
         cfg = getattr(self.settings, "_config", None) or {}
         return is_regular_session(now, MARKET, config=cfg)
+
+    def _wait_until_session_or_stop(self, now: datetime) -> None:
+        """장외: 다음 risk_poll 세션(예: 23:15 KST)까지 대기. 60초 단위로 stop_event 확인."""
+        cfg = getattr(self.settings, "_config", None) or {}
+        session_open = next_session_open_kst(now, MARKET, config=cfg)
+        remain = (session_open - now).total_seconds()
+        if remain > 60:
+            logger.info(
+                "장외 대기 — 다음 리스크 세션 %s KST (약 %.0f분 후)",
+                session_open.strftime("%H:%M"),
+                remain / 60,
+            )
+        deadline = session_open
+        while not self.stop_event.is_set():
+            now = datetime.now(KST)
+            if self._is_trading_hours(now):
+                logger.info("리스크 세션 시작 — 모니터링 재개")
+                return
+            remain = (deadline - now).total_seconds()
+            if remain <= 0:
+                return
+            if self.stop_event.wait(min(remain, 60)):
+                return
         
     def _run_risk_check(self):
         """리스크 체크 실행 - RiskManager의 완전한 판단 로직 사용"""

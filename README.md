@@ -60,7 +60,7 @@
 - **GPT / 휴리스틱 분석** — `MARKET=SP500` 시 US 전용 프롬프트(초기필터·전술·리밸런싱), 가격·예산 **USD** (`fmt_money`), `gpt_params.budget_guard` / `initial_filter` 연동
 - **스케줄 오케스트레이션** — `integrated_manager.py`가 평일 잡·스크리너·파이프라인·잔액·체결확인·리컨실·요약 담당
 - **해외 잔고·주문** — `account.py` → `kis_overseas_account` (USD), `KIS.order_cash()` → `overseas_order` (NASD)
-- **장중 리스크** — `background_risk_manager` (US: `sell_time_windows`·`direct_execute`·NYSE 거래일; 잔고 `prpr=0` 시 KIS 실시간 시세 보정)
+- **장중 리스크** — `background_risk_manager` (US: `market_hours.SP500.risk_poll_windows`·`sell_time_windows`·`direct_execute`·NYSE 거래일; 장외는 다음 세션까지 대기·스레드 자동 재시작; 잔고 `prpr=0` 시 KIS 실시간 시세 보정)
 - **파이프라인 AM/PM 세션** — KST 시각·US ET 거래일 기준 `session`(`am`/`pm`)·`trade_date`를 산출물 파일명·환경변수로 고정 (자정 넘김 시 스크리너↔GPT 짝 유지)
 - **주문 정합성** — `order_reconciler.py` (DB `pending`/`partial` → KIS 미체결·일자별 주문 조회로 `executed` 갱신; `order_id` 없는 orphan 방지·`--backfill-only`)
 - **영속 손절/목표(positions)** — `recorder.py`의 `positions` 테이블에 `stop_price/target_price`를 저장하고, `trader.run_sell_logic()`에서 **positions 레벨을 우선 적용**
@@ -78,7 +78,7 @@
 | 서비스 | 진입점 | 역할 |
 |--------|--------|------|
 | `integrated_manager` | `run_integrated_manager.py` | 평일 스케줄·스크리너·매매 파이프라인·잔액/요약·체결확인·리컨실 |
-| `background_risk_manager` | `run_background_risk_manager.py` | 장중 약 5분 주기 `risk_manager._run_cycle()` (`config/.env`의 `DISCORD_WEBHOOK_URL_RISK`) |
+| `background_risk_manager` | `run_background_risk_manager.py` | `risk_poll_windows` 구간만 약 5분 주기 `_run_cycle()`; 장외는 `next_session_open_kst`까지 대기; 스레드 중단 시 60초마다 재시작 (`DISCORD_WEBHOOK_URL_RISK`) |
 
 공통: **`env_file: ./config/.env`만** (두 서비스 동일), 볼륨 `./src`, `./config`, `./output`  
 `config/.env.risk`는 **사용하지 않습니다.**
@@ -141,6 +141,19 @@
 ```
 
 수동 오버라이드: `PIPELINE_SESSION=pm PIPELINE_TRADE_DATE=20260602`
+
+### 3.3.1 파이프라인 PM vs 리스크 폴링 세션 (US)
+
+| 구분 | KST 시간창 | 설정 키 | 비고 |
+|------|------------|---------|------|
+| **파이프라인 PM** | 22:00~06:30 | `pipeline_sessions.pm_start` / `am_end` | 22:30 스크리너·23:40 파이프라인 등 **스케줄 잡** |
+| **리스크 폴링** | 23:15~06:00 | `market_hours.SP500.risk_poll_windows` (없으면 `trading_params.sell_time_windows`) | `background_risk_manager`만 사용 · NYSE 거래일 가드 |
+
+컨테이너가 **22:00에 기동**해도 23:15 이전에는 리스크 체크를 하지 않습니다(정상). 23:15에 `리스크 세션 시작 — 모니터링 재개` 로그 후 5분 주기로 `_run_cycle()`이 돌아갑니다. 22:00~23:14에도 폴링하려면 `risk_poll_windows`를 넓히세요.
+
+```bash
+docker compose logs -f background_risk_manager | grep -E '장외 대기|리스크 세션|리스크 체크'
+```
 
 ### 3.4 스크리너 vs 매매 파이프라인
 
@@ -258,7 +271,8 @@ api/kis_auth.KIS (DomesticStock + OverseasStock)
 | `integrated_manager.py` | 스케줄, AM/PM·`trade_date` 컨텍스트, subprocess 파이프라인, 일일 잔액·요약 |
 | `run_integrated_manager.py` | Docker / 로컬 진입점 |
 | `risk_manager.py` | 장중 리스크 사이클·`check_sell_condition`·옵션 `direct_execute` 즉시매도 |
-| `run_background_risk_manager.py` | 리스크 전용 컨테이너 (`DISCORD_WEBHOOK_URL_RISK` → notifier) |
+| `run_background_risk_manager.py` | 리스크 전용 컨테이너·백그라운드 스레드 생존 감시·재시작 |
+| `integrated_manager.BackgroundRiskManager` | `risk_poll_windows`·5분 주기·장외 `next_session_open_kst` 대기 |
 | `kis_market_data.py` | KIS 일봉 OHLCV·RSI/ATR 입력용 정규화 |
 | `rotation_policy.py` | 회전(리밸런싱) 공통 정책 (`trader`·`rotation_manager`) |
 
@@ -281,7 +295,7 @@ api/kis_auth.KIS (DomesticStock + OverseasStock)
 
 | 파일 | 역할 |
 |------|------|
-| `utils.py` | `resolve_pipeline_context`, `format_pipeline_artifact`, `is_us_market`, `norm_ticker`, `find_latest_file`(세션·거래일 필터) |
+| `utils.py` | `resolve_pipeline_context`, `risk_session_windows`, `is_regular_session`, `next_session_open_kst`, `find_latest_file`(세션·거래일 필터) |
 | `order_reconciler.py` | `pending`/`partial` ↔ KIS 체결 리컨실·orphan `order_id` backfill |
 | `api/overseas_stock/overseas_stock_functions.py` | 해외 시세·잔고·주문 TR 래퍼 |
 | `settings.py` / `env_loader.py` | 설정·`.env` 로드 |
@@ -405,17 +419,25 @@ DISCORD_WEBHOOK_URL_RISK=https://discord.com/api/webhooks/.../risk
 
 US 프롬프트는 점수 **0.0–1.0**, 손절/목표·MA를 **$X.XX USD**로 안내합니다. `account.py`로 `summary_YYYYMMDD.json`이 없으면 Budget Guard가 비활성화됩니다.
 
-### 6.5 장중 리스크 (`risk_params` · `trading_params`)
+### 6.5 장중 리스크 (`market_hours` · `risk_params` · `trading_params`)
 
 | 키 | 기본 | 설명 |
 |----|------|------|
+| `market_hours.SP500.risk_poll_windows` | `["23:15-06:00"]` | `background_risk_manager` 활성 KST 구간 (`utils.is_regular_session`) |
 | `risk_params.auto_sell.direct_execute` | `true` | SELL 판단 시 `risk_manager`가 즉시 `order_cash` 매도 |
 | `risk_params.auto_sell.cooldown_sec_per_ticker` | `20` | 종목별 즉시매도 쿨다운 |
 | `trading_params.sell_time_windows` | `["23:15-06:00"]` | 매도·즉시매도 허용 KST 구간 (판단·실행 공통) |
+| `trading_params.buy_time_windows` | `["23:20-05:45"]` | `trader` 매수·보유 0 시 리스크 자동 `trader` 트리거 허용 구간 |
 | `trading_params.min_holding_hours` | `72` | 매수 후 N시간 미만이면 매도 보류 |
-| `trading_params.buy_enabled` | `false` | `true`일 때만 `trader` 매수 실행 |
+| `trading_params.buy_enabled` | `true` | `false`면 `trader` 매수 스킵(매도·리스크만 검증 시 권장) |
 
 손절/목표·RSI는 `kis_market_data` + `compute_realtime_levels()`로 계산하며, DB `positions`에 저장된 레벨이 있으면 `trader` 매도 시 우선합니다.
+
+**리스크 컨테이너 재배포** (코드·설정 반영 후):
+
+```bash
+docker compose restart background_risk_manager
+```
 
 **US 일일 요약:** `23:25` open 스냅샷은 다음 거래일 `session_close_date` 키로도 저장되고, `06:15` 요약은 `balance_close_당일` + `balance_open_전일`(또는 동일 세션 키)을 짝지어 비교합니다.
 
@@ -510,7 +532,7 @@ python3 gpt_analyzer.py --date ${DATE} --session ${SESSION} --market SP500 --slo
 
 `trading_environment`가 `prod`이면 실계좌 주문이 나갈 수 있습니다. 처음에는 `config.json`에서 **`vps`** 로 두고 검증하세요.
 
-또한 기본 설정에서는 안전을 위해 `config/config.json`의 `trading_params.buy_enabled=false`로 둘 것을 권장합니다(매도/리스크만 검증).
+실주문 검증 전에는 `config/config.json`에서 `trading_params.buy_enabled=false`로 두고 매도·리스크만 먼저 확인하는 것을 권장합니다(저장소 기본값은 `true`).
 
 ```bash
 python3 trader.py --date ${DATE}
@@ -592,6 +614,7 @@ trading_bot_260530_NASDAQ/
 | 파이프라인 AM/PM·`trade_date` 연동 | ✅ 산출물 `_{date}_{am\|pm}_SP500`·env 전달 |
 | 파이프라인 E2E (health → news → GPT) | ✅ 로컬 검증 (§7.3) |
 | 장중 리스크·즉시매도 (`direct_execute`) | ✅ `pending` DB 기록 → 리컨실 `executed` |
+| 리스크 세션 대기·23:15 재개 (`BackgroundRiskManager`) | ✅ `next_session_open_kst`·스레드 watchdog 재시작 |
 | 리스크 Discord (`DISCORD_WEBHOOK_URL_RISK`) | ✅ `config/.env` 단일 로드 (`docker-compose`에 `.env.risk` 없음) |
 | `order_reconciler`·`--backfill-only` | ✅ 미체결 0건·일자별 주문으로 체결 해소 |
 | US 일일 요약 open/close 짝 | ✅ `session_close_date`·`--capture-close` |

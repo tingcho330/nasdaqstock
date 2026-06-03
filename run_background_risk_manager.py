@@ -66,9 +66,13 @@ if __name__ == "__main__":
         background_risk_manager.start()
         print("백그라운드 RiskManager가 시작되었습니다.")
         
-        # 메인 루프 - 컨테이너가 종료될 때까지 실행
+        # 메인 루프 — 백그라운드 스레드 생존 감시 및 자동 재시작
         while True:
-            time.sleep(60)  # 1분마다 상태 확인
+            time.sleep(60)
+            if not background_risk_manager.is_thread_alive():
+                print("백그라운드 RiskManager 스레드 중단 감지 → 재시작")
+                background_risk_manager.is_running = False
+                background_risk_manager.start()
             
     except KeyboardInterrupt:
         print("사용자에 의한 종료")
