@@ -46,6 +46,7 @@ from utils import (
     format_pipeline_artifact,
     resolve_pipeline_context,
     us_regime_benchmark,
+    _to_float,
 )
 
 # 시장 분석 모듈 (screener_core에서 통합)
@@ -1634,7 +1635,7 @@ def update_holdings_scores(holdings: List[Dict[str, Any]], date_str: str, market
     for holding in holdings:
         ticker = norm_ticker(holding.get("pdno", ""), market)
         name = holding.get("prdt_name", "")
-        price = int(holding.get("prpr", 0))
+        price = _to_float(holding.get("prpr", 0))
         
         holdings_data.append({
             "Ticker": ticker,
