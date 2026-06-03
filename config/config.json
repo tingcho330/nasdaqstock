@@ -106,25 +106,25 @@
     }
   },
   "trading_params": {
-    "buy_enabled": false,
+    "buy_enabled": true,
     "allow_rebuy": false,
     "max_legs_per_ticker": 1,
     "post_partial_sell_buy_cooldown_days": 5,
     "partial_sell_flag_ttl_days": 7,
-    "per_ticker_max_weight": 0.12,
+    "per_ticker_max_weight": 0.33,
     "min_holding_hours": 72,
     "min_order_cash": 100,
     "rebuy_atr_k": 0.5,
     "rebuy_rsi_ceiling": 72.0,
     "cash_buffer_ratio": 0.02,
-    "min_cash_reserve": 500,
+    "min_cash_reserve": 100,
     "dynamic_cash_management": {
-      "enabled": true,
+      "enabled": false,
       "market_regime_adjustment": {
-        "bull_market": 0.1,
-        "sideways_market": 0.15,
-        "bear_market": 0.35,
-        "volatile_market": 0.3
+        "bull_market": 0.3,
+        "sideways_market": 0.4,
+        "bear_market": 0.6,
+        "volatile_market": 0.5
       },
       "volatility_threshold": 0.25,
       "rebalance_frequency_hours": 6
@@ -172,7 +172,7 @@
   },
   "trading_guards": {
     "auto_shrink_slots": true,
-    "min_total_cash_to_trade": 1000,
+    "min_total_cash_to_trade": 300,
     "skip_when_low_funds": true,
     "enforce_per_ticker_limit": true
   },
@@ -190,13 +190,13 @@
   },
   "daily_summary": {
     "enabled": true,
-    "balance_open_time": "23:25",
+    "balance_open_time": "23:55",
     "balance_close_time": "06:00",
     "summary_send_time": "06:15"
   },
   "schedule_times": {
-    "screener_time": "22:30",
-    "pipeline_time": "23:40"
+    "screener_time": "22:50",
+    "pipeline_time": "23:30"
   },
   "pipeline_sessions": {
     "pm_start": "22:00",
