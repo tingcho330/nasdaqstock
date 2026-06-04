@@ -415,33 +415,76 @@ def _holdings_detail_from_rows(holdings: List[Dict]) -> List[Dict]:
     return out
 
 
-def _total_balance_from_cash_map(cash_map: Dict, holdings: List[Dict]) -> Tuple[int, int]:
-    """(총평가, 예수금) — SP500은 USD 필드 우선."""
+def _holdings_value_from_rows(holdings: List[Dict]) -> int:
+    return sum(h["value"] for h in _holdings_detail_from_rows(holdings))
+
+
+def _portfolio_totals_from_cash_map(
+    cash_map: Dict, holdings: List[Dict]
+) -> Tuple[int, int, int]:
+    """(총평가, 예수금, 보유평가) — US는 예수금+보유평가가 KIS 총평가보다 신뢰될 때 우선."""
+    hv = _holdings_value_from_rows(holdings)
+    if hv <= 0:
+        hv = sum(_parse_amount(h.get("evlu_amt")) for h in holdings)
+        if hv <= 0:
+            hv = sum(
+                _parse_amount(h.get("hldg_qty")) * _parse_amount(h.get("prpr"))
+                for h in holdings
+            )
+
     if is_us_market(MARKET):
-        total = _parse_amount(cash_map.get("tot_evlu_amt_usd"))
-        if total <= 0:
-            total = _parse_amount(cash_map.get("tot_evlu_amt"))
-        if total <= 0:
-            hv = sum(_parse_amount(h.get("evlu_amt")) for h in holdings)
-            if hv <= 0:
-                hv = sum(
-                    _parse_amount(h.get("hldg_qty")) * _parse_amount(h.get("prpr"))
-                    for h in holdings
-                )
-            total = _parse_amount(cash_map.get("available_cash")) + hv
         cash = _parse_amount(cash_map.get("dnca_tot_amt"))
         if cash <= 0:
-            cash = _parse_amount(cash_map.get("available_cash"))
-        return total, cash
+            cash = _parse_amount(cash_map.get("frcr_buy_amt"))
+        orderable = _parse_amount(cash_map.get("available_cash")) or _parse_amount(
+            cash_map.get("ord_psbl_frcr_amt")
+        )
+        if cash <= 0:
+            cash = orderable
+
+        kis_total = _parse_amount(cash_map.get("tot_evlu_amt_usd"))
+        if kis_total <= 0:
+            kis_total = _parse_amount(cash_map.get("tot_evlu_amt"))
+
+        computed = cash + hv
+        cash_only_ref = max(cash, orderable)
+        if hv > 0 and (kis_total <= 0 or kis_total <= cash_only_ref + 1):
+            total = computed
+        elif hv > 0:
+            total = max(kis_total, computed)
+        else:
+            total = kis_total if kis_total > 0 else cash_only_ref
+        return total, cash, hv
+
     total = _parse_amount(cash_map.get("tot_evlu_amt"))
     cash = _parse_amount(cash_map.get("dnca_tot_amt"))
-    return total, cash
+    if total <= 0:
+        total = cash + hv
+    return total, cash, hv
+
+
+def _portfolio_totals_from_snapshot(snap: Dict) -> Tuple[int, int, int]:
+    """저장된 스냅샷의 총평가 보정 (과거 cash-only total_balance 호환)."""
+    cash = _parse_amount(snap.get("cash"))
+    hv = _parse_amount(snap.get("holdings_value"))
+    if hv <= 0 and snap.get("holdings_detail"):
+        hv = sum(_parse_amount(h.get("value")) for h in snap["holdings_detail"])
+    total = _parse_amount(snap.get("total_balance"))
+    computed = cash + hv
+    orderable = cash
+    if hv > 0 and (total <= 0 or total <= orderable + 1):
+        total = computed
+    elif hv > 0 and computed > total:
+        total = computed
+    elif total <= 0:
+        total = computed if computed > 0 else cash
+    return total, cash, hv
 
 
 def _iter_open_snapshot_dates(close_date: str) -> List[str]:
     """
     종료일(close)에 맞는 장시작(open) 스냅샷 파일 날짜 후보.
-    US: 23:25(KST) 전일 캡처 → balance_open_{전일}.json + balance_close_{당일}.json
+    US: balance_open_time(KST, 기본 23:55) 캡처 → balance_open_{전일}.json + balance_close_{당일}.json
     KR: 동일 일자 open/close
     """
     d = datetime.strptime(close_date, "%Y%m%d").date()
@@ -511,9 +554,10 @@ def capture_balance_snapshot(snapshot_type: str) -> Optional[Dict]:
             ttl_sec=5
         )
         
-        total_balance, cash = _total_balance_from_cash_map(cash_map, holdings)
         holdings_detail = _holdings_detail_from_rows(holdings)
-        holdings_value = sum(h["value"] for h in holdings_detail)
+        total_balance, cash, holdings_value = _portfolio_totals_from_cash_map(
+            cash_map, holdings
+        )
         if holdings_value <= 0 and total_balance > cash:
             holdings_value = total_balance - cash
 
@@ -581,15 +625,16 @@ def load_balance_snapshot(date: str, snapshot_type: str) -> Optional[Dict]:
     return None
 
 def compare_balances(open_balance: Dict, close_balance: Dict) -> Dict:
-    """장시작/종료 잔액 비교 분석"""
+    """장시작/종료 총평가(예수금+보유평가) 비교 분석"""
     try:
-        # 기본 변화량
-        total_change = close_balance["total_balance"] - open_balance["total_balance"]
-        cash_change = close_balance["cash"] - open_balance["cash"]
-        holdings_change = close_balance["holdings_value"] - open_balance["holdings_value"]
-        
-        # 수익률 계산
-        daily_return_pct = (total_change / open_balance["total_balance"]) * 100 if open_balance["total_balance"] > 0 else 0
+        open_total, open_cash, open_hv = _portfolio_totals_from_snapshot(open_balance)
+        close_total, close_cash, close_hv = _portfolio_totals_from_snapshot(close_balance)
+
+        total_change = close_total - open_total
+        cash_change = close_cash - open_cash
+        holdings_change = close_hv - open_hv
+
+        daily_return_pct = (total_change / open_total) * 100 if open_total > 0 else 0
         
         # 보유종목 변화 분석
         open_tickers = {h["ticker"] for h in open_balance["holdings_detail"]}
@@ -635,8 +680,12 @@ def compare_balances(open_balance: Dict, close_balance: Dict) -> Dict:
             "sold_tickers": list(sold_tickers),
             "bought_tickers": list(bought_tickers),
             "held_tickers": list(held_tickers),
-            "open_balance": open_balance["total_balance"],
-            "close_balance": close_balance["total_balance"]
+            "open_balance": open_total,
+            "close_balance": close_total,
+            "open_cash": open_cash,
+            "close_cash": close_cash,
+            "open_holdings_value": open_hv,
+            "close_holdings_value": close_hv,
         }
         
     except Exception as e:
@@ -672,7 +721,7 @@ def send_daily_trading_summary():
             tried = ", ".join(_iter_open_snapshot_dates(today)[:5])
             _notify(
                 f"⚠️ {today} 일일 요약: 장시작 스냅샷 없음 "
-                f"(balance_open_*.json, 23:25 캡처 확인 / 후보: {tried})",
+                f"(balance_open_*.json, balance_open_time 캡처 확인 / 후보: {tried})",
                 key="daily_summary_error",
             )
             return
@@ -691,21 +740,47 @@ def send_daily_trading_summary():
         change_emoji = "📈" if total_change > 0 else "📉" if total_change < 0 else "➡️"
         mkt = os.getenv("MARKET", "SP500")
 
-        # 임베드 필드 구성
+        open_total = comparison["open_balance"]
+        close_total = comparison["close_balance"]
+        open_hv = comparison.get("open_holdings_value", 0)
+        close_hv = comparison.get("close_holdings_value", 0)
+        open_cash = comparison.get("open_cash", open_balance.get("cash", 0))
+        close_cash = comparison.get("close_cash", close_balance.get("cash", 0))
+
         fields = [
             {
-                "name": f"{change_emoji} 잔액 변화",
+                "name": f"{change_emoji} 총평가 변화 (예수금+보유평가)",
                 "value": (
-                    f"**{fmt_money(open_balance['total_balance'], mkt)}** → "
-                    f"**{fmt_money(close_balance['total_balance'], mkt)}** "
+                    f"**{fmt_money(open_total, mkt)}** → "
+                    f"**{fmt_money(close_total, mkt)}** "
                     f"({fmt_money_signed(total_change, mkt)})"
                 ),
-                "inline": False
-            }
+                "inline": False,
+            },
+            {
+                "name": "💵 예수금",
+                "value": (
+                    f"{fmt_money(open_cash, mkt)} → {fmt_money(close_cash, mkt)} "
+                    f"({fmt_money_signed(comparison['cash_change'], mkt)})"
+                ),
+                "inline": True,
+            },
+            {
+                "name": "📈 보유평가",
+                "value": (
+                    f"{fmt_money(open_hv, mkt)} → {fmt_money(close_hv, mkt)} "
+                    f"({fmt_money_signed(comparison['holdings_change'], mkt)})"
+                ),
+                "inline": True,
+            },
         ]
-        
-        # 수익률이 0이 아니거나 변화가 있을 때만 상세 정보 표시
-        if abs(daily_return) > 0.01 or abs(total_change) > 0:
+
+        if (
+            abs(daily_return) > 0.01
+            or abs(total_change) > 0
+            or open_hv > 0
+            or close_hv > 0
+        ):
             fields.extend([
                 {
                     "name": "📊 일일 수익률",
@@ -761,8 +836,11 @@ def send_daily_trading_summary():
             "fields": fields,
             "color": 0x00ff00 if total_change > 0 else 0xff0000 if total_change < 0 else 0x808080,
             "footer": {
-                "text": f"보유종목: {open_balance['holdings_count']}개"
-            }
+                "text": (
+                    f"보유종목: open {open_balance['holdings_count']}개 → "
+                    f"close {close_balance['holdings_count']}개"
+                )
+            },
         }
         
         if WEBHOOK_URL and is_valid_webhook(WEBHOOK_URL):
