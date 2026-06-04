@@ -613,10 +613,10 @@ class Trader:
             logger.error(f"보유 종목 스냅샷 조회 실패: {e}")
             return []
 
-    @staticmethod
-    def _get_qty(holdings: List[Dict], ticker: str) -> int:
+    def _get_qty(self, holdings: List[Dict], ticker: str) -> int:
+        norm = self._t(ticker)
         for h in holdings:
-            if self._t(h.get("pdno", "")) == ticker:
+            if self._t(h.get("pdno", "")) == norm:
                 return _to_int(h.get("hldg_qty", 0))
         return 0
 
@@ -2175,6 +2175,8 @@ class Trader:
                 return "ADVANCED_STRATEGY"
             elif context_type == "AdvancedStrategyError":
                 return "ADVANCED_STRATEGY_ERROR"
+            elif context_type == "EmergencyDrop":
+                return "EMERGENCY_DROP"
         
         # 하위 호환: 기존 문자열 파싱
         if "전략=StopLoss" in reason or "손절가 도달" in reason:
@@ -2187,6 +2189,8 @@ class Trader:
             return "MAX_HOLDING_DAYS"
         if "전략=PrevCloseBreak" in reason or "전일 종가 이탈" in reason:
             return "PREV_CLOSE_BREAK"
+        if "전략=EmergencyDrop" in reason or "긴급 낙폭" in reason:
+            return "EMERGENCY_DROP"
         if reason.startswith("유지"):
             return "HOLD"
         return "UNKNOWN"
