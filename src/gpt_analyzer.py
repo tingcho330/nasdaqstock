@@ -1215,7 +1215,9 @@ def analyze_candidates_and_create_plans(
         src = stock_info.get("source") or stock_info.get("levels_source")
         sector = stock_info.get("Sector")
         rsi = stock_info.get("RSI"); ma50 = stock_info.get("MA50"); ma200 = stock_info.get("MA200")
-        news_tag = "(NO_NEWS)" if news_status == "NO_NEWS" else "(NEWS_OK)"
+        news_tag = "(NO_NEWS)" if news_status == "NO_NEWS" else (
+            "(NEWS_PARTIAL)" if news_status == "PARTIAL" else "(NEWS_OK)"
+        )
         if is_us_market(mkt):
             ma50_s = fmt_money(float(ma50 or 0), mkt)
             ma200_s = fmt_money(float(ma200 or 0), mkt)

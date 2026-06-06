@@ -57,7 +57,8 @@
 - **KIS 해외 시세·일봉** — `overseas_price`(실시간), `overseas_daily_price`(일봉), `overseas_price_detail`(PER/PBR) (`api/overseas_stock/`)
 - **US 시세 라우팅** — `KIS.get_realtime_price_with_quotes()` / `inquire_price()`가 `MARKET=SP500`이면 해외 TR(`HHDFS00000300`)로 자동 분기 (`trader`·`risk_manager` 공통)
 - **RSI·손절/목표·ATR** — `kis_market_data.py`가 KIS 일봉 우선 (`get_historical_prices` → US는 pykrx/fdr **미로드·미사용**)
-- **GPT / 휴리스틱 분석** — `MARKET=SP500` 시 US 전용 프롬프트(초기필터·전술·리밸런싱), 가격·예산 **USD** (`fmt_money`), `gpt_params.budget_guard` / `initial_filter` 연동
+- **Google News RSS (US)** — RSS 수집 + publisher **본문 scrape** → `collected_news` (`text`는 GPT 입력용)
+- **GPT / 휴리스틱 분석** — US 프롬프트·1차 필터 `min_score_pass` config 연동·USD Budget Guard → `gpt_trades_*.json`
 - **스케줄 오케스트레이션** — `integrated_manager.py`가 평일 잡·스크리너·파이프라인·잔액·체결확인·리컨실·요약 담당
 - **일일 요약(US)** — `balance_open`/`balance_close` + `summary_*.json`의 KIS 필드로 Discord 전송: **총평가 `tot_evlu_amt_krw`(원화)**, **예수금 `ord_psbl_frcr_amt`(USD)**, **보유평가 `evlu_pfls_smtl_amt`(USD, 평가손익 합계)** 각각 open→close 변화량 표기
 - **해외 잔고·주문** — `account.py` → `kis_overseas_account` (USD), `KIS.order_cash()` → `overseas_order` (NASD)
@@ -219,7 +220,7 @@ screener.py --market SP500              health_check.py (AAPL @ NAS)
 | `screener_candidates_{date}_{am\|pm}_SP500.json` | `screener.py` |
 | `screener_candidates_full_*`, `screener_scores_*`, `screener_holdings_*` | `screener.py` |
 | `market_state_{date}_{am\|pm}_SP500.json` | `screener.py` |
-| `collected_news_{date}_{am\|pm}_SP500.json` | `news_collector.py` |
+| `collected_news_{date}_{am\|pm}_SP500.json` | `news_collector.py` — `{status, text, articles[], meta}` (US: RSS+본문 scrape) |
 | `gpt_trades_{date}_{am\|pm}_SP500.json` | `gpt_analyzer.py` (`plans[]`, `session` 메타 포함) |
 | `balance_*`, `summary_*` | `account.py` (US: `currency: "USD"`) |
 | `daily_balances/balance_{open\|close}_*.json` | `integrated_manager` 일일 요약 — `kis_summary`(US)·`total_balance`·`cash`·`holdings_value`·`holdings_detail[]`·`summary_file` |
@@ -318,8 +319,8 @@ api/kis_auth.KIS (DomesticStock + OverseasStock)
 | `screener_core.py` | 지표·점수·`MarketState` (US: pykrx/fdr 지연 로드 스킵) |
 | `kis_master.py` | 국내/해외 `.mst`·`.cod` 다운로드·캐시 |
 | `health_check.py` | US: `AAPL` @ `NAS`, KR: `005930` |
-| `news_collector.py` | US: Google News RSS / KR: Naver API |
-| `gpt_analyzer.py` | GPT·휴리스틱; US/KR 프롬프트·시스템 메시지 분기, USD Budget Guard |
+| `news_collector.py` | US: Google RSS → publisher URL resolve → **본문 scrape**; KR: Naver API + 본문 scrape |
+| `gpt_analyzer.py` | GPT·휴리스틱; 1차 필터 `min_score_pass` **config 연동**; US/KR 프롬프트·USD Budget Guard |
 | `account.py` | 잔고·요약 JSON (`MARKET`에 따라 국내/해외 분기) |
 | `kis_overseas_account.py` | 해외 잔고 TR → 국내 JSON 호환 정규화 (USD) |
 | `trader.py` | 매수/매도·`positions` 손절/목표 우선·회전·`--batch-check-only`; 매도 사유 코드(`EMERGENCY_DROP` 등)·체결 수량 `_get_qty` |
@@ -436,24 +437,41 @@ DISCORD_WEBHOOK_URL_RISK=https://discord.com/api/webhooks/.../risk
 |----|-----------|------|
 | `min_trading_value_5d_avg_us` | `5000000000` | 5일 평균 거래대금 하한(USD) — 조정 가능 |
 | `min_market_cap_us` | `5000000000` | 시총 하한(마스터 Marcap 미제공 시 1차 스킵) |
-| `min_score_threshold` | `0.48` | 최종 점수 컷 (스크리너·리밸런스·GPT initial_filter 동기화) |
-| `require_positive_momentum` | `true` | 20일 모멘텀 > 0 |
-| `volatility_threshold` | `0.75` | 연율화 변동성 상한 |
+| `min_score_threshold` | `0.48` | 최종 점수 컷 (스크리너·리밸런스·GPT `initial_filter` 동기화) |
+| `require_positive_momentum` | `false` | `true`면 20일 모멘텀 < 0 종목 제외 |
+| `exclude_high_volatility` | `false` | `true`면 `volatility_threshold` 초과 종목 제외 |
+| `volatility_threshold` | `0.90` | 연율화 변동성 상한 (`exclude_high_volatility=true`일 때) |
 | `top_n` | `8` | 최종 후보 수 (`max_positions`와 min) |
 
-### 6.4 GPT 분석 (`config.json` → `gpt_params`)
+### 6.4 뉴스 수집 (`config.json` → `news_params`)
+
+| 키 | 기본 | 설명 |
+|----|------|------|
+| `days` | `14` | 최근 N일 RSS 필터 (스윙용; legacy 90) |
+| `articles_per_stock` | `5` | 종목당 기사 수 |
+| `scrape_body_us` | `true` | US: Google News 링크 follow 후 publisher 본문 scrape |
+| `max_body_chars_per_article` | `800` | 기사별 본문 상한 |
+| `max_gpt_text_chars` | `1500` | GPT `text` 필드 상한 (`gpt_analyzer`와 동일) |
+| `dedupe_title_threshold` | `0.85` | US RSS 제목 중복 제거 |
+| `us_query_mode` | `ticker_and_name` | `"Apple" AAPL stock` 검색 (`ticker_only` 가능) |
+| `scrape_rps` | `2` | US 본문 scrape 초당 요청 상한 |
+| `include_links_in_gpt_text` | `false` | `false`: URL은 `articles[].url`, GPT `text`는 제목·요약·본문만 |
+
+**`collected_news_*.json` 종목별 구조:** `status` (`OK` / `PARTIAL` / `NO_NEWS` / `ERROR`), `text` (GPT 입력), `articles[]` (메타·URL), `meta` (수집 통계). GPT는 **`text` 문자열만** 분석하며 URL을 fetch하지 않습니다.
+
+### 6.5 GPT 분석 (`config.json` → `gpt_params`)
 
 | 키 | 기본 | 설명 |
 |----|------|------|
 | `openai_model` | `gpt-4o-mini` | OpenAI 모델 (HTTP 폴백 시 프롬프트 JSON 유도) |
 | `budget_guard` | `true` | `summary_*.json`의 USD 가용금액으로 매수 적정성 검사 |
 | `max_entry_price_ratio` | `0.2` | 종목당 최대 진입 비율 (슬롯·현금 대비) |
-| `initial_filter.min_score_pass` | `0.48` | 1차 GPT/휴리스틱 점수 컷 (0–1 스케일) |
+| `initial_filter.min_score_pass` | `0.48` | 1차 GPT 프롬프트·하드컷 (config 런타임 로드; 구 0.55 하드코딩 제거) |
 | `analysis_expansion.max_total_analysis` | `15` | GPT 상세 분석 최대 종목 수 |
 
-US 프롬프트는 점수 **0.0–1.0**, 손절/목표·MA를 **$X.XX USD**로 안내합니다. `account.py`로 `summary_YYYYMMDD.json`이 없으면 Budget Guard가 비활성화됩니다.
+US 프롬프트는 점수 **0.0–1.0**, 손절/목표·MA를 **$X.XX USD**로 안내합니다. `account.py`로 `summary_YYYYMMDD.json`이 없으면 Budget Guard가 비활성화됩니다. `max_entry_price_ratio=0.2`이면 종목당 매수 상한 = `usable_cash × 0.2` (고가주는 1주도 불가할 수 있음).
 
-### 6.5 장중 리스크 (`market_hours` · `risk_params` · `trading_params`)
+### 6.6 장중 리스크 (`market_hours` · `risk_params` · `trading_params`)
 
 | 키 | 기본 | 설명 |
 |----|------|------|
@@ -566,8 +584,9 @@ export PIPELINE_SESSION=${SESSION}
 # 1) API 헬스체크 (US: AAPL @ NAS)
 python3 health_check.py
 
-# 2) 뉴스 (Google RSS)
+# 2) 뉴스 (Google RSS + US 본문 scrape, config news_params)
 python3 news_collector.py --file ../output/screener_candidates_${DATE}_${SESSION}_SP500.json
+# → collected_news: status/text/articles/meta (--days·--articles는 config 기본값)
 
 # 3) 해외 잔고 스냅샷 (권장 — GPT Budget Guard용 USD)
 python3 account.py
@@ -589,8 +608,8 @@ python3 trader.py --date ${DATE}
 # trader는 PIPELINE_TRADE_DATE·PIPELINE_SESSION env로 gpt_trades 최신 파일 매칭
 ```
 
-**검증된 로컬 결과 (예시, `DATE=20260529`):** health_check ✅ → news 1종목 ✅ → gpt_analyzer 매수 계획 1건(AMZN, USD 손절/목표 표기) ✅.  
-후보 수는 `min_trading_value_5d_avg_us`에 따라 달라집니다(기본 10억 USD면 유동 상위만 통과).
+**검증된 로컬 결과 (예시):** health_check ✅ → news 8종목(RSS+본문) ✅ → gpt_analyzer ✅.  
+스크리너 후보 수는 `min_trading_value_5d_avg_us`·`min_score_threshold`·모멘텀/변동성 필터에 따라 달라집니다(현재 기본: 점수≥0.48, 모멘텀/변동성 필터 OFF → 최대 ~8종).
 
 `PYTHONPATH=src` 대신 `cd src` 후 실행해도 동일합니다. Docker는 `/app/src` 기준으로 동일 스크립트를 호출합니다.
 
@@ -654,8 +673,9 @@ trading_bot_260530_NASDAQ/
 | US 일봉·RSI·손절/ATR (`kis_market_data`) | ✅ `HHDFS76240000`; US pykrx/fdr **미로드** |
 | SP500 pykrx/KRX 초기화 | ✅ `MARKET=SP500` 시 pykrx/fdr 지연 로드 스킵 |
 | 스크리너 `--force` (휴장일 테스트) | ✅ 주말·NYSE 휴장일 수동 실행 |
-| Google News RSS (US) | ✅ |
-| GPT 분석·`gpt_trades_*.json` | ✅ (US 프롬프트·USD 표기) |
+| Google News RSS + US 본문 scrape | ✅ RSS dedupe·publisher URL resolve·`PARTIAL` status |
+| GPT 1차 필터 config 연동 | ✅ `initial_filter.min_score_pass` 런타임 반영 |
+| GPT 분석·`gpt_trades_*.json` | ✅ (US 프롬프트·USD 표기·Budget Guard) |
 | 티커 정규화 (`normalize_ticker_6`) | ✅ trader·GPT·recorder·리컨실 등 |
 | `Ticker` US 심볼 저장 | ✅ `AMZN` 형식 (zfill 미사용) |
 | 해외 실주문 (`KIS.order_cash` → `overseas_order`) | ✅ 코드 연동 (`vps`/`prod`에서 검증 필요) |

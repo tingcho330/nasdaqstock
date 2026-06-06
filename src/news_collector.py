@@ -9,7 +9,8 @@ import re
 import os
 import xml.etree.ElementTree as ET
 from email.utils import parsedate_to_datetime
-from typing import Dict, List, Tuple, Optional
+import threading
+from typing import Dict, List, Tuple, Optional, Any, Union
 from urllib.parse import quote_plus
 import difflib
 
@@ -27,6 +28,7 @@ from utils import (
     norm_ticker,
     parse_pipeline_artifact_stem,
     format_pipeline_artifact,
+    load_config,
 )
 
 # ───────────────── 로깅 설정 ─────────────────
@@ -68,8 +70,65 @@ NAVER_ID = os.getenv("NAVER_CLIENT_ID", "").strip()
 NAVER_SECRET = os.getenv("NAVER_CLIENT_SECRET", "").strip()
 DEDUPE_THRESHOLD = float(os.getenv("NEWS_TITLE_SIM_THRESHOLD", "0.85"))
 
-if not (NAVER_ID and NAVER_SECRET):
-    logger.warning("NAVER API 키가 비었습니다. (/app/config/.env 확인) 예: NAVER_CLIENT_ID=xxx, NAVER_CLIENT_SECRET=yyy")
+_SCRAPE_LOCK = threading.Lock()
+_LAST_SCRAPE_TS = 0.0
+
+_DEFAULT_NEWS_PARAMS: Dict[str, Any] = {
+    "days": 14,
+    "articles_per_stock": 5,
+    "scrape_body_us": True,
+    "max_body_chars_per_article": 800,
+    "max_gpt_text_chars": 1500,
+    "dedupe_title_threshold": 0.85,
+    "us_query_mode": "ticker_and_name",
+    "scrape_rps": 2.0,
+    "include_links_in_gpt_text": False,
+}
+
+
+def _load_news_params() -> Dict[str, Any]:
+    """config.json → news_params (런타임 reload)."""
+    out = dict(_DEFAULT_NEWS_PARAMS)
+    try:
+        cfg = load_config() or {}
+        raw = cfg.get("news_params") or {}
+        if isinstance(raw, dict):
+            for k in out:
+                if k in raw and raw[k] is not None:
+                    out[k] = raw[k]
+    except Exception as e:
+        logger.debug("news_params 로드 실패, 기본값 사용: %s", e)
+    out["days"] = int(out["days"])
+    out["articles_per_stock"] = int(out["articles_per_stock"])
+    out["max_body_chars_per_article"] = int(out["max_body_chars_per_article"])
+    out["max_gpt_text_chars"] = int(out["max_gpt_text_chars"])
+    out["dedupe_title_threshold"] = float(out["dedupe_title_threshold"])
+    out["scrape_rps"] = float(out["scrape_rps"])
+    out["scrape_body_us"] = bool(out["scrape_body_us"])
+    out["include_links_in_gpt_text"] = bool(out["include_links_in_gpt_text"])
+    out["us_query_mode"] = str(out["us_query_mode"] or "ticker_and_name")
+    return out
+
+
+def _rate_limit_scrape(rps: float) -> None:
+    global _LAST_SCRAPE_TS
+    if rps <= 0:
+        return
+    interval = 1.0 / rps
+    with _SCRAPE_LOCK:
+        now = time.monotonic()
+        wait = interval - (now - _LAST_SCRAPE_TS)
+        if wait > 0:
+            time.sleep(wait)
+        _LAST_SCRAPE_TS = time.monotonic()
+
+
+if not is_us_market(os.getenv("MARKET", "SP500")):
+    if not (NAVER_ID and NAVER_SECRET):
+        logger.warning(
+            "NAVER API 키가 비었습니다. (/app/config/.env 확인) "
+            "예: NAVER_CLIENT_ID=xxx, NAVER_CLIENT_SECRET=yyy"
+        )
 
 # ─────────────────────── 유틸 함수 ───────────────────────
 def _clean_text(text: str) -> str:
@@ -145,6 +204,143 @@ def _scrape_article_content(url: str) -> str:
         logger.warning(f"본문 스크레이핑 실패({url}): {e}")
         return "본문을 가져오지 못했습니다."
 
+
+def _extract_publisher_from_title(title: str) -> str:
+    if not title:
+        return ""
+    parts = [p.strip() for p in re.split(r"\s[-–—]\s+", title) if p.strip()]
+    if len(parts) >= 2:
+        return parts[-1]
+    return ""
+
+
+def _us_rss_search_query(name: str, ticker: str, mode: str) -> str:
+    mode = (mode or "ticker_and_name").lower().strip()
+    if mode == "ticker_and_name" and name:
+        short = re.sub(
+            r"\s+(INC\.?|CORP\.?|CORPORATION|LTD\.?|PLC\.?|CO\.?)\s*$",
+            "",
+            name,
+            flags=re.I,
+        ).strip()
+        if short:
+            return quote_plus(f'"{short}" {ticker} stock')
+    return quote_plus(f"{ticker} stock")
+
+
+def _resolve_publisher_url(link: str) -> str:
+    """Google News RSS redirect → publisher URL (가능한 경우)."""
+    if not link:
+        return ""
+    if "news.google.com" not in link:
+        return link
+    try:
+        headers = {"User-Agent": "Mozilla/5.0 (compatible; NewsBot/1.0)"}
+        r = requests.get(link, headers=headers, timeout=12, allow_redirects=True)
+        final = (r.url or "").strip()
+        if final and "news.google.com" not in final:
+            return final
+        if r.text:
+            soup = BeautifulSoup(r.text, "html.parser")
+            for tag_name, attrs in (
+                ("meta", {"property": "og:url"}),
+                ("link", {"rel": "canonical"}),
+            ):
+                tag = soup.find(tag_name, attrs)
+                if tag:
+                    href = (tag.get("content") or tag.get("href") or "").strip()
+                    if href and "news.google.com" not in href:
+                        return href
+        return final or link
+    except Exception as e:
+        logger.debug("URL resolve 실패(%s): %s", link[:80], e)
+        return link
+
+
+_US_BODY_SELECTORS = [
+    "[itemprop='articleBody']",
+    "article .article-body",
+    "article .article-content",
+    ".article-body",
+    ".article-content",
+    ".story-body",
+    ".entry-content",
+    ".post-content",
+    "article",
+    "main",
+]
+
+
+def _scrape_us_article_content(url: str, max_chars: int, scrape_rps: float) -> Tuple[str, int]:
+    if not url or not url.startswith("http"):
+        return "", 0
+    _rate_limit_scrape(scrape_rps)
+    try:
+        headers = {"User-Agent": "Mozilla/5.0 (compatible; NewsBot/1.0)"}
+        r = requests.get(url, headers=headers, timeout=12, allow_redirects=True)
+        r.raise_for_status()
+        r.encoding = r.apparent_encoding or r.encoding
+        soup = BeautifulSoup(r.text, "html.parser")
+        container = None
+        for sel in _US_BODY_SELECTORS:
+            container = soup.select_one(sel)
+            if container:
+                break
+        if not container:
+            container = soup.body
+        if not container:
+            return "", 0
+        for unwanted in container.select(
+            "script, style, nav, footer, aside, .ad, .advertisement, "
+            ".related, .newsletter, figure, iframe"
+        ):
+            unwanted.decompose()
+        text = _clean_text(container.get_text())
+        if max_chars > 0 and len(text) > max_chars:
+            text = text[:max_chars].rsplit(" ", 1)[0] + "…"
+        return text, len(text)
+    except Exception as e:
+        logger.debug("US 본문 스크래핑 실패(%s): %s", url[:80], e)
+        return "", 0
+
+
+def _build_gpt_news_text(
+    articles: List[Dict[str, Any]],
+    max_chars: int,
+    include_links: bool,
+) -> str:
+    blocks: List[str] = []
+    for art in articles:
+        parts = [f"Title: {art.get('title', '')}"]
+        summary = (art.get("summary") or "").strip()
+        body = (art.get("body") or "").strip()
+        if summary and summary.lower() != (art.get("title") or "").lower():
+            parts.append(f"Summary: {summary}")
+        if body:
+            parts.append(f"Body: {body}")
+        if include_links and art.get("url"):
+            parts.append(f"Link: {art['url']}")
+        blocks.append("\n".join(parts))
+    combined = "\n\n---\n\n".join(blocks)
+    if max_chars > 0 and len(combined) > max_chars:
+        combined = combined[:max_chars].rsplit("\n", 1)[0] + "\n…"
+    return combined
+
+
+def _news_payload(
+    status: str,
+    text: str,
+    articles: Optional[List[Dict[str, Any]]] = None,
+    meta: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    return {
+        "status": status,
+        "text": text or "",
+        "articles": articles or [],
+        "meta": meta or {},
+    }
+
+
 def _parse_pubdate(pub: str) -> datetime:
     dt = datetime.strptime(pub, "%a, %d %b %Y %H:%M:%S %z")
     return dt.astimezone(timezone.utc)
@@ -170,9 +366,15 @@ def _normalize_stock_dict(d: Dict) -> Dict:
                 break
     return out
 
-def _fetch_google_news_rss(ticker: str, limit: int = 20) -> List[Dict]:
+def _fetch_google_news_rss(
+    ticker: str,
+    limit: int = 20,
+    *,
+    name: str = "",
+    query_mode: str = "ticker_and_name",
+) -> List[Dict]:
     """Google News RSS (US)."""
-    q = quote_plus(f"{ticker} stock")
+    q = _us_rss_search_query(name, ticker, query_mode)
     url = f"https://news.google.com/rss/search?q={q}&hl=en-US&gl=US&ceid=US:en"
     try:
         r = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
@@ -202,39 +404,117 @@ def _parse_rss_pubdate(pub: str) -> Optional[datetime]:
 
 
 def _fetch_news_for_single_stock_us(
-    stock: Dict, cutoff_utc: datetime, num_articles: int
-) -> Tuple[str, str]:
+    stock: Dict,
+    cutoff_utc: datetime,
+    num_articles: int,
+    params: Optional[Dict[str, Any]] = None,
+) -> Tuple[str, Dict[str, Any]]:
     stock = _normalize_stock_dict(stock)
     name, ticker = stock.get("Name"), stock.get("Ticker")
+    p = params or _load_news_params()
     if not ticker:
-        return "", "[NO_NEWS] 종목 정보 누락"
+        return "", _news_payload("NO_NEWS", "[NO_NEWS] 종목 정보 누락")
+
+    t0 = time.perf_counter()
     try:
-        items = _fetch_google_news_rss(str(ticker), limit=100)
+        items = _fetch_google_news_rss(
+            str(ticker),
+            limit=100,
+            name=str(name or ""),
+            query_mode=str(p.get("us_query_mode", "ticker_and_name")),
+        )
         if not items:
-            return str(ticker), "[NO_NEWS] Google RSS 결과 없음"
-        recent = []
+            return str(ticker), _news_payload("NO_NEWS", "[NO_NEWS] Google RSS 결과 없음")
+
+        recent: List[Dict] = []
+        skipped_no_date = 0
         for it in items:
             pub = _parse_rss_pubdate(it.get("pubDate", ""))
-            if pub is None or pub >= cutoff_utc:
+            if pub is None:
+                skipped_no_date += 1
+                continue
+            if pub >= cutoff_utc:
                 recent.append(it)
+
         if not recent:
-            return str(ticker), "[NO_NEWS] 최근 기간 내 뉴스 없음"
-        articles = []
+            return str(ticker), _news_payload("NO_NEWS", "[NO_NEWS] 최근 기간 내 뉴스 없음")
+
+        dedupe_thr = float(p.get("dedupe_title_threshold", DEDUPE_THRESHOLD))
+        recent = _dedupe_items_by_title(recent, threshold=dedupe_thr)
+
+        scrape_body = bool(p.get("scrape_body_us", True))
+        max_body = int(p.get("max_body_chars_per_article", 800))
+        scrape_rps = float(p.get("scrape_rps", 2.0))
+        max_gpt = int(p.get("max_gpt_text_chars", 1500))
+        include_links = bool(p.get("include_links_in_gpt_text", False))
+
+        article_records: List[Dict[str, Any]] = []
+        bodies_ok = 0
         for it in recent[:num_articles]:
             title = _clean_text(it.get("title", ""))
             desc = _clean_text(it.get("description", ""))
-            link = it.get("link", "")
-            parts = [f"Title: {title}"]
-            if desc:
-                parts.append(f"Summary: {desc}")
-            parts.append(f"Link: {link or 'N/A'}")
-            articles.append("\n".join(parts))
-        if not articles:
-            return str(ticker), "[NO_NEWS] 기사 수집 실패"
-        return str(ticker), "\n\n---\n\n".join(articles)
+            rss_link = it.get("link", "")
+            pub_dt = _parse_rss_pubdate(it.get("pubDate", ""))
+            published = pub_dt.isoformat() if pub_dt else ""
+
+            publisher_url = _resolve_publisher_url(rss_link) if rss_link else ""
+            body, body_chars = "", 0
+            if scrape_body and publisher_url:
+                body, body_chars = _scrape_us_article_content(
+                    publisher_url, max_body, scrape_rps
+                )
+                if body_chars > 0:
+                    bodies_ok += 1
+
+            article_records.append({
+                "title": title,
+                "summary": desc,
+                "body": body,
+                "url": publisher_url or rss_link,
+                "rss_url": rss_link,
+                "published": published,
+                "source": _extract_publisher_from_title(title),
+                "body_chars": body_chars,
+            })
+
+        if not article_records:
+            return str(ticker), _news_payload("NO_NEWS", "[NO_NEWS] 기사 수집 실패")
+
+        gpt_text = _build_gpt_news_text(article_records, max_gpt, include_links)
+        if not gpt_text.strip():
+            return str(ticker), _news_payload("NO_NEWS", "[NO_NEWS] GPT용 텍스트 생성 실패")
+
+        if bodies_ok == 0:
+            status = "PARTIAL"
+        elif bodies_ok < len(article_records):
+            status = "PARTIAL"
+        else:
+            status = "OK"
+
+        meta = {
+            "collected_at": datetime.now(timezone.utc).isoformat(),
+            "article_count": len(article_records),
+            "bodies_scraped": bodies_ok,
+            "text_chars": len(gpt_text),
+            "skipped_no_pubdate": skipped_no_date,
+            "dedupe_threshold": dedupe_thr,
+            "scrape_body_us": scrape_body,
+            "duration_sec": round(time.perf_counter() - t0, 2),
+        }
+        logger.info(
+            "[%s] 뉴스 %s: articles=%d bodies=%d text_chars=%d (%.2fs)",
+            ticker,
+            status,
+            len(article_records),
+            bodies_ok,
+            len(gpt_text),
+            meta["duration_sec"],
+        )
+        return str(ticker), _news_payload(status, gpt_text, article_records, meta)
+
     except Exception as e:
         logger.error("US 뉴스 수집 오류 %s: %s", ticker, e)
-        return str(ticker), "[ERROR] 뉴스 수집 중 오류 발생"
+        return str(ticker), _news_payload("ERROR", "[ERROR] 뉴스 수집 중 오류 발생")
 
 
 # ───────────────── 뉴스 수집 코어 ─────────────────
@@ -298,23 +578,29 @@ def _fetch_news_for_single_stock(
 
 def fetch_news_for_stocks(
     stocks: List[Dict],
-    num_articles_per_stock: int = 5,
-    days: int = 90,
+    num_articles_per_stock: Optional[int] = None,
+    days: Optional[int] = None,
     max_workers: Optional[int] = None,
-) -> Dict[str, str]:
+    news_params: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Union[str, Dict[str, Any]]]:
     """
     항상 각 티커 키를 포함한 dict를 반환.
-    - 기본값은 '[NO_NEWS] 데이터 부족(수집 0건)'으로 채우고, 성공 시 덮어씀.
-    (저장 직전에 구조화 포맷으로 통일함)
+    US: 구조화 dict(status,text,articles,meta) / KR: legacy str (저장 시 구조화)
     """
     if not stocks:
         return {}
 
-    cutoff_utc = datetime.now(timezone.utc) - timedelta(days=days)
+    p = dict(news_params or _load_news_params())
+    if num_articles_per_stock is not None:
+        p["articles_per_stock"] = int(num_articles_per_stock)
+    if days is not None:
+        p["days"] = int(days)
+
+    cutoff_utc = datetime.now(timezone.utc) - timedelta(days=int(p["days"]))
+    n_articles = int(p["articles_per_stock"])
     if max_workers is None:
         max_workers = max(1, min(10, len(stocks)))
 
-    # 기본값: 모두 NO_NEWS로 초기화
     base_map: Dict[str, str] = {}
     norm_list: List[Dict] = []
     mkt = _market_tag()
@@ -325,24 +611,36 @@ def fetch_news_for_stocks(
             base_map[t] = "[NO_NEWS] 데이터 부족(수집 0건)"
             norm_list.append({"Name": s["Name"], "Ticker": t})
 
-    news_cache: Dict[str, str] = dict(base_map)
+    news_cache: Dict[str, Union[str, Dict[str, Any]]] = dict(base_map)
 
-    logger.info(f"{len(norm_list)}개 종목 뉴스 병렬 수집 시작... (최근 {days}일)")
+    logger.info(
+        f"{len(norm_list)}개 종목 뉴스 병렬 수집 시작... "
+        f"(최근 {p['days']}일, articles={n_articles}, scrape_us={p.get('scrape_body_us')})"
+    )
     if not norm_list:
         return news_cache
 
-    fetch_fn = _fetch_news_for_single_stock_us if is_us_market(mkt) else _fetch_news_for_single_stock
+    us_mode = is_us_market(mkt)
+
+    def _fetch_one(stock: Dict) -> Tuple[str, Union[str, Dict[str, Any]]]:
+        if us_mode:
+            return _fetch_news_for_single_stock_us(stock, cutoff_utc, n_articles, p)
+        return _fetch_news_for_single_stock(stock, cutoff_utc, n_articles)
+
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         futures = {
-            ex.submit(fetch_fn, stock, cutoff_utc, num_articles_per_stock): str(stock.get("Name", ""))
+            ex.submit(_fetch_one, stock): str(stock.get("Name", ""))
             for stock in norm_list
         }
         for fut in as_completed(futures):
             stock_name = futures[fut]
             try:
-                ticker, text = fut.result()
+                ticker, payload = fut.result()
                 if ticker:
-                    news_cache[ticker] = text or "[NO_NEWS] 빈 본문"
+                    if isinstance(payload, dict):
+                        news_cache[ticker] = payload
+                    else:
+                        news_cache[ticker] = payload or "[NO_NEWS] 빈 본문"
             except Exception as e:
                 logger.error(f"'{stock_name}' 처리 중 예외: {e}", exc_info=True)
 
@@ -350,35 +648,45 @@ def fetch_news_for_stocks(
     return news_cache
 
 # ───────────────── 저장 전 포맷 통일 유틸 ─────────────────
-def _to_structured_news_map(news_data: Dict[str, object], all_tickers: List[str]) -> Dict[str, Dict[str, str]]:
+def _to_structured_news_map(news_data: Dict[str, object], all_tickers: List[str]) -> Dict[str, Dict[str, Any]]:
     """
     다양한 형태의 news_data 값을 저장 전 통일:
-      - dict(status,text) → 그대로
-      - str 시작이 "[NO_NEWS]" → {"status":"NO_NEWS","text":<원문 또는 빈 문자열>}
-      - 그 외 str → {"status":"OK","text":<원문>}
-      - None/빈값/키없음 → {"status":"NO_NEWS","text":""}
+      - dict(status,text[,articles,meta]) → 보존
+      - str 시작이 "[NO_NEWS]" → {"status":"NO_NEWS","text":...}
+      - 그 외 str → {"status":"OK","text":...}
     """
-    out: Dict[str, Dict[str, str]] = {}
+    out: Dict[str, Dict[str, Any]] = {}
     for t in all_tickers:
         v = news_data.get(t, None)
         if isinstance(v, dict) and "status" in v and "text" in v:
-            out[t] = {"status": str(v.get("status")), "text": str(v.get("text") or "")}
+            entry: Dict[str, Any] = {
+                "status": str(v.get("status")),
+                "text": str(v.get("text") or ""),
+            }
+            if v.get("articles") is not None:
+                entry["articles"] = v.get("articles")
+            if v.get("meta") is not None:
+                entry["meta"] = v.get("meta")
+            out[t] = entry
         elif isinstance(v, str):
             s = v.strip()
             if s.startswith("[NO_NEWS]"):
-                out[t] = {"status": "NO_NEWS", "text": s}
+                out[t] = {"status": "NO_NEWS", "text": s, "articles": [], "meta": {}}
             elif s.startswith("[ERROR]"):
-                out[t] = {"status": "ERROR", "text": s}
+                out[t] = {"status": "ERROR", "text": s, "articles": [], "meta": {}}
             else:
-                out[t] = {"status": "OK", "text": s}
+                out[t] = {"status": "OK", "text": s, "articles": [], "meta": {}}
         else:
-            out[t] = {"status": "NO_NEWS", "text": ""}
+            out[t] = {"status": "NO_NEWS", "text": "", "articles": [], "meta": {}}
     return out
 
 def run_news_collection_from_results_file(
-    results_file: Path, num_articles_per_stock: int = 5, days: int = 90
+    results_file: Path,
+    num_articles_per_stock: Optional[int] = None,
+    days: Optional[int] = None,
 ) -> None:
     t0 = time.perf_counter()
+    news_params = _load_news_params()
 
     if not results_file.exists():
         logger.error(f"결과 파일({results_file})이 존재하지 않습니다.")
@@ -415,7 +723,10 @@ def run_news_collection_from_results_file(
         return
 
     news_data = fetch_news_for_stocks(
-        stocks_for_news, num_articles_per_stock=num_articles_per_stock, days=days
+        stocks_for_news,
+        num_articles_per_stock=num_articles_per_stock,
+        days=days,
+        news_params=news_params,
     )
 
     # 파일 저장: 비어 있어도 NO_NEWS 기본값으로 저장되도록 보장
@@ -440,10 +751,21 @@ def run_news_collection_from_results_file(
 if __name__ == "__main__":
     import argparse
 
+    np = _load_news_params()
     parser = argparse.ArgumentParser(description="News Collector (compat with screener outputs)")
     parser.add_argument("--file", type=str, help="스크리너 결과 JSON 경로")
-    parser.add_argument("--articles", type=int, default=5, help="종목별 기사 수 (기본 5)")
-    parser.add_argument("--days", type=int, default=90, help="최근 N일만 수집 (기본 90)")
+    parser.add_argument(
+        "--articles",
+        type=int,
+        default=None,
+        help=f"종목별 기사 수 (config 기본 {np['articles_per_stock']})",
+    )
+    parser.add_argument(
+        "--days",
+        type=int,
+        default=None,
+        help=f"최근 N일만 수집 (config 기본 {np['days']})",
+    )
     args = parser.parse_args()
 
     if args.file:

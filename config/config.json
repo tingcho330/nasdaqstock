@@ -116,6 +116,19 @@
     }
   },
 
+  // ── 뉴스 수집 (news_collector.py) ─────────────────────────────────
+  "news_params": {
+    "days": 14,                         // 최근 N일 (스윙: 14 권장, legacy 90)
+    "articles_per_stock": 5,
+    "scrape_body_us": true,             // US: RSS 링크 follow 후 본문 스크래핑
+    "max_body_chars_per_article": 800,  // 기사별 본문 상한
+    "max_gpt_text_chars": 1500,         // GPT용 text 필드 상한
+    "dedupe_title_threshold": 0.85,
+    "us_query_mode": "ticker_and_name", // ticker_only | ticker_and_name
+    "scrape_rps": 2,                    // US 본문 스크래핑 초당 요청 상한
+    "include_links_in_gpt_text": false  // false: URL은 articles[].url, text는 제목·요약·본문만
+  },
+
   // ── 매매 전략 (strategies.py) ─────────────────────────────────────
   "strategy_params": {
     "stop_loss_pct": 0.03,
