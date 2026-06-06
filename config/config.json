@@ -114,7 +114,7 @@
   },
   "market_hours": {
     "SP500": {
-      "risk_poll_windows": ["23:15-06:00"]
+      "risk_poll_windows": ["22:30-05:00"]
     }
   },
   "trading_params": {
@@ -141,8 +141,8 @@
       "volatility_threshold": 0.25,
       "rebalance_frequency_hours": 6
     },
-    "buy_time_windows": ["23:20-05:45"],
-    "sell_time_windows": ["23:15-06:00"],
+    "buy_time_windows": ["22:35-04:45"],
+    "sell_time_windows": ["22:30-05:00"],
     "split_buy": {
       "enabled": false,
       "slices": 5,

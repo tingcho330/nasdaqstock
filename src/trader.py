@@ -47,6 +47,7 @@ from utils import (
     check_min_holding_period,
     check_min_holding_hours,
     extract_broker_order_id,
+    resolve_us_sell_order_params,
 )
 from api.kis_auth import KIS
 from risk_manager import RiskManager
@@ -702,6 +703,24 @@ class Trader:
             filtered_kwargs = {k: v for k, v in kwargs.items() if k in valid_params}
             if filtered_kwargs.get("pdno"):
                 filtered_kwargs["pdno"] = self._t(filtered_kwargs["pdno"])
+            ord_dv = str(filtered_kwargs.get("ord_dv", "") or "")
+            is_sell = ord_dv in ("01", "1", "sell", "s")
+            if is_us_market(self.market) and is_sell:
+                try:
+                    sell_unpr = int(filtered_kwargs.get("ord_unpr", 0) or 0)
+                except (TypeError, ValueError):
+                    sell_unpr = 0
+                if sell_unpr <= 0:
+                    out = {
+                        "ok": False,
+                        "rt_cd": None,
+                        "msg_cd": None,
+                        "msg1": "US 매도 단가 0",
+                        "http_status": None,
+                        "raw": None,
+                    }
+                    logger.warning("[order_guard] US sell blocked: ord_unpr=0 ticker=%s", filtered_kwargs.get("pdno"))
+                    return out
             res = self.kis.order_cash(**filtered_kwargs, market=self.market)
             # 1) DataFrame 성공 경로
             if hasattr(res, "empty"):
@@ -1517,9 +1536,10 @@ class Trader:
             }
         
         # 2. 주문 실행
+        ord_dvsn, ord_unpr = self._sell_order_params_at_price(int(price))
         result = self._order_cash_retry(
-            ord_dv="01", pdno=ticker, ord_dvsn="01", 
-            ord_qty=str(quantity), ord_unpr=str(int(price))
+            ord_dv="01", pdno=ticker, ord_dvsn=ord_dvsn,
+            ord_qty=str(quantity), ord_unpr=str(ord_unpr)
         )
         
         # 3. 즉시 체결 확인
@@ -1630,9 +1650,10 @@ class Trader:
             
             # 2. 주문 실행
             logger.info(f"[{batch_name}] 주문 실행: {name}({ticker}) {quantity}주 @ {self._money(price)}")
+            ord_dvsn, ord_unpr = self._sell_order_params_at_price(int(price))
             result = self._order_cash_retry(
-                ord_dv="01", pdno=ticker, ord_dvsn="01", 
-                ord_qty=str(quantity), ord_unpr=str(int(price))
+                ord_dv="01", pdno=ticker, ord_dvsn=ord_dvsn,
+                ord_qty=str(quantity), ord_unpr=str(ord_unpr)
             )
             try:
                 self._last_order_odno = result.get('odno')
@@ -1687,8 +1708,20 @@ class Trader:
         if self.is_real_trading:
             pre_qty = quantity
 
+            px = 0
+            try:
+                price_info = self._get_realtime_price_with_quotes(ticker)
+                px = _to_int(price_info.get("current_price", 0)) if price_info else 0
+            except Exception:
+                px = 0
+            if px <= 0:
+                logger.warning("[REBALANCE] %s(%s) 매도 스킵: 유효 현재가 없음", name, ticker)
+                return {"status": "sell_fail", "filled_qty": 0, "rt_cd": None, "msg1": "no valid price"}
+
+            ord_dvsn, ord_unpr = self._sell_order_params(px)
             result = self._order_cash_retry(
-                ord_dv="01", pdno=ticker, ord_dvsn="01", ord_qty=str(quantity), ord_unpr="0"
+                ord_dv="01", pdno=ticker, ord_dvsn=ord_dvsn,
+                ord_qty=str(quantity), ord_unpr=str(ord_unpr)
             )
 
             time.sleep(2)
@@ -2141,19 +2174,39 @@ class Trader:
         tick_size = get_tick_size(current_price)
         return round_to_tick(target_price, mode="down")
     
+    def _sell_order_params_at_price(self, price: int) -> Tuple[str, int]:
+        """명시 단가 매도 — US: 00+price, KR: 01+price."""
+        px = _to_int(price)
+        if px <= 0:
+            raise ValueError(f"invalid sell price: {price!r}")
+        if is_us_market(self.market):
+            return "00", px
+        return "01", px
+
+    def _sell_order_params(
+        self,
+        current_price: int,
+        structured_context: Optional[Dict] = None,
+    ) -> Tuple[str, int]:
+        """US/KR 매도 ORD_DVSN + 단가."""
+        px = _to_int(current_price)
+        if px <= 0:
+            raise ValueError(f"invalid sell price: {current_price!r}")
+        if is_us_market(self.market):
+            ctx_type = (structured_context or {}).get("type", "")
+            urgency = "urgent" if ctx_type in ("StopLoss", "EmergencyDrop") else "normal"
+            return resolve_us_sell_order_params(px, urgency=urgency)
+        if structured_context and structured_context.get("type") == "StopLoss":
+            return "02", 0
+        sell_price = self._calculate_sell_price_with_slippage(px, slippage_bps=30)
+        return "00", sell_price
+
     def _determine_sell_order_type(self, current_price: int, structured_context: Optional[Dict] = None) -> Tuple[str, int]:
         """
         매도 주문 타입 결정 (시장가 vs 지정가)
-        급락 상황에서는 시장가, 일반적인 경우 지정가 사용
+        US: KIS TTTT1006U — ORD_DVSN=00 + 현재가(슬리피지). KR: 기존 분기 유지.
         """
-        # 급락 감지 (5% 이상 하락 시 시장가)
-        if structured_context and structured_context.get("type") == "StopLoss":
-            # 손절 상황에서는 시장가 사용
-            return "02", 0  # 시장가
-        
-        # 일반적인 매도는 지정가 사용 (슬리피지 적용)
-        sell_price = self._calculate_sell_price_with_slippage(current_price, slippage_bps=30)
-        return "00", sell_price  # 지정가
+        return self._sell_order_params(current_price, structured_context)
 
     def _parse_reason_code(self, reason: str, structured_context: Optional[Dict] = None) -> str:
         # 구조화된 컨텍스트가 있으면 우선 사용
@@ -2320,6 +2373,10 @@ class Trader:
                     continue
                 
                 logger.info(f"부분 익절 실행: {name}({ticker}) {partial_qty}주 ({partial_ratio:.0%})")
+                if current_price <= 0:
+                    logger.warning(f"⚠️ [{ticker}] 부분 익절 스킵: 유효 현재가 없음")
+                    self.stats["hold"] += 1
+                    continue
                 order_type, order_price = self._determine_sell_order_type(current_price, structured_context)
                 result = self._order_cash_retry(
                     ord_dv="01", pdno=ticker, ord_dvsn=order_type, ord_qty=str(partial_qty), ord_unpr=str(order_price)
@@ -2384,6 +2441,14 @@ class Trader:
 
             if self.is_real_trading:
                 pre_qty = self._get_qty(holdings, ticker)
+
+                if current_price <= 0:
+                    logger.warning(
+                        "⚠️ [%s] 매도 스킵: 유효 현재가 없음 (평단 fallback은 주문에 사용하지 않음)",
+                        ticker,
+                    )
+                    self.stats["hold"] += 1
+                    continue
 
                 # 매도 주문 타입 결정 (시장가 vs 지정가)
                 order_type, order_price = self._determine_sell_order_type(current_price, structured_context)
@@ -2926,12 +2991,23 @@ class Trader:
             
             # 매도 주문 실행
             if self.is_real_trading:
+                px = 0
+                try:
+                    price_info = self._get_realtime_price_with_quotes(ticker)
+                    px = _to_int(price_info.get("current_price", 0)) if price_info else 0
+                except Exception:
+                    px = 0
+                if px <= 0:
+                    logger.warning("종목 %s 비중 조정 매도 스킵: 유효 현재가 없음", ticker)
+                    return False
+
+                ord_dvsn, ord_unpr = self._sell_order_params(px)
                 result = self._order_cash_retry(
-                    ord_dv="01",  # 매도
-                    pdno=ticker, 
-                    ord_dvsn="01",  # 시장가
-                    ord_qty=str(sell_qty), 
-                    ord_unpr="0"  # 시장가는 가격 0
+                    ord_dv="01",
+                    pdno=ticker,
+                    ord_dvsn=ord_dvsn,
+                    ord_qty=str(sell_qty),
+                    ord_unpr=str(ord_unpr),
                 )
                 
                 # 향상된 체결 확인 로직 적용

@@ -28,6 +28,7 @@ from utils import (
     is_market_open_day,
     is_regular_session,
     next_session_open_kst,
+    resolve_us_sell_order_params,
     risk_session_windows,
 )
 from notifier import (
@@ -496,36 +497,60 @@ class RiskManager:
         return True
 
     def _direct_execute_sell(self, ticker: str, name: str, qty: int, reason_meta: Dict) -> bool:
-        """[NEW] 즉시 시장가 매도(브로커 지원 기준: ord_unpr=0)"""
+        """즉시 매도 — US: ORD_DVSN=00 + 현재가 지정가, KR: 시장가(ord_dvsn=01)."""
         try:
             if qty <= 0:
                 logger.debug(f"[DIRECT_SELL] skip: qty<=0 (ticker={ticker})")
                 return False
-            logger.info(f"[DIRECT_SELL] try submit: {name}({ticker}) qty={qty}, reason={reason_meta.get('type','')}")
+
+            mkt = _market()
+            px = self._quote_price_for_record(ticker)
+            if px <= 0:
+                logger.warning("[DIRECT_SELL] skip: no valid price for %s(%s)", name, ticker)
+                return False
+
+            if is_us_market(mkt):
+                ord_dvsn, ord_unpr = resolve_us_sell_order_params(px, urgency="urgent")
+            else:
+                ord_dvsn, ord_unpr = "01", 0
+
+            logger.info(
+                "[DIRECT_SELL] try submit: %s(%s) qty=%s reason=%s ord_dvsn=%s unpr=%s",
+                name,
+                ticker,
+                qty,
+                reason_meta.get("type", ""),
+                ord_dvsn,
+                ord_unpr,
+            )
             df = self._kis.order_cash(
                 ord_dv="01",
                 pdno=ticker,
-                ord_dvsn="01",
+                ord_dvsn=ord_dvsn,
                 ord_qty=int(qty),
-                ord_unpr=0,
-                market=_market(),
+                ord_unpr=int(ord_unpr),
+                market=mkt,
             )
             from utils import extract_broker_order_id
             odno = extract_broker_order_id(df)
             ok = False
             rt_cd = ""
+            msg_cd = ""
+            msg1 = ""
             if hasattr(df, "empty") and not df.empty:
                 rec = df.to_dict("records")[0]
                 if not odno:
                     odno = extract_broker_order_id(rec)
                 rt_cd = str(rec.get("rt_cd", "")).strip()
+                msg_cd = str(rec.get("msg_cd", "") or "")
+                msg1 = str(rec.get("msg1", "") or "")
                 ok = (rt_cd == "0") or bool(odno)
             elif odno:
                 ok = True
             if ok:
                 logger.info(f"[DIRECT_SELL] ✅ submitted: {name}({ticker}) {qty}주 (ODNO={odno or 'N/A'})")
                 try:
-                    current_price = self._quote_price_for_record(ticker)
+                    current_price = px or self._quote_price_for_record(ticker)
                     from recorder import record_trade
                     try:
                         from db_debug import log_trade_in as _db_dbg_trade_in
@@ -553,7 +578,16 @@ class RiskManager:
                     logger.debug(f"[DIRECT_SELL] record_trade 실패: {e}")
                 return True
             else:
-                logger.warning(f"[DIRECT_SELL] submit failed: {name}({ticker}) qty={qty}, df_empty={getattr(df,'empty',True)}")
+                logger.warning(
+                    "[DIRECT_SELL] submit failed: %s(%s) qty=%s df_empty=%s rt_cd=%s msg_cd=%s msg1=%s",
+                    name,
+                    ticker,
+                    qty,
+                    getattr(df, "empty", True),
+                    rt_cd or "N/A",
+                    msg_cd or "N/A",
+                    msg1 or "N/A",
+                )
         except Exception as e:
             logger.error(f"[DIRECT_SELL] exception: {e}")
         return False
@@ -2054,7 +2088,7 @@ def _run_cycle(rm: RiskManager, *, notify_summary: bool = True) -> None:
                         if ok:
                             logger.info(f"[리스크체크] [{idx}/{len(valid_holdings)}] {ticker} [DIRECT_SELL] ✅ 즉시 매도 주문 제출 성공")
                         else:
-                            logger.warning(f"[리스크체크] [{idx}/{len(valid_holdings)}] {ticker} [DIRECT_SELL] ❌ 주문 제출 실패 (다음 사이클에서 trader.py 처리)")
+                            logger.warning(f"[리스크체크] [{idx}/{len(valid_holdings)}] {ticker} [DIRECT_SELL] ❌ 주문 제출 실패 (다음 리스크 사이클 재시도 / 장중 시간창 내)")
                     else:
                         # direct_sell이 비활성화된 경우에도 로그 출력
                         logger.info(f"[리스크체크] [{idx}/{len(valid_holdings)}] {ticker} 매도 판단되었으나 direct_sell 비활성화 또는 조건 불충족. trader.py에서 처리 필요.")

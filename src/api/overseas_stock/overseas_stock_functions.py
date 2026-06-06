@@ -393,10 +393,30 @@ class OverseasStock:
         is_sell = side in ("01", "1", "sell", "s")
         tr_id = self._parse_order_tr_id(ord_dv, excd)
 
-        # 시장가: 단가 0 (KIS 샘플 기준)
-        unpr_str = "0" if price <= 0 else str(price)
-        if price <= 0 and str(ord_dvsn) not in ("00", "0"):
-            ord_dvsn = "00"
+        if is_sell and price <= 0:
+            logger.error(
+                "해외 매도 거부: OVRS_ORD_UNPR=0 (sym=%s excd=%s ord_dvsn=%s)",
+                symb,
+                excd,
+                ord_dvsn,
+            )
+            return pd.DataFrame()
+
+        if is_sell:
+            unpr_str = str(price)
+            ord_dvsn = str(ord_dvsn or "00")
+            if ord_dvsn not in ("00", "0", "31", "32", "33", "34"):
+                logger.warning(
+                    "해외 매도 ord_dvsn=%s → 00(지정가)로 정규화 (sym=%s)",
+                    ord_dvsn,
+                    symb,
+                )
+                ord_dvsn = "00"
+        else:
+            # 매수: 단가 0 허용(시장가 등)
+            unpr_str = "0" if price <= 0 else str(price)
+            if price <= 0 and str(ord_dvsn) not in ("00", "0"):
+                ord_dvsn = "00"
 
         data = {
             "CANO": self.cano,
@@ -434,4 +454,12 @@ class OverseasStock:
             row.setdefault("msg_cd", body.get("msg_cd", ""))
             row.setdefault("msg1", body.get("msg1", ""))
             return pd.DataFrame([row])
+        logger.warning(
+            "해외 주문 응답 output 없음 %s %s rt_cd=%s msg_cd=%s msg1=%s",
+            excd,
+            symb,
+            body.get("rt_cd"),
+            body.get("msg_cd"),
+            body.get("msg1"),
+        )
         return pd.DataFrame()

@@ -65,6 +65,7 @@ __all__ = [
     "us_ovrs_excg_cd",
     "resolve_us_excd",
     "resolve_us_ovrs_excg",
+    "resolve_us_sell_order_params",
     "set_us_ticker_excd_map",
     "set_us_ticker_ovrs_excg_map",
     "us_regime_benchmark",
@@ -1202,6 +1203,30 @@ def round_to_tick(price: float, mode: str = "nearest") -> int:
         return int(((p + tick - 1) // tick) * tick)
     # nearest
     return int(round(p / tick) * tick)
+
+
+def resolve_us_sell_order_params(
+    current_price: int,
+    *,
+    urgency: str = "normal",
+    slippage_bps: Optional[int] = None,
+) -> Tuple[str, int]:
+    """
+    KIS TTTT1006U(미국 매도) 유효 조합: ORD_DVSN=00(지정가) + OVRS_ORD_UNPR>0.
+    urgent(EmergencyDrop/StopLoss): 슬리피지 100bps, normal: 30bps.
+    """
+    px = int(current_price or 0)
+    if px <= 0:
+        raise ValueError(f"US sell requires current_price > 0, got {current_price!r}")
+    if slippage_bps is None:
+        slippage_bps = 100 if str(urgency).lower() == "urgent" else 30
+    slippage_factor = 1.0 - (float(slippage_bps) / 10000.0)
+    target_price = px * slippage_factor
+    sell_price = round_to_tick(target_price, mode="down")
+    if sell_price <= 0:
+        sell_price = max(1, px)
+    return "00", sell_price
+
 
 # ────────────────────────────────
 def convert_screener_data_to_trader_format(screener_data: Dict) -> Dict:
