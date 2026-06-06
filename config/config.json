@@ -42,12 +42,12 @@
     "exclude_consecutive_up_days": 4,
     // 최소 종합 점수 (0~1). 미만 종목 탈락. GPT initial_filter·rebalance와 동기화 권장
     "min_score_threshold": 0.48,
-    // true: 단기 모멘텀 음수 종목 제외 (보수적)
-    "require_positive_momentum": true,
+    // false: 단기 모멘텀 음수 종목도 후보 포함
+    "require_positive_momentum": false,
     // true: 변동성 과다 종목 제외
     "exclude_high_volatility": true,
-    // 변동성 상한 (0~1, 0.75=75%). exclude_high_volatility=true 일 때 적용
-    "volatility_threshold": 0.75,
+    // 변동성 상한 (0~1, 0.90=90%). exclude_high_volatility=true 일 때 적용
+    "volatility_threshold": 0.90,
     // OHLCV 최소 봉 수 (지표 계산용)
     "min_history_bars": 50,
     // true: 잔고 대비 매수 불가 종목 후보에서 제외
