@@ -2591,6 +2591,7 @@ def run_screener(
     workers: int,
     debug: bool,
     pipeline_session: Optional[str] = None,
+    force: bool = False,
 ):
     global _KIS_INSTANCE, _KIS_RATE_LIMITER, _KIS_MAX_CONCURRENCY, _CURRENT_MARKET_STATE
     sess = (pipeline_session or os.getenv("PIPELINE_SESSION", "")).lower().strip()
@@ -2621,11 +2622,13 @@ def run_screener(
 
     ensure_output_dir()
 
-    if not is_market_open_day(market=market):
+    if not force and not is_market_open_day(market=market):
         msg = f"휴장일이므로 screener를 건너뜁니다. (market={market})"
         logger.info(msg)
         _notify(f"ℹ️ {msg}", key="screener_holiday", cooldown_sec=600)
         return
+    if force and not is_market_open_day(market=market):
+        logger.warning("⚠️ --force: 휴장일 검사를 건너뛰고 스크리너를 실행합니다. (market=%s)", market)
 
     # 오늘 개장일 여부(로그용)
     try:
@@ -3243,6 +3246,11 @@ def parse_args():
     parser.add_argument("--config", help="추가/오버레이할 config.json 파일 경로")
     parser.add_argument("--workers", type=int, default=int(os.getenv("WORKERS", "4")))
     parser.add_argument("--debug", action="store_true")
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="휴장일/주말에도 실행 (로컬 테스트용)",
+    )
     return parser.parse_args()
 
 if __name__ == "__main__":
@@ -3257,6 +3265,7 @@ if __name__ == "__main__":
             max(1, min(args.workers, MAX_WORKERS_HARD_CAP)),
             args.debug,
             pipeline_session=args.session,
+            force=args.force,
         )
     except Exception as e:
         logger.critical("스크리너 치명적 오류: %s", e, exc_info=True)
