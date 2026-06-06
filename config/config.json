@@ -45,7 +45,7 @@
     // false: 단기 모멘텀 음수 종목도 후보 포함
     "require_positive_momentum": false,
     // true: 변동성 과다 종목 제외
-    "exclude_high_volatility": true,
+    "exclude_high_volatility": false,
     // 변동성 상한 (0~1, 0.90=90%). exclude_high_volatility=true 일 때 적용
     "volatility_threshold": 0.90,
     // OHLCV 최소 봉 수 (지표 계산용)
