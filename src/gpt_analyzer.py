@@ -260,7 +260,7 @@ INITIAL_FILTER_PROMPT_TMPL = (
     "{news_text}\n\n"
     "**판단 기준:**\n"
     "1. 뉴스가 명백히 부정적(스캔들, 소송, 실적 악화)이면 '보류' 권장\n"
-    "2. 정량적 점수가 매우 낮으면(60 미만) 뉴스에 강력한 촉매가 없으면 회의적 접근\n"
+    "2. 정량적 점수가 {min_score_pass:.2f} 미만(0–1 스케일)이면 뉴스에 강력한 촉매가 없으면 '보류' 권장\n"
     "3. 좋은 점수와 긍정적 뉴스의 조합을 찾아라\n"
     "4. 한국 시장 특성(기관 매매, 외국인 자금 흐름) 고려\n\n"
     "**--- 필수 JSON 출력 (한국어) ---**\n"
@@ -273,12 +273,12 @@ INITIAL_FILTER_PROMPT_US_TMPL = (
     "Respond with a single valid JSON object only.\n\n"
     "**Input:**\n"
     "- Symbol / Name: {name}\n"
-    "- Quantitative score: {score:.3f} (higher is better; typical buy threshold ≥ 0.52)\n"
+    "- Quantitative score: {score:.3f} (0.0–1.0 scale; config min_score_pass = {min_score_pass:.2f})\n"
     "- Recent news summary (max 1500 chars):\n{news_text}\n\n"
     "**US market rules:**\n"
     "1. Clearly negative news (fraud, major lawsuit, guidance cut, SEC issues) → recommend hold (보류)\n"
-    "2. Score < 0.55 without a strong positive catalyst → skeptical / hold\n"
-    "3. Prefer combination of solid score and constructive news (earnings beat, product catalyst, analyst upgrade)\n"
+    "2. Score < {min_score_pass:.2f} without a strong positive catalyst → hold (보류)\n"
+    "3. Score ≥ {min_score_pass:.2f} with neutral or constructive news → lean toward proceed (매수 고려) unless rule 1 applies\n"
     "4. Consider US context: mega-cap liquidity, after-hours headline risk, sector rotation (tech-heavy index)\n"
     "5. Do NOT cite Korean-market flows (foreigner/institution net buy on KRX)\n\n"
     '**JSON (Korean keys, reason may be Korean or English):** '
@@ -716,13 +716,30 @@ def _apply_strategy_weights(selected: str, c: Dict, market_trend: str, weights: 
     scored = {k: ctx.get(k, 0.0) * float(weights.get(k, 0.5)) for k in ctx.keys()}
     return max(scored.items(), key=lambda kv: (kv[1], 1.0 if kv[0] == selected else 0.0))[0]
 
+def _initial_filter_thresholds() -> Dict[str, float]:
+    """config.json gpt_params.initial_filter 최신값 (프롬프트·하드컷 동기화)."""
+    cfg = load_config() or _config
+    ic = (cfg.get("gpt_params") or {}).get("initial_filter") or {}
+    return {
+        "min_score_pass": float(ic.get("min_score_pass", _IF_MIN_SCORE_PASS)),
+        "min_score_no_news": float(ic.get("min_score_no_news", _IF_MIN_SCORE_NO_NEWS)),
+        "heuristic_min_score": float(ic.get("heuristic_min_score", _IF_HEURISTIC_MIN_SCORE)),
+    }
+
+
 def _initial_filter_gpt(
     name: str, score: float, news_text: str, market: Optional[str] = None
 ) -> Optional[dict]:
     mkt = _market_env(market)
     sys = _gpt_system_initial(mkt)
     tmpl = INITIAL_FILTER_PROMPT_US_TMPL if is_us_market(mkt) else INITIAL_FILTER_PROMPT_TMPL
-    user = tmpl.format(name=name, score=score, news_text=news_text[:1500])
+    thr = _initial_filter_thresholds()
+    user = tmpl.format(
+        name=name,
+        score=score,
+        news_text=news_text[:1500],
+        min_score_pass=thr["min_score_pass"],
+    )
     return _call_openai_json(sys, user)
 
 def _build_budget_guard_block(
@@ -1125,10 +1142,20 @@ def analyze_candidates_and_create_plans(
         else:
             news_text = (raw_news or "")[:1500]
 
-        # 1차 필터링: 기본 조건 체크
+        # 1차 필터링: config 하드컷 + (선택) GPT 초기 스크리닝
+        thr = _initial_filter_thresholds()
+        min_pass = thr["min_score_pass"]
+        min_no_news = thr["min_score_no_news"]
+        heuristic_min = thr["heuristic_min_score"]
+
         passed = True
+        if score < min_pass:
+            passed = False
+            logger.debug(
+                f"[Initial] {name}({ticker}) → score<{min_pass:.2f} hard cut (Score={score:.3f})"
+            )
         if news_status == "NO_NEWS":
-            if score < _IF_MIN_SCORE_NO_NEWS:
+            if score < min_no_news:
                 passed = False
             logger.debug(f"[Initial] {name}({ticker}) → NO_NEWS 플래그 감지(Score={score:.3f})")
 
@@ -1142,14 +1169,17 @@ def analyze_candidates_and_create_plans(
             except Exception as e:
                 logger.warning(f"GPT 초기 필터링 실패 {name}({ticker}): {e}")
                 # GPT 실패 시 휴리스틱으로 폴백
-                if score < _IF_HEURISTIC_MIN_SCORE and len(news_text) < _IF_MIN_NEWS_CHARS:
+                if score < heuristic_min and len(news_text) < _IF_MIN_NEWS_CHARS:
                     passed = False
         else:
             # 휴리스틱 필터링
-            if score < _IF_HEURISTIC_MIN_SCORE and len(news_text) < _IF_MIN_NEWS_CHARS:
+            if score < heuristic_min and len(news_text) < _IF_MIN_NEWS_CHARS:
                 passed = False
 
         if not passed:
+            logger.info(
+                f"[Initial] {name}({ticker}) 1차 필터 탈락 (Score={score:.3f}, min_pass={min_pass:.2f})"
+            )
             continue
 
         # 전술적 계획 생성
