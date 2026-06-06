@@ -276,6 +276,13 @@ class Trader:
         self.rebuy_rsi_ceiling = float(self.trading_params.get("rebuy_rsi_ceiling", 100.0))
         self.min_cash_reserve = int(self.trading_params.get("min_cash_reserve", 0))
         self.cash_buffer_ratio = float(self.trading_params.get("cash_buffer_ratio", 0.0))
+        _ps = self.trading_params.get("position_sizing") or {}
+        self.position_sizing_mode = str(_ps.get("mode", "equal_slots"))
+        _max_sh = _ps.get("max_shares_per_order")
+        self.position_sizing_max_shares = (
+            int(_max_sh) if _max_sh is not None else None
+        )
+        self.position_sizing_reserve_final = bool(_ps.get("reserve_final_cash", True))
 
         # ⬇️ 신규 주입 파라미터
         self.fee_buffer_pct = float(self.trading_params.get("fee_buffer_pct", 0.0))
@@ -447,6 +454,75 @@ class Trader:
         tb = float(self.trading_params.get("cash_buffer_ratio", 0.0))
         sb = float(self.screener_params.get("affordability_buffer", 0.0))
         return max(tb, sb)
+
+    def _sizing_mode_for_batch(self, batch_name: str) -> str:
+        """신규 매수만 rank_cascade; REBUY·회전 매수는 equal_slots."""
+        if batch_name in ("REBUY", "REBALANCE_NEW"):
+            return "equal_slots"
+        return self.position_sizing_mode
+
+    def _compute_buy_budget(
+        self,
+        remaining_cash: int,
+        *,
+        mode: str,
+        slots_left: int = 1,
+        effective_slots: int = 1,
+        reserve_on_this_step: bool = False,
+    ) -> Tuple[int, Dict[str, Any]]:
+        """
+        매수 1종목에 배정할 예산(budget) 계산.
+        rank_cascade: remaining 전액(×per_ticker_max_weight) 연쇄 / equal_slots: 균등 분배.
+        """
+        buffer = self._eff_buffer()
+        reserve = self.min_cash_reserve if reserve_on_this_step else 0
+        deployable = max(0, int(remaining_cash) - reserve)
+        max_allowed = int(deployable * self.per_ticker_max_weight)
+
+        if mode == "rank_cascade":
+            slot_cash = max_allowed
+            equal_share = deployable
+        else:
+            slot_cap = max(1, min(slots_left, effective_slots) if effective_slots > 0 else slots_left)
+            equal_share = deployable // slot_cap
+            slot_cash = min(equal_share, max_allowed)
+
+        budget = int(slot_cash * (1 - buffer))
+        if self.trading_guards.get("enforce_per_ticker_limit", False):
+            budget = min(budget, max_allowed)
+
+        meta = {
+            "mode": mode,
+            "deployable": deployable,
+            "max_allowed": max_allowed,
+            "equal_share": equal_share,
+            "reserve_applied": reserve,
+            "buffer": buffer,
+        }
+        return budget, meta
+
+    def _cap_qty_by_max_shares(self, quantity: int) -> int:
+        cap = self.position_sizing_max_shares
+        if cap is None or cap <= 0:
+            return quantity
+        return min(quantity, cap)
+
+    def _log_position_sizing(
+        self,
+        name: str,
+        ticker: str,
+        budget: int,
+        meta: Dict[str, Any],
+        *,
+        prefix: str = "POSITION_SIZING",
+    ) -> None:
+        logger.info(f"  -> [{name}({ticker})] 배분 예산: {self._money(budget)}")
+        logger.info(
+            f"      [{prefix}] mode={meta.get('mode')} deployable={self._money(meta.get('deployable', 0))} "
+            f"max_allowed={self._money(meta.get('max_allowed', 0))} "
+            f"equal_share={self._money(meta.get('equal_share', 0))} "
+            f"reserve={self._money(meta.get('reserve_applied', 0))}"
+        )
 
     # ── 스크리너 전체 데이터 로드 ──────────────────────────────────────
     def _load_all_stock_data(self) -> Dict[str, Dict]:
@@ -3622,6 +3698,53 @@ class Trader:
         
         return filtered_candidates
 
+    def _plan_gpt_rank(self, plan: Dict, gpt_decisions: Optional[Dict] = None) -> int:
+        """gpt_trades plan 또는 gpt_decisions 캐시에서 rank(낮을수록 우선)를 반환."""
+        raw = plan.get("rank")
+        if raw is not None:
+            try:
+                return int(raw)
+            except (TypeError, ValueError):
+                pass
+        if gpt_decisions:
+            ticker = self._t((plan.get("stock_info") or {}).get("Ticker", ""))
+            info = gpt_decisions.get(ticker) or {}
+            try:
+                return int(info.get("rank", 999))
+            except (TypeError, ValueError):
+                pass
+        return 999
+
+    def _sort_buy_plans_by_gpt_rank(
+        self,
+        plans: List[Dict],
+        gpt_decisions: Optional[Dict] = None,
+    ) -> List[Dict]:
+        """GPT rank 오름차순(1→2→…)으로 매수 큐 정렬. 동률 rank는 Score 내림차순."""
+        if not plans:
+            return plans
+        if gpt_decisions:
+            for plan in plans:
+                if plan.get("rank") is None:
+                    ticker = self._t((plan.get("stock_info") or {}).get("Ticker", ""))
+                    if ticker in gpt_decisions:
+                        plan["rank"] = gpt_decisions[ticker].get("rank", 999)
+
+        ordered = sorted(
+            plans,
+            key=lambda p: (
+                self._plan_gpt_rank(p, gpt_decisions),
+                -float((p.get("stock_info") or {}).get("Score", 0.0)),
+            ),
+        )
+        summary = ", ".join(
+            f"#{self._plan_gpt_rank(p, gpt_decisions)} "
+            f"{(p.get('stock_info') or {}).get('Ticker', '?')}"
+            for p in ordered
+        )
+        logger.info(f"[BuyOrder] GPT rank 순 매수 큐: {summary}")
+        return ordered
+
     def _log_analysis_step(self, message: str):
         """분석 과정 로깅"""
         if self.integrated_analysis.get("enhanced_logging", False):
@@ -3818,10 +3941,15 @@ class Trader:
                         logger.debug(f"[DEBUG] GPT 분석 없음: {ticker} - 내부점수만 사용 (점수: {plan['integrated_score']:.3f})")
                         enhanced_buy_plans.append(plan)
                 
-                # 통합 점수 기준으로 정렬
-                enhanced_buy_plans.sort(key=lambda x: x.get("integrated_score", 0.0), reverse=True)
+                # 통합 점수는 로깅용; 매수 순서는 GPT rank 기준
+                enhanced_buy_plans.sort(
+                    key=lambda x: (
+                        self._plan_gpt_rank(x, gpt_decisions),
+                        -float(x.get("integrated_score", 0.0)),
+                    ),
+                )
                 to_buy_plans = enhanced_buy_plans
-                logger.debug(f"[DEBUG] GPT 분석 반영 완료 - 정렬된 매수계획: {len(to_buy_plans)}건")
+                logger.debug(f"[DEBUG] GPT rank 순 매수계획: {len(to_buy_plans)}건")
             else:
                 logger.debug(f"[DEBUG] GPT 분석 결과 없음 - 내부 점수만 사용")
             
@@ -3832,6 +3960,8 @@ class Trader:
             filtered_count = original_count - len(to_buy_plans)
             if filtered_count > 0:
                 logger.debug(f"[DEBUG] GPT 보류 결정으로 {filtered_count}건 제외")
+
+        to_buy_plans = self._sort_buy_plans_by_gpt_rank(to_buy_plans, gpt_decisions)
         
         self._log_analysis_step(f"리밸런싱 후보 선정 완료: 매도 {len(to_sell_list)}건, 매수 {len(to_buy_plans)}건")
         logger.debug(f"[DEBUG] 최종 리밸런싱 결과 - 매도: {len(to_sell_list)}건, 매수: {len(to_buy_plans)}건")
@@ -4123,6 +4253,7 @@ class Trader:
                 trade_plans = []
             
             buy_plans = [p for p in trade_plans if p.get("결정") == "매수"]
+            buy_plans = self._sort_buy_plans_by_gpt_rank(buy_plans)
             # 추천 집계
             self.recomm_stats["buy"] += len(buy_plans)
             # 안전 디폴트 주입
@@ -4209,7 +4340,10 @@ class Trader:
 
             _notify_text(f" {batch_name} 매수 시도 {len(plans)}종목 (예산 {self._money(remaining_cash)})",
                          key=f"phase:{batch_name.lower()}_start:{self.run_id}", cooldown=120)
-            logger.info(f"총 {len(plans)}개 종목 {batch_name} 매수 시도. 유동적 예산 배분 + 버퍼 적용.")
+            logger.info(
+                f"총 {len(plans)}개 종목 {batch_name} 매수 시도 "
+                f"(sizing={self._sizing_mode_for_batch(batch_name)}, 예산 {self._money(remaining_cash)})."
+            )
 
             for i, plan in enumerate(plans):
                 info = plan.get("stock_info", {})
@@ -4217,6 +4351,8 @@ class Trader:
                     info.setdefault(k, dv)
                 ticker, name = self._t(info.get("Ticker", "")), info.get("Name", "N/A")
                 slots_left = len(plans) - i
+                is_last = i >= len(plans) - 1
+                sizing_mode = self._sizing_mode_for_batch(batch_name)
 
                 # 중복 주문 방지 체크
                 if not self._prevent_duplicate_orders(ticker, batch_name):
@@ -4227,24 +4363,21 @@ class Trader:
                 if self.trading_guards.get("auto_shrink_slots", False):
                     effective_slots = self._compute_effective_slots(remaining_cash)
 
-                # 개선된 포지션 사이징 로직
-                # 1. 종목당 최대 투입 가능 금액 계산 (per_ticker_max_weight 적용)
-                max_allowed_per_stock = int(remaining_cash * self.per_ticker_max_weight)
-                
-                # 2. 균등 분배 계산
-                equal_share = remaining_cash // max(1, slots_left if effective_slots <= 0 else min(slots_left, effective_slots))
-                
-                # 3. 최대 제한과 균등 분배 중 작은 값 선택
-                slot_cash = min(equal_share, max_allowed_per_stock)
-                budget_for_this_stock = int(slot_cash * (1 - buffer))
-                
-                # 4. 리스크 가드 적용 (enforce_per_ticker_limit)
-                if self.trading_guards.get("enforce_per_ticker_limit", False):
-                    budget_for_this_stock = min(budget_for_this_stock, max_allowed_per_stock)
-                logger.info(f"  -> [{i+1}/{len(plans)}] {name}({ticker}) 배분 예산: {self._money(budget_for_this_stock)}")
-                logger.info(
-                    f"      [POSITION_SIZING] max_allowed={self._money(max_allowed_per_stock)}, "
-                    f"equal_share={self._money(equal_share)}, final_budget={self._money(budget_for_this_stock)}"
+                budget_for_this_stock, sizing_meta = self._compute_buy_budget(
+                    remaining_cash,
+                    mode=sizing_mode,
+                    slots_left=slots_left,
+                    effective_slots=effective_slots,
+                    reserve_on_this_step=(
+                        is_last
+                        and sizing_mode == "rank_cascade"
+                        and self.position_sizing_reserve_final
+                    ),
+                )
+                logger.info(f"  -> [{i+1}/{len(plans)}] {name}({ticker}) rank={plan.get('rank', '?')}")
+                self._log_position_sizing(
+                    name, ticker, budget_for_this_stock, sizing_meta,
+                    prefix="CASCADE" if sizing_mode == "rank_cascade" else "POSITION_SIZING",
                 )
 
                 # 실시간 현재가 및 호가 정보 조회
@@ -4268,6 +4401,7 @@ class Trader:
                 effective_budget = int(budget_for_this_stock * (1 - max(0.0, self.fee_buffer_pct)))
                 quantity = int(effective_budget // current_price)  # 임시 수량으로 동적 지정가 계산
                 quantity = self._cap_qty_by_fee_buffer(quantity, current_price, budget_for_this_stock)
+                quantity = self._cap_qty_by_max_shares(quantity)
 
                 # 동적 지정가 계산
                 order_price = self._calculate_dynamic_order_price(current_price, bid_price, ask_price, quantity)
@@ -4278,6 +4412,7 @@ class Trader:
                 # 최종 수량 재계산 (동적 지정가 기준)
                 quantity = int(effective_budget // order_price)
                 quantity = self._cap_qty_by_fee_buffer(quantity, order_price, budget_for_this_stock)
+                quantity = self._cap_qty_by_max_shares(quantity)
 
                 # 최소 주문 금액은 **수량×가격**으로 판정
                 if quantity == 0 or (self.min_order_cash > 0 and (quantity * order_price) < self.min_order_cash):
@@ -4692,7 +4827,9 @@ class Trader:
 
                     logger.info(f"[SWAP-AFTER] new_cash={self._money(new_cash)}, eff_slots_now={eff_now}, slots_now={slots_now}")
                     if slots_now > 0:
-                        buy_now = to_buy_plans[:slots_now]
+                        buy_now = self._sort_buy_plans_by_gpt_rank(
+                            to_buy_plans, gpt_decisions
+                        )[:slots_now]
                         logger.info(f"회전 매매 매수 시작: {len(buy_now)}개 종목 (슬롯: {slots_now}개)")
                         
                         # 매수 대상 상세 로깅
@@ -4740,7 +4877,10 @@ class Trader:
         if not targets:
             return
             
-        logger.info(f"순차적 매수 시작: {len(targets)}개 종목, 예산: {self._money(available_cash)}")
+        logger.info(
+            f"순차적 매수 시작: {len(targets)}개 종목, 예산: {self._money(available_cash)}, "
+            f"sizing={self.position_sizing_mode}"
+        )
         
         # 병렬로 모든 종목의 가격 정보 미리 조회
         logger.info("병렬 가격 조회 시작...")
@@ -4786,28 +4926,31 @@ class Trader:
                 for k, dv in SCHEMA_DEFAULTS.items():
                     info.setdefault(k, dv)
                 ticker, name = self._t(info.get("Ticker", "")), info.get("Name", "N/A")
-                
-                # 개선된 포지션 사이징 로직 (회전 매매용)
                 slots_left = len(round_targets) - i
-                
-                # 1. 종목당 최대 투입 가능 금액 계산 (per_ticker_max_weight 적용)
-                max_allowed_per_stock = int(remaining_cash * self.per_ticker_max_weight)
-                
-                # 2. 균등 분배 계산
-                equal_share = remaining_cash // max(1, slots_left)
-                
-                # 3. 최대 제한과 균등 분배 중 작은 값 선택
-                slot_cash = min(equal_share, max_allowed_per_stock)
-                budget_for_this_stock = int(slot_cash * 0.95)  # 5% 버퍼
-                
-                # 4. 리스크 가드 적용
-                if self.trading_guards.get("enforce_per_ticker_limit", False):
-                    budget_for_this_stock = min(budget_for_this_stock, max_allowed_per_stock)
-                
-                logger.info(f"  -> [{i+1}/{len(round_targets)}] {name}({ticker}) 배분 예산: {self._money(budget_for_this_stock)}")
+                is_last = i >= len(round_targets) - 1
+                eff_slots = (
+                    self._compute_effective_slots(remaining_cash)
+                    if self.trading_guards.get("auto_shrink_slots", False)
+                    else self.max_positions
+                )
+                budget_for_this_stock, sizing_meta = self._compute_buy_budget(
+                    remaining_cash,
+                    mode=self.position_sizing_mode,
+                    slots_left=slots_left,
+                    effective_slots=eff_slots,
+                    reserve_on_this_step=(
+                        is_last
+                        and self.position_sizing_mode == "rank_cascade"
+                        and self.position_sizing_reserve_final
+                    ),
+                )
                 logger.info(
-                    f"      [ROTATION_SIZING] max_allowed={self._money(max_allowed_per_stock)}, "
-                    f"equal_share={self._money(equal_share)}, final_budget={self._money(budget_for_this_stock)}"
+                    f"  -> [{i+1}/{len(round_targets)}] {name}({ticker}) "
+                    f"rank={plan.get('rank', '?')} remaining={self._money(remaining_cash)}"
+                )
+                self._log_position_sizing(
+                    name, ticker, budget_for_this_stock, sizing_meta,
+                    prefix="CASCADE" if self.position_sizing_mode == "rank_cascade" else "POSITION_SIZING",
                 )
                 
                 # 매수 시도
@@ -4865,6 +5008,7 @@ class Trader:
             effective_budget = int(budget * (1 - max(0.0, self.fee_buffer_pct)))
             quantity = int(effective_budget // current_price)
             quantity = self._cap_qty_by_fee_buffer(quantity, current_price, budget)
+            quantity = self._cap_qty_by_max_shares(quantity)
             
             # 수량이 0이면 최소 주문 금액을 고려하여 재시도
             if quantity <= 0:
@@ -4886,6 +5030,7 @@ class Trader:
             # 최종 수량 재계산
             quantity = int(effective_budget // order_price)
             quantity = self._cap_qty_by_fee_buffer(quantity, order_price, budget)
+            quantity = self._cap_qty_by_max_shares(quantity)
             
             if quantity <= 0 or (self.min_order_cash > 0 and (quantity * order_price) < self.min_order_cash):
                 logger.warning(f"  -> [{name}({ticker})] 최소 주문 금액 미충족")

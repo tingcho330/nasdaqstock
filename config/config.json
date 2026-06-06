@@ -102,7 +102,7 @@
   "gpt_params": {
     "openai_model": "gpt-4o-mini",
     "budget_guard": true,            // 잔고 대비 과매수 방지
-    "max_entry_price_ratio": 0.2,    // 1종목 최대 진입 비중
+    "max_entry_price_ratio": 0.95,   // 1종목 최대 진입 비중 (trading_params.per_ticker_max_weight 와 동기화)
     "initial_filter": {
       "min_score_pass": 0.48,
       "min_score_no_news": 0.48,     // 뉴스 없을 때 최소 점수
@@ -174,7 +174,12 @@
     "max_legs_per_ticker": 1,
     "post_partial_sell_buy_cooldown_days": 5,
     "partial_sell_flag_ttl_days": 7,
-    "per_ticker_max_weight": 0.33,   // 종목당 최대 비중
+    "per_ticker_max_weight": 0.95,   // 종목당 최대 비중 (gpt_params.max_entry_price_ratio 와 동기화)
+    "position_sizing": {
+      "mode": "rank_cascade",          // rank_cascade: GPT rank 순 잔액 연쇄 | equal_slots: 균등 분배
+      "max_shares_per_order": null,    // null=무제한(예산 내 최대 주수), 정수=종목당 상한
+      "reserve_final_cash": true       // 마지막 rank 매수 시 min_cash_reserve 유지
+    },
     "min_holding_hours": 72,         // 최소 보유 시간
     "min_order_cash": 100,           // 최소 주문 금액 (USD)
     "rebuy_atr_k": 0.5,
