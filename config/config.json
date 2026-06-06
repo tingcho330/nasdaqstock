@@ -1,84 +1,113 @@
 {
+  // ── 공통 ──────────────────────────────────────────────────────────
+  // KIS API 환경: "prod"(실전) | "mock"(모의). config/.env 의 KIS_* 키와 함께 사용
   "trading_environment": "prod",
+
+  // KIS Open API 호출 제한 (초당 요청·동시 연결). SP500 스크리너는 2/2 권장
   "kis_limits": {
-    "max_rps": 2,
-    "max_concurrency": 2
+    "max_rps": 2,           // 초당 최대 요청 수
+    "max_concurrency": 2    // 동시 API 호출 상한
   },
+
+  // ── 스크리너 (screener.py) ────────────────────────────────────────
   "screener_params": {
+    // [KR] 최소 시가총액(원). KOSPI/KOSDAQ 1차 필터
     "min_market_cap": 50000000000,
+    // [US] 최소 시가총액(USD). 마스터 미제공 시 스킵될 수 있음
     "min_market_cap_us": 5000000000,
+    // [KR] 최대 시가총액(원)
     "max_market_cap": 50000000000000,
+    // [US] 최대 시가총액(USD)
     "max_market_cap_us": 5000000000000,
+    // [KR] 5일 평균 거래대금 하한(원)
     "min_trading_value_5d_avg": 100000000000,
+    // [US] 5일 평균 거래대금 하한(USD). 5B=50억달러
     "min_trading_value_5d_avg_us": 5000000000,
+    // 최종 후보 상위 N종 (섹터 다양화 전)
     "top_n": 8,
-    "fin_weight": 0.25,
-    "tech_weight": 0.35,
-    "mkt_weight": 0.1,
-    "sector_weight": 0.1,
+    // 종합 점수 가중치 (합≈1.0)
+    "fin_weight": 0.25,       // 재무(PER/PBR 등)
+    "tech_weight": 0.35,      // 기술(RSI/MA/패턴)
+    "mkt_weight": 0.1,        // 시장 레짐
+    "sector_weight": 0.1,     // 섹터 트렌드
+    "vol_kki_weight": 0.05,   // 거래량 KKI
+    "pos_52w_weight": 0.05,   // 52주 고점 대비 위치
+    // 동일 섹터 비중 상한 (0~1)
     "sector_cap": 0.35,
+    // 섹터 정보 소스 우선순위. SP500: ["kis","mst"] 권장
     "sector_source_priority": ["kis", "mst"],
-    "vol_kki_weight": 0.05,
-    "pos_52w_weight": 0.05,
+    // 신규 상장 제외 일수
     "exclude_newly_listed_days": 20,
+    // 연속 상승일 N일 초과 종목 제외
     "exclude_consecutive_up_days": 4,
-    "min_score_threshold": 0.52,
+    // 최소 종합 점수 (0~1). 미만 종목 탈락. GPT initial_filter·rebalance와 동기화 권장
+    "min_score_threshold": 0.48,
+    // true: 단기 모멘텀 음수 종목 제외 (보수적)
     "require_positive_momentum": true,
+    // true: 변동성 과다 종목 제외
     "exclude_high_volatility": true,
+    // 변동성 상한 (0~1, 0.75=75%). exclude_high_volatility=true 일 때 적용
     "volatility_threshold": 0.75,
+    // OHLCV 최소 봉 수 (지표 계산용)
     "min_history_bars": 50,
+    // true: 잔고 대비 매수 불가 종목 후보에서 제외
     "affordability_filter": true,
+    // 매수 가능 금액 버퍼 (0.05=5% 여유)
     "affordability_buffer": 0.05
   },
+
+  // ── 리스크 관리 (risk_manager.py / background_risk_manager) ───────
   "risk_params": {
-    "max_positions": 8,
-    "cooldown_period_days": 20,
-    "atr_period": 14,
-    "atr_k_stop": 2.0,
-    "reward_risk": 3.0,
-    "max_daily_loss_pct": 0.02,
-    "max_daily_loss_amount": 5000,
-    "stop_trading_on_consecutive_losses": 2,
-    "stop_pct": 0.03,
-    "cooldown_fail_threshold": 2,
-    "strategy_mode": "hybrid",
+    "max_positions": 8,              // 최대 보유 종목 수
+    "cooldown_period_days": 20,      // 매도 후 동일 종목 재매수 쿨다운(일)
+    "atr_period": 14,                // ATR 계산 기간
+    "atr_k_stop": 2.0,               // ATR 배수 손절
+    "reward_risk": 3.0,              // 익절:손절 비율
+    "max_daily_loss_pct": 0.02,      // 일일 최대 손실률 (계좌 대비)
+    "max_daily_loss_amount": 5000,   // 일일 최대 손실 금액 (USD/KRW)
+    "stop_trading_on_consecutive_losses": 2,  // 연속 손실 N회 시 당일 매매 중단
+    "stop_pct": 0.03,                // 고정 % 손절 (전략 보조)
+    "cooldown_fail_threshold": 2,    // API 실패 N회 시 쿨다운
+    "strategy_mode": "hybrid",       // hybrid | conservative | aggressive
     "enable_advanced_strategies": true,
     "auto_sell": {
       "enabled": true,
-      "stop_loss_pct": 0.045,
-      "target_pct": 0.07,
-      "partial_profit_pct": 0.025,
-      "partial_profit_ratio": 0.5,
-      "emergency_drop_pct": 0.03,
-      "direct_execute": true,
-      "cooldown_sec_per_ticker": 20
+      "stop_loss_pct": 0.045,        // 자동 손절 %
+      "target_pct": 0.07,            // 목표 익절 %
+      "partial_profit_pct": 0.025,   // 부분 익절 트리거 %
+      "partial_profit_ratio": 0.5,   // 부분 익절 비율
+      "emergency_drop_pct": 0.03,    // 급락 시 즉시 매도 %
+      "direct_execute": true,        // true: risk_manager가 직접 주문
+      "cooldown_sec_per_ticker": 20  // 종목별 재매도 방지(초)
     },
-    "rsi_take_profit": 82.0,
-    "prev_close_break_sell": false,
-    "rsi_min_profit_pct": 0.012,
-    "rsi_take_profit_early": 85.0,
+    "rsi_take_profit": 82.0,         // RSI 과열 익절 기준
+    "prev_close_break_sell": false,  // 전일 종가 이탈 시 매도
+    "rsi_min_profit_pct": 0.012,     // RSI 익절 최소 수익률
+    "rsi_take_profit_early": 85.0,   // 조기 RSI 익절
     "rsi_sell_strategy": {
       "enabled": false,
       "warning_level": 75.0,
       "sell_candidate_level": 80.0,
       "full_exit_level": 70.0,
       "confirm_conditions_required": 2,
-      "mode": "partial",
+      "mode": "partial",             // partial | full
       "partial_ratio": 0.3,
       "check_divergence": true,
       "check_trend_weakening": true,
       "check_volume_weakening": true
     }
   },
+
+  // ── GPT 분석 (gpt_analyzer.py) ────────────────────────────────────
   "gpt_params": {
     "openai_model": "gpt-4o-mini",
-    "budget_guard": true,
-    "max_entry_price_ratio": 0.2,
+    "budget_guard": true,            // 잔고 대비 과매수 방지
+    "max_entry_price_ratio": 0.2,    // 1종목 최대 진입 비중
     "initial_filter": {
-      "min_score_pass": 0.52,
-      "min_score_no_news": 0.52,
-      "heuristic_min_score": 0.52,
-      "min_news_chars": 200
+      "min_score_pass": 0.48,
+      "min_score_no_news": 0.48,     // 뉴스 없을 때 최소 점수
+      "heuristic_min_score": 0.48,
+      "min_news_chars": 200          // 뉴스 본문 최소 글자 수
     },
     "analysis_expansion": {
       "enabled": true,
@@ -86,6 +115,8 @@
       "max_total_analysis": 15
     }
   },
+
+  // ── 매매 전략 (strategies.py) ─────────────────────────────────────
   "strategy_params": {
     "stop_loss_pct": 0.03,
     "take_profit_pct": 0.06,
@@ -100,10 +131,12 @@
     },
     "sell_threshold": 1.0
   },
+
+  // ── US 시장 레짐 (SP500 / SPX 지수) ───────────────────────────────
   "us_market_regime": {
-    "source": "index",
-    "index_market_code": "N",
-    "index_symbol": "SPX",
+    "source": "index",               // index | etf
+    "index_market_code": "N",        // KIS 지수 시장코드 (N=NYSE)
+    "index_symbol": "SPX",           // S&P 500 지수
     "lookback_calendar_days": 500,
     "min_bars": 200,
     "etf_fallback": {
@@ -112,23 +145,28 @@
       "excd": "AMS"
     }
   },
+
+  // ── 시장별 운영 시간 (KST) ─────────────────────────────────────────
   "market_hours": {
     "SP500": {
+      // risk_manager 폴링 허용 구간 (미국 정규장 대응)
       "risk_poll_windows": ["22:30-05:00"]
     }
   },
+
+  // ── 매매 실행 (trader.py) ─────────────────────────────────────────
   "trading_params": {
     "buy_enabled": true,
-    "allow_rebuy": false,
+    "allow_rebuy": false,            // 동일 종목 추가 매수
     "max_legs_per_ticker": 1,
     "post_partial_sell_buy_cooldown_days": 5,
     "partial_sell_flag_ttl_days": 7,
-    "per_ticker_max_weight": 0.33,
-    "min_holding_hours": 72,
-    "min_order_cash": 100,
+    "per_ticker_max_weight": 0.33,   // 종목당 최대 비중
+    "min_holding_hours": 72,         // 최소 보유 시간
+    "min_order_cash": 100,           // 최소 주문 금액 (USD)
     "rebuy_atr_k": 0.5,
     "rebuy_rsi_ceiling": 72.0,
-    "cash_buffer_ratio": 0.02,
+    "cash_buffer_ratio": 0.02,       // 현금 유지 비율
     "min_cash_reserve": 100,
     "dynamic_cash_management": {
       "enabled": false,
@@ -141,6 +179,7 @@
       "volatility_threshold": 0.25,
       "rebalance_frequency_hours": 6
     },
+    // KST 기준 매수/매도 허용 시간대
     "buy_time_windows": ["22:35-04:45"],
     "sell_time_windows": ["22:30-05:00"],
     "split_buy": {
@@ -158,7 +197,7 @@
     "max_retries": 2,
     "retry_delay_ms": 400,
     "slippage_bps": 10,
-    "commission_rate": 0.001,
+    "commission_rate": 0.001,        // US: 해외 수수료 근사
     "securities_tax_rate": 0,
     "agricultural_tax_rate": 0,
     "slippage_rate": 0.001,
@@ -178,46 +217,62 @@
       "split_step_min_delay_sec": 1.0
     }
   },
+
+  // ── 알림 ───────────────────────────────────────────────────────────
   "notifications": {
     "discord_cooldown_sec": 60,
     "snapshot_change_threshold_pct": 1.0
   },
+
+  // ── 매매 가드 (잔고·슬롯) ─────────────────────────────────────────
   "trading_guards": {
-    "auto_shrink_slots": true,
+    "auto_shrink_slots": true,       // 자금 부족 시 슬롯 자동 축소
     "min_total_cash_to_trade": 300,
     "skip_when_low_funds": true,
     "enforce_per_ticker_limit": true
   },
+
+  // ── 리포팅 ─────────────────────────────────────────────────────────
   "reporting": {
     "coherent_summary": true,
     "include_cash_breakdown": true
   },
+
   "prompting": {
     "core_questions": true
   },
+
+  // ── 종목 회전 (rotation_manager) ──────────────────────────────────
   "rotation": {
     "enabled": false,
     "min_holding_days": 10,
-    "delta_score_min": 0.12
+    "delta_score_min": 0.12          // 교체 최소 점수 차이
   },
+
+  // ── 일일 요약 (integrated_manager) ────────────────────────────────
   "daily_summary": {
     "enabled": true,
-    "balance_open_time": "23:55",
-    "balance_close_time": "06:00",
-    "summary_send_time": "06:15"
+    "balance_open_time": "23:55",   // KST 장 시작 전 잔고
+    "balance_close_time": "06:00",    // KST 장 마감 후 잔고
+    "summary_send_time": "06:15"      // Discord 요약 발송
   },
+
+  // ── 스케줄 (KST, integrated_manager) ──────────────────────────────
   "schedule_times": {
-    "screener_time": "22:50",
-    "pipeline_time": "23:30"
+    "screener_time": "22:50",         // 저녁 스크리너 (pm 세션)
+    "pipeline_time": "23:30"          // GPT+매매 파이프라인
   },
   "pipeline_sessions": {
-    "pm_start": "22:00",
-    "am_end": "06:30"
+    "pm_start": "22:00",              // pm 세션 시작 (KST)
+    "am_end": "06:30"                   // am 세션 종료 (KST)
   },
+
   "monthly_maintenance": {
     "day": 1,
     "time": "16:00"
   },
+
+  // ── GPT + 내부 점수 통합 (trader 리밸런싱) ───────────────────────
   "integrated_analysis": {
     "enabled": true,
     "gpt_weight": 0.65,
@@ -230,11 +285,14 @@
       "enabled": true
     }
   },
+
   "rebalance_params": {
     "use_gpt_analysis": true,
     "screener_top_n": 8,
-    "min_score_threshold": 0.52
+    "min_score_threshold": 0.48
   },
+
+  // ── 체결 확인·주문 리컨실 (integrated_manager) ────────────────────
   "batch_execution_check": {
     "enabled": true,
     "check_time": "06:05"

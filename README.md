@@ -43,7 +43,7 @@
 
 - **기본 시장:** `MARKET=SP500` (`integrated_manager`, `screener`, `gpt_analyzer` 기본값)
 - **실행 환경:** Docker Compose (`integrated_manager` + `background_risk_manager`)
-- **설정:** `config/config.json`(전략·스케줄) + `config/.env`(비밀값, Git 제외)
+- **설정:** `config/config.json`(전략·스케줄, `//` 한글 주석 지원) + `config/.env`(비밀값, Git 제외)
 - **모듈 연동:** `output/` 아래 JSON·DB 파일 파이프라인
 - **알림:** Discord 웹훅(선택)
 
@@ -56,7 +56,7 @@
 - **티커 정규화** — `utils.normalize_ticker_6()` / `norm_ticker` (`MARKET` 기준: US 심볼·KR 6자리). `trader`는 `self._t()` 헬퍼 사용
 - **KIS 해외 시세·일봉** — `overseas_price`(실시간), `overseas_daily_price`(일봉), `overseas_price_detail`(PER/PBR) (`api/overseas_stock/`)
 - **US 시세 라우팅** — `KIS.get_realtime_price_with_quotes()` / `inquire_price()`가 `MARKET=SP500`이면 해외 TR(`HHDFS00000300`)로 자동 분기 (`trader`·`risk_manager` 공통)
-- **RSI·손절/목표·ATR** — `kis_market_data.py`가 KIS 일봉 우선 (`get_historical_prices` → US는 pykrx/fdr 미사용)
+- **RSI·손절/목표·ATR** — `kis_market_data.py`가 KIS 일봉 우선 (`get_historical_prices` → US는 pykrx/fdr **미로드·미사용**)
 - **GPT / 휴리스틱 분석** — `MARKET=SP500` 시 US 전용 프롬프트(초기필터·전술·리밸런싱), 가격·예산 **USD** (`fmt_money`), `gpt_params.budget_guard` / `initial_filter` 연동
 - **스케줄 오케스트레이션** — `integrated_manager.py`가 평일 잡·스크리너·파이프라인·잔액·체결확인·리컨실·요약 담당
 - **일일 요약(US)** — `balance_open`/`balance_close` + `summary_*.json`의 KIS 필드로 Discord 전송: **총평가 `tot_evlu_amt_krw`(원화)**, **예수금 `ord_psbl_frcr_amt`(USD)**, **보유평가 `evlu_pfls_smtl_amt`(USD, 평가손익 합계)** 각각 open→close 변화량 표기
@@ -288,11 +288,11 @@ api/kis_auth.KIS (DomesticStock + OverseasStock)
 - `get_historical_prices_kis()` — US 개별종목: `overseas_daily_price` (HHDFS76240000) BYMD 페이지네이션
 - `get_us_regime_ohlcv()` — US 레짐: `overseas_daily_chart_price` (FHKST03030100) **SPX 지수**, 실패 시 SPY@AMS (HHDFS76240000)
 - `config.json` → `us_market_regime` (`index_symbol`, `etf_fallback`)
-- `screener_core.get_historical_prices()` — **KIS 우선**, US 실패 시 fdr/pykrx **미사용**, KR만 레거시 백업
+- `screener_core.get_historical_prices()` — **KIS 우선**, US는 pykrx/fdr **미로드**, KR만 레거시 백업
 - 사용처: `risk_manager` RSI·손절/목표·MA, `_compute_levels` ATR·스윙 / 레짐·`MarketAnalyzer` → `get_us_regime_ohlcv`
 
 - **마스터:** `kis_master.load_kis_master("SP500")` — `frgn_code.mst`(S&P500) ∩ (nasmst+nysmst+amsmst)
-- **레이트 리밋:** `config.json` → `kis_limits.max_rps=2`, `max_concurrency=1`
+- **레이트 리밋:** `config.json` → `kis_limits.max_rps=2`, `max_concurrency=2`
 
 ---
 
@@ -314,8 +314,8 @@ api/kis_auth.KIS (DomesticStock + OverseasStock)
 
 | 파일 | 역할 |
 |------|------|
-| `screener.py` | `--market SP500` (기본), `--debug` 퍼널 로그 |
-| `screener_core.py` | 지표·점수·`MarketState` |
+| `screener.py` | `--market SP500` (기본), `--debug` 퍼널 로그, `--force` 휴장일 테스트 |
+| `screener_core.py` | 지표·점수·`MarketState` (US: pykrx/fdr 지연 로드 스킵) |
 | `kis_master.py` | 국내/해외 `.mst`·`.cod` 다운로드·캐시 |
 | `health_check.py` | US: `AAPL` @ `NAS`, KR: `005930` |
 | `news_collector.py` | US: Google News RSS / KR: Naver API |
@@ -342,7 +342,7 @@ api/kis_auth.KIS (DomesticStock + OverseasStock)
 |------|------|
 | 언어 | Python 3.11 (`Dockerfile`) |
 | 스케줄 | `schedule` |
-| 데이터 | `pandas`, `numpy` — **US 일봉·RSI: KIS** (`kis_market_data`); KR 백업: `FinanceDataReader`, `pykrx` |
+| 데이터 | `pandas`, `numpy` — **US 일봉·RSI: KIS** (`kis_market_data`); KR 백업: `FinanceDataReader`, `pykrx` (**SP500에서는 미로드**) |
 | HTTP | `requests`, `httpx` |
 | AI | `openai` (선택, HTTP 폴백 지원) |
 | 설정 | `python-dotenv`, `PyYAML` |
@@ -361,7 +361,7 @@ api/kis_auth.KIS (DomesticStock + OverseasStock)
 |------|------|------|
 | Docker & Compose | ✅ | 두 서비스 실행 |
 | `config/.env` | ✅ | `cp config/.env.example config/.env` |
-| `config/config.json` | ✅ | `trading_environment`: `vps` 또는 `prod` |
+| `config/config.json` | ✅ | `trading_environment`: `vps` 또는 `prod` — `//` 라인 주석(한글 설명) 지원 |
 | `output/` | 자동 | 런타임 전용 |
 
 ### 6.2 API별 설정 (`config/.env`)
@@ -436,7 +436,7 @@ DISCORD_WEBHOOK_URL_RISK=https://discord.com/api/webhooks/.../risk
 |----|-----------|------|
 | `min_trading_value_5d_avg_us` | `5000000000` | 5일 평균 거래대금 하한(USD) — 조정 가능 |
 | `min_market_cap_us` | `5000000000` | 시총 하한(마스터 Marcap 미제공 시 1차 스킵) |
-| `min_score_threshold` | `0.52` | 최종 점수 컷 |
+| `min_score_threshold` | `0.48` | 최종 점수 컷 (스크리너·리밸런스·GPT initial_filter 동기화) |
 | `require_positive_momentum` | `true` | 20일 모멘텀 > 0 |
 | `volatility_threshold` | `0.75` | 연율화 변동성 상한 |
 | `top_n` | `8` | 최종 후보 수 (`max_positions`와 min) |
@@ -448,7 +448,7 @@ DISCORD_WEBHOOK_URL_RISK=https://discord.com/api/webhooks/.../risk
 | `openai_model` | `gpt-4o-mini` | OpenAI 모델 (HTTP 폴백 시 프롬프트 JSON 유도) |
 | `budget_guard` | `true` | `summary_*.json`의 USD 가용금액으로 매수 적정성 검사 |
 | `max_entry_price_ratio` | `0.2` | 종목당 최대 진입 비율 (슬롯·현금 대비) |
-| `initial_filter.min_score_pass` | `0.52` | 1차 GPT/휴리스틱 점수 컷 (0–1 스케일) |
+| `initial_filter.min_score_pass` | `0.48` | 1차 GPT/휴리스틱 점수 컷 (0–1 스케일) |
 | `analysis_expansion.max_total_analysis` | `15` | GPT 상세 분석 최대 종목 수 |
 
 US 프롬프트는 점수 **0.0–1.0**, 손절/목표·MA를 **$X.XX USD**로 안내합니다. `account.py`로 `summary_YYYYMMDD.json`이 없으면 Budget Guard가 비활성화됩니다.
@@ -509,12 +509,12 @@ docker compose logs -f background_risk_manager
 # 스크리너 관련만 필터
 docker compose logs -f integrated_manager | grep -i screener
 
-# 수동 실행 (디버그)
+# 수동 실행 (디버그·주말/휴장일 테스트)
 docker compose exec integrated_manager python /app/src/screener.py \
-  --market SP500 --date YYYYMMDD --session pm --workers 1 --debug
+  --market SP500 --date YYYYMMDD --session pm --workers 2 --debug --force
 ```
 
-> **주말·휴장일 수동 실행:** 스크리너는 `--date`와 무관하게 **실행 당일(ET) 거래일**만 검사합니다. 토요일·NYSE 휴장일에 `--date`로 과거 거래일을 지정해도 `휴장일이므로 screener를 건너뜁니다`로 종료됩니다. **평일(월~금)**에 실행하거나, 코드에 `--date` 기준 휴장 검사/강제 실행 옵션을 추가해야 합니다. SP500 실행 시 `KRX 로그인 실패` 메시지는 pykrx(국내용) 경고로 **무시 가능**합니다.
+> **주말·휴장일 수동 실행:** 기본적으로 스크리너는 **실행 당일(ET) 거래일**만 검사합니다. 토요일·NYSE 휴장일에는 `휴장일이므로 screener를 건너뜁니다`로 종료됩니다. 로컬·Docker 테스트 시 **`--force`** 로 휴장 검사를 건너뛸 수 있습니다. SP500 실행 시 pykrx(KRX)는 **로드하지 않습니다** (KRX 로그인 경고 없음).
 
 **일일 요약·잔액 (컨테이너 안에서 실행):**
 
@@ -552,7 +552,8 @@ cd src
 #### A. 스크리너 (선택, ~3–4분)
 
 ```bash
-python3 -u screener.py --market SP500 --date ${DATE} --session ${SESSION} --workers 1 --debug
+python3 -u screener.py --market SP500 --date ${DATE} --session ${SESSION} --workers 2 --debug
+# 주말·휴장일: --force 추가
 # → ../output/screener_candidates_${DATE}_${SESSION}_SP500.json
 ```
 
@@ -610,7 +611,7 @@ python3 trader.py --date ${DATE}
 ```
 trading_bot_260530_NASDAQ/
 ├── config/
-│   ├── config.json              # 전략·스케줄 (Git OK)
+│   ├── config.json              # 전략·스케줄 (Git OK, // 한글 주석)
 │   ├── .env.example
 │   ├── .env.risk.example        # (참고용, 미사용 — 웹훅은 .env 에 설정)
 │   ├── kis_devlp.yaml.example
@@ -650,7 +651,9 @@ trading_bot_260530_NASDAQ/
 | SP500 마스터·1·2차 스크리닝 | ✅ 동작 확인 |
 | 해외 시세·Amount5D·PER/PBR | ✅ KIS TR |
 | US 실시간 시세·호가 (`trader`·`risk_manager`) | ✅ `overseas_price` (국내 `inquire-price` 미사용) |
-| US 일봉·RSI·손절/ATR (`kis_market_data`) | ✅ `HHDFS76240000`; US fdr/pykrx 백업 없음 |
+| US 일봉·RSI·손절/ATR (`kis_market_data`) | ✅ `HHDFS76240000`; US pykrx/fdr **미로드** |
+| SP500 pykrx/KRX 초기화 | ✅ `MARKET=SP500` 시 pykrx/fdr 지연 로드 스킵 |
+| 스크리너 `--force` (휴장일 테스트) | ✅ 주말·NYSE 휴장일 수동 실행 |
 | Google News RSS (US) | ✅ |
 | GPT 분석·`gpt_trades_*.json` | ✅ (US 프롬프트·USD 표기) |
 | 티커 정규화 (`normalize_ticker_6`) | ✅ trader·GPT·recorder·리컨실 등 |
@@ -672,7 +675,7 @@ trading_bot_260530_NASDAQ/
 | `trader` 매도 체결 수량 (`_get_qty`) | ✅ 인스턴스 메서드·티커 정규화 (긴급 손절 등 매도 후 체결 확인) |
 | `trader` 매도 사유 코드 | ✅ `EMERGENCY_DROP` 등 `risk_manager` 구조화 사유 매핑 |
 | 해외 평단 (`pchs_avg_pric`) | ✅ 수량으로 재나누지 않음 (주당 평단) |
-| 휴장일 판단 | ✅ US: NYSE(XNYS) / KR: 주말 (`is_market_open_day`) — 스크리너는 **실행일** 기준( `--date` 미반영) |
+| 휴장일 판단 | ✅ US: NYSE(XNYS) / KR: 주말 — 기본은 **실행일** 기준; `--force`로 테스트 우회 |
 | `Marcap` (US) | 마스터 미제공 → 0, 시총 필터 스킵 |
 | `investor_flow` (US) | 0 (국내 수급 API 경로) |
 | `dynamic_cash_management` | ⚠️ 보유 0·현금 100% 시 가용금 축소 가능 → 설정 확인 |

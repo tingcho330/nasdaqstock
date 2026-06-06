@@ -133,20 +133,57 @@ def setup_logging(level: int = logging.INFO) -> logging.Logger:
 # ────────────────────────────────
 # 설정 파일 및 데이터 분석 유틸리티
 # ────────────────────────────────
+def strip_jsonc_comments(text: str) -> str:
+    """config.json 등 // 라인 주석을 제거 (표준 json.load 호환용)."""
+    out: List[str] = []
+    for line in text.splitlines():
+        in_str = False
+        esc = False
+        cut = len(line)
+        i = 0
+        while i < len(line):
+            ch = line[i]
+            if esc:
+                esc = False
+            elif ch == "\\" and in_str:
+                esc = True
+            elif ch == '"':
+                in_str = not in_str
+            elif not in_str and ch == "/" and i + 1 < len(line) and line[i + 1] == "/":
+                cut = i
+                break
+            i += 1
+        out.append(line[:cut].rstrip())
+    return "\n".join(out)
+
+
+def load_json_config(path: Path) -> Optional[Dict[str, Any]]:
+    """JSON/JSONC 설정 파일을 dict로 로드."""
+    logger = logging.getLogger(__name__)
+    try:
+        raw = path.read_text(encoding="utf-8")
+        cleaned = strip_jsonc_comments(raw)
+        cfg = json.loads(cleaned)
+        if not isinstance(cfg, dict):
+            logger.error("설정 파일의 최상위 구조가 dict가 아닙니다: %s", path)
+            return None
+        return cfg
+    except (json.JSONDecodeError, OSError) as e:
+        logger.error("설정 파일 읽기 실패(%s): %s", path, e)
+        return None
+
+
 def load_config(path: Path = CONFIG_PATH) -> Optional[Dict[str, Any]]:
     logger = logging.getLogger(__name__)
     try:
         if not path.exists():
             logger.error("설정 파일을 찾을 수 없습니다: %s", path)
             return None
-        with open(path, "r", encoding="utf-8") as f:
-            cfg = json.load(f)
-            if not isinstance(cfg, dict):
-                logger.error("설정 파일의 최상위 구조가 dict가 아닙니다: %s", path)
-                return None
+        cfg = load_json_config(path)
+        if cfg is not None:
             logger.info("설정 로드 완료: %s", path)
-            return cfg
-    except (json.JSONDecodeError, OSError) as e:
+        return cfg
+    except Exception as e:
         logger.error("설정 파일 읽기 실패(%s): %s", path, e)
         return None
 

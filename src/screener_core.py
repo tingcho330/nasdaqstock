@@ -16,50 +16,79 @@ import logging
 import time
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List, Tuple
+import os
+
 import numpy as np
 import pandas as pd
-import FinanceDataReader as fdr
-from pykrx import stock as pykrx
 
-# ───────────────── pykrx 커스텀 헤더 패치 적용 ─────────────────
-# 패치는 모듈 레벨에서 한 번만 적용되면 모든 곳에서 적용되므로,
-# screener.py에서 이미 적용되었더라도 중복 적용해도 안전합니다.
-CUSTOM_HEADERS = {
-    "User-Agent": "Mozilla/5.0",
-    "Referer": "https://data.krx.co.kr/contents/MDC/MDI/outerLoader/index.cmd",
-}
+# ───────────────── pykrx/fdr: KR 시장에서만 지연 로드 ─────────────────
+_pykrx_mod = None
+_fdr_mod = None
+_pykrx_patch_applied = False
 
-def _apply_pykrx_patch():
-    """pykrx 라이브러리에 커스텀 헤더 패치 적용 (내부 함수)"""
+
+def _needs_kr_data_backend(market: Optional[str] = None) -> bool:
+    """US(SP500 등)에서는 pykrx/fdr 백업을 사용하지 않는다."""
+    from utils import is_us_market
+
+    mkt = (market or os.getenv("MARKET", "SP500")).upper().strip()
+    return not is_us_market(mkt)
+
+
+def _apply_pykrx_patch() -> bool:
+    """pykrx 라이브러리에 커스텀 헤더 패치 적용 (KR 전용, 1회)"""
+    global _pykrx_patch_applied
+    if _pykrx_patch_applied:
+        return True
     try:
         from pykrx.website.comm import webio
         import requests
-        
+
         def _patched_get_read(self, **params):
             headers = {
                 "User-Agent": "Mozilla/5.0",
-                "Referer": "https://data.krx.co.kr/contents/MDC/MDI/outerLoader/index.cmd"
+                "Referer": "https://data.krx.co.kr/contents/MDC/MDI/outerLoader/index.cmd",
             }
             return requests.get(self.url, headers=headers, params=params)
-        
+
         def _patched_post_read(self, **params):
             headers = {
                 "User-Agent": "Mozilla/5.0",
-                "Referer": "https://data.krx.co.kr/contents/MDC/MDI/outerLoader/index.cmd"
+                "Referer": "https://data.krx.co.kr/contents/MDC/MDI/outerLoader/index.cmd",
             }
             return requests.post(self.url, headers=headers, data=params)
-        
-        # 기존 메서드를 새 메서드로 대체
+
         webio.Get.read = _patched_get_read
         webio.Post.read = _patched_post_read
-        
+        _pykrx_patch_applied = True
         return True
     except Exception:
-        # 패치 실패 시 무시 (이미 다른 곳에서 적용되었을 수 있음)
         return False
 
-# 패치 적용 (모듈 로드 시 자동 적용)
-_apply_pykrx_patch()
+
+def _get_pykrx():
+    """KR 시장 백업용 pykrx. US(SP500)에서는 None."""
+    global _pykrx_mod
+    if not _needs_kr_data_backend():
+        return None
+    if _pykrx_mod is None:
+        _apply_pykrx_patch()
+        from pykrx import stock as pykrx
+
+        _pykrx_mod = pykrx
+    return _pykrx_mod
+
+
+def _get_fdr():
+    """KR 시장 백업용 FinanceDataReader. US(SP500)에서는 None."""
+    global _fdr_mod
+    if not _needs_kr_data_backend():
+        return None
+    if _fdr_mod is None:
+        import FinanceDataReader as fdr
+
+        _fdr_mod = fdr
+    return _fdr_mod
 
 # reviewer.py와 recorder.py에서 import
 from reviewer import MarketRegime, MarketState
@@ -241,7 +270,6 @@ def get_historical_prices(
     Returns:
         DataFrame with OHLCV data or None if failed
     """
-    import os
     import time
     from utils import is_us_market
 
@@ -276,39 +304,45 @@ def get_historical_prices(
         )
         return None
 
+    pykrx = _get_pykrx()
+    fdr = _get_fdr()
+    if pykrx is None and fdr is None:
+        logger.debug("KR 데이터 백엔드(pykrx/fdr) 미로드 — %s", symbol)
+        return None
+
     for attempt in range(retries):
         try:
             # 1단계: pykrx 시도
-            try:
-                df = pykrx.get_market_ohlcv(start_date, end_date, symbol)
-                if df is not None and not df.empty:
-                    logger.debug(f"pykrx success for {symbol}: {len(df)} rows")
-                    return df
-            except Exception as e:
-                logger.debug(f"pykrx attempt {attempt + 1} failed for {symbol}: {e}")
-            
-            # 2단계: fdr 시도
-            try:
-                start_dt = datetime.strptime(start_date, '%Y%m%d')
-                end_dt = datetime.strptime(end_date, '%Y%m%d')
-                
-                df = fdr.DataReader(symbol, start=start_dt, end=end_dt)
-                if df is not None and not df.empty:
-                    logger.debug(f"fdr success for {symbol}: {len(df)} rows")
-                    return df
-            except Exception as e:
-                logger.debug(f"fdr attempt {attempt + 1} failed for {symbol}: {e}")
-            
-            # 3단계: 날짜 범위 확장 시도 (마지막 시도에서만)
-            if attempt == retries - 1:
+            if pykrx is not None:
                 try:
-                    # 시작일을 더 앞으로 확장
+                    df = pykrx.get_market_ohlcv(start_date, end_date, symbol)
+                    if df is not None and not df.empty:
+                        logger.debug(f"pykrx success for {symbol}: {len(df)} rows")
+                        return df
+                except Exception as e:
+                    logger.debug(f"pykrx attempt {attempt + 1} failed for {symbol}: {e}")
+
+            # 2단계: fdr 시도
+            if fdr is not None:
+                try:
+                    start_dt = datetime.strptime(start_date, '%Y%m%d')
+                    end_dt = datetime.strptime(end_date, '%Y%m%d')
+
+                    df = fdr.DataReader(symbol, start=start_dt, end=end_dt)
+                    if df is not None and not df.empty:
+                        logger.debug(f"fdr success for {symbol}: {len(df)} rows")
+                        return df
+                except Exception as e:
+                    logger.debug(f"fdr attempt {attempt + 1} failed for {symbol}: {e}")
+
+            # 3단계: 날짜 범위 확장 시도 (마지막 시도에서만)
+            if attempt == retries - 1 and pykrx is not None:
+                try:
                     start_dt = datetime.strptime(start_date, '%Y%m%d') - timedelta(days=30)
                     extended_start = start_dt.strftime('%Y%m%d')
-                    
+
                     df = pykrx.get_market_ohlcv(extended_start, end_date, symbol)
                     if df is not None and not df.empty:
-                        # 원하는 시작일 이후 데이터만 필터링
                         df = df[df.index >= start_date]
                         if not df.empty:
                             logger.debug(f"pykrx with extended range success for {symbol}: {len(df)} rows")

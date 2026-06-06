@@ -128,13 +128,14 @@ class Settings:
         rp.setdefault("include_cash_breakdown", True)
 
     def _load_config(self, config_path: Path) -> Dict[str, Any]:
+        from utils import load_json_config
+
         if not config_path.exists():
             raise FileNotFoundError(f"설정 파일을 찾을 수 없습니다: {config_path}")
-        with open(config_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            if not isinstance(data, dict):
-                raise ValueError("config.json 최상위 구조는 객체여야 합니다.")
-            return data
+        data = load_json_config(config_path)
+        if data is None:
+            raise ValueError(f"config.json 파싱 실패: {config_path}")
+        return data
 
 # 싱글턴처럼 사용할 수 있도록 인스턴스 생성
 settings = Settings()

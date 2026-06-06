@@ -76,8 +76,8 @@ def _load_config_fallback() -> dict:
     try:
         p = Path(cfg_path)
         if p.exists():
-            with open(p, "r", encoding="utf-8") as f:
-                return json.load(f) or {}
+            from utils import load_json_config
+            return load_json_config(p) or {}
         logging.getLogger(__name__).error("설정 파일을 찾을 수 없습니다: %s", p)
         return {}
     except Exception as e:
