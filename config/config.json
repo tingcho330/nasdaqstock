@@ -20,7 +20,7 @@
     // [US] 최대 시가총액(USD)
     "max_market_cap_us": 5000000000000,
     // [KR] 5일 평균 거래대금 하한(원)
-    "min_trading_value_5d_avg": 100000000000,
+    "min_trading_value_5d_avg": 150000000000,
     // [US] 5일 평균 거래대금 하한(USD). 5B=50억달러
     "min_trading_value_5d_avg_us": 5000000000,
     // 최종 후보 상위 N종 (섹터 다양화 전)
