@@ -1,5 +1,5 @@
 # 이 스택 전체의 프로젝트/리소스 이름 접두사
-name: stock_stack
+name: nasdaq_stack
 
 x-common: &common
   build:
@@ -15,7 +15,7 @@ x-common: &common
 services:
   integrated_manager:
     <<: *common
-    container_name: SP500_trading_bot_integrated
+    container_name: nasdaq_trading_bot_integrated
     command: python /app/run_integrated_manager.py
     deploy:
       resources:
@@ -26,7 +26,7 @@ services:
 
   background_risk_manager:
     <<: *common
-    container_name: SP500_trading_bot_risk_manager
+    container_name: nasdaq_trading_bot_risk_manager
     command: python /app/run_background_risk_manager.py
     deploy:
       resources:
