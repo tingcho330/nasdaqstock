@@ -111,6 +111,12 @@ def normalize_overseas_holdings(df_hold: pd.DataFrame, market: str) -> pd.DataFr
         evlu = _f(rec.get("frcr_evlu_amt2") or rec.get("evlu_amt") or rec.get("ovrs_stck_evlu_amt"))
         if evlu <= 0 and prpr > 0:
             evlu = prpr * qty
+        pfls_amt = _f(rec.get("frcr_evlu_pfls_amt2") or rec.get("evlu_pfls_amt"))
+        if pfls_amt == 0 and prpr > 0 and avg_px > 0 and qty > 0:
+            pfls_amt = (prpr - avg_px) * qty
+        pfls_rt = _f(rec.get("evlu_pfls_rt") or rec.get("frcr_evlu_pfls_rt"))
+        if pfls_rt == 0 and avg_px > 0 and prpr > 0:
+            pfls_rt = ((prpr - avg_px) / avg_px) * 100.0
         if os.getenv("KIS_TRACE", "").strip() in ("1", "true", "yes") and avg_px > 0:
             logger.info(
                 "[KIS_TRACE] %s avg_px=%s qty=%s raw_pchs_avg=%s raw_frcr_pchs=%s prpr=%s",
@@ -134,8 +140,8 @@ def normalize_overseas_holdings(df_hold: pd.DataFrame, market: str) -> pd.DataFr
                 "pchs_avg_pric": str(avg_px),
                 "prpr": str(prpr),
                 "evlu_amt": str(evlu),
-                "evlu_pfls_amt": str(_f(rec.get("frcr_evlu_pfls_amt2") or rec.get("evlu_pfls_amt"))),
-                "evlu_pfls_rt": str(_f(rec.get("evlu_pfls_rt") or rec.get("frcr_evlu_pfls_rt"))),
+                "evlu_pfls_amt": str(pfls_amt),
+                "evlu_pfls_rt": str(pfls_rt),
                 "ovrs_excg_cd": str(rec.get("ovrs_excg_cd") or ""),
                 "tr_crcy_cd": str(rec.get("tr_crcy_cd") or "USD"),
             }

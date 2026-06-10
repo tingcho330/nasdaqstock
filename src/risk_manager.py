@@ -28,6 +28,7 @@ from utils import (
     is_market_open_day,
     is_regular_session,
     next_session_open_kst,
+    load_us_ticker_exchange_maps,
     resolve_us_sell_order_params,
     risk_session_windows,
 )
@@ -344,6 +345,11 @@ class RiskManager:
         except Exception:
             self._kis = None
 
+        if is_us_market(_market()):
+            n = load_us_ticker_exchange_maps(_market())
+            if n > 0:
+                logger.info("RiskManager US 거래소 맵 로드: %d tickers", n)
+
         # [NEW] 전략 시스템 설정
         self.strategy_mode = rp.get("strategy_mode", "simple")
         self.enable_advanced = bool(rp.get("enable_advanced_strategies", False))
@@ -377,6 +383,11 @@ class RiskManager:
             return list(self.session_windows)
         return None
 
+    @staticmethod
+    def _holding_ovrs_hint(holding: Dict) -> Optional[str]:
+        hint = str(holding.get("ovrs_excg_cd") or "").strip()
+        return hint or None
+
     def _resolve_holding_current_price(self, holding: Dict) -> int:
         """보유 현재가 — 잔고 prpr=0이면 KIS 실시간 시세로 보정 (US/국내 공통)."""
         cur = _to_int(holding.get("prpr", 0))
@@ -386,7 +397,11 @@ class RiskManager:
         if not ticker or self._kis is None:
             return 0
         try:
-            info = self._kis.get_realtime_price_with_quotes(ticker, market=_market())
+            info = self._kis.get_realtime_price_with_quotes(
+                ticker,
+                market=_market(),
+                ovrs_excg_hint=self._holding_ovrs_hint(holding),
+            )
             if info and _to_int(info.get("current_price", 0)) > 0:
                 px = _to_int(info["current_price"])
                 logger.info(
@@ -400,14 +415,35 @@ class RiskManager:
             logger.debug("[가격보정] %s 시세 조회 실패: %s", ticker, e)
         return 0
 
-    def _quote_price_for_record(self, ticker: str) -> int:
+    def _quote_price_for_record(
+        self,
+        ticker: str,
+        *,
+        fallback_px: int = 0,
+        ovrs_excg_hint: Optional[str] = None,
+    ) -> int:
         if self._kis is None:
-            return 0
+            return max(0, int(fallback_px or 0))
         try:
-            info = self._kis.get_realtime_price_with_quotes(ticker, market=_market())
-            return _to_int(info.get("current_price")) if info else 0
+            info = self._kis.get_realtime_price_with_quotes(
+                ticker,
+                market=_market(),
+                ovrs_excg_hint=ovrs_excg_hint,
+            )
+            px = _to_int(info.get("current_price")) if info else 0
+            if px > 0:
+                return px
         except Exception:
-            return 0
+            pass
+        fb = max(0, int(fallback_px or 0))
+        if fb > 0:
+            logger.info(
+                "[DIRECT_SELL] 시세 조회 실패 → 잔고 prpr 폴백: %s(%s) %s",
+                ticker,
+                ovrs_excg_hint or "?",
+                _money(fb),
+            )
+        return fb
 
     def _load_holdings(self) -> Dict[str, Dict]:
         """보유 종목 정보 로드 (백그라운드 모니터링용)"""
@@ -453,7 +489,64 @@ class RiskManager:
         except Exception as e:
             logger.error(f"계좌 스냅샷 갱신 실패: {e}")
 
-    def _can_direct_sell_now(self, ticker: str) -> bool:
+    def _holding_profit_pct(self, holding: Dict, cur_price: int) -> Optional[float]:
+        """보유 종목 평가손익률 (KIS evlu_pfls_rt 우선, 없으면 매수가 대비 계산)."""
+        pl_rate = holding.get("evlu_pfls_rt")
+        if pl_rate is not None and str(pl_rate) != "":
+            return float(str(pl_rate).replace("%", "").replace(",", "")) / 100.0
+        avg_price = _to_float(holding.get("pchs_avg_pric"), 0.0)
+        if avg_price > 0 and cur_price > 0:
+            return (float(cur_price) - float(avg_price)) / float(avg_price)
+        return None
+
+    def _try_emergency_drop(
+        self,
+        holding: Dict,
+        *,
+        levels_source: str = "unknown",
+        sell_win_ok: bool,
+    ) -> Optional[Tuple[str, str, Dict]]:
+        """긴급 낙폭(EmergencyDrop) 조건 — min_holding_hours 예외 적용 대상."""
+        ticker = normalize_ticker_6(holding.get("pdno", ""), os.getenv("MARKET", "SP500"))
+        name = holding.get("prdt_name", "N/A")
+        cur_price = _to_int(holding.get("prpr", 0))
+        if cur_price <= 0 or self.emergency_drop_pct <= 0 or not sell_win_ok:
+            return None
+        try:
+            profit_pct = self._holding_profit_pct(holding, cur_price)
+            if profit_pct is None:
+                return None
+            logger.debug(
+                f"[{ticker}] 긴급낙폭] 손익률={profit_pct:.4f}, "
+                f"임계값={-abs(self.emergency_drop_pct):.4f}, "
+                f"도달여부={profit_pct <= -abs(self.emergency_drop_pct)}"
+            )
+            if profit_pct <= -abs(self.emergency_drop_pct):
+                logger.info(
+                    f"[{ticker}] ✅ 긴급낙폭 손절 조건 충족: {name}({ticker}) "
+                    f"손익률 {profit_pct:.2%} ≤ -{self.emergency_drop_pct:.2%}"
+                )
+                return (
+                    "SELL",
+                    f"긴급 낙폭 손절({profit_pct:.2%} ≤ -{self.emergency_drop_pct:.2%}) | "
+                    f"전략=EmergencyDrop, levels_source={levels_source} | "
+                    f"win={self.rules.time_windows_for_sells or 'ALL'}",
+                    {
+                        "type": "EmergencyDrop",
+                        "context": {
+                            "profit_pct": profit_pct,
+                            "threshold": -abs(self.emergency_drop_pct),
+                            "levels_source": levels_source,
+                            "time_window": self.rules.time_windows_for_sells or "ALL",
+                            "bypass_min_holding_hours": True,
+                        },
+                    },
+                )
+        except Exception:
+            pass
+        return None
+
+    def _can_direct_sell_now(self, ticker: str, *, bypass_min_holding: bool = False) -> bool:
         if not self._direct_execute_sell_enabled:
             logger.debug(f"[DIRECT_SELL] skip: disabled by config (ticker={ticker})")
             return False
@@ -461,22 +554,21 @@ class RiskManager:
             logger.debug(f"[DIRECT_SELL] skip: KIS not initialized (ticker={ticker})")
             return False
 
-        # [SAFETY] 당일 매도 방지(보유시간) 재검증
-        # check_sell_condition에서 이미 체크하지만, DB/환경 이슈로 체크가 스킵되는 경우를 막기 위해
-        # direct_execute 직전에도 동일 가드를 한 번 더 적용한다.
-        try:
-            trading_params = self.config.get("trading_params", {}) or {}
-            min_holding_hours = int(trading_params.get("min_holding_hours", 0) or 0)
-        except Exception:
-            min_holding_hours = 0
-        if min_holding_hours > 0:
-            is_eligible, holding_hours = check_min_holding_hours(ticker, min_holding_hours)
-            if not is_eligible:
-                logger.info(
-                    f"[DIRECT_SELL] skip: same-day sell prevented (ticker={ticker}, "
-                    f"holding_hours={holding_hours:.1f} < min_holding_hours={min_holding_hours})"
-                )
-                return False
+        # [SAFETY] 당일 매도 방지(보유시간) 재검증 — EmergencyDrop 은 bypass_min_holding=True 로 예외
+        if not bypass_min_holding:
+            try:
+                trading_params = self.config.get("trading_params", {}) or {}
+                min_holding_hours = int(trading_params.get("min_holding_hours", 0) or 0)
+            except Exception:
+                min_holding_hours = 0
+            if min_holding_hours > 0:
+                is_eligible, holding_hours = check_min_holding_hours(ticker, min_holding_hours)
+                if not is_eligible:
+                    logger.info(
+                        f"[DIRECT_SELL] skip: same-day sell prevented (ticker={ticker}, "
+                        f"holding_hours={holding_hours:.1f} < min_holding_hours={min_holding_hours})"
+                    )
+                    return False
 
         now = pytime.time()
         last = self._recent_direct_sell.get(ticker, 0.0)
@@ -496,7 +588,16 @@ class RiskManager:
         self._recent_direct_sell[ticker] = now
         return True
 
-    def _direct_execute_sell(self, ticker: str, name: str, qty: int, reason_meta: Dict) -> bool:
+    def _direct_execute_sell(
+        self,
+        ticker: str,
+        name: str,
+        qty: int,
+        reason_meta: Dict,
+        *,
+        fallback_px: int = 0,
+        ovrs_excg_hint: Optional[str] = None,
+    ) -> bool:
         """즉시 매도 — US: ORD_DVSN=00 + 현재가 지정가, KR: 시장가(ord_dvsn=01)."""
         try:
             if qty <= 0:
@@ -504,7 +605,11 @@ class RiskManager:
                 return False
 
             mkt = _market()
-            px = self._quote_price_for_record(ticker)
+            px = self._quote_price_for_record(
+                ticker,
+                fallback_px=fallback_px,
+                ovrs_excg_hint=ovrs_excg_hint,
+            )
             if px <= 0:
                 logger.warning("[DIRECT_SELL] skip: no valid price for %s(%s)", name, ticker)
                 return False
@@ -530,6 +635,7 @@ class RiskManager:
                 ord_qty=int(qty),
                 ord_unpr=int(ord_unpr),
                 market=mkt,
+                ovrs_excg_hint=ovrs_excg_hint,
             )
             from utils import extract_broker_order_id
             odno = extract_broker_order_id(df)
@@ -550,7 +656,11 @@ class RiskManager:
             if ok:
                 logger.info(f"[DIRECT_SELL] ✅ submitted: {name}({ticker}) {qty}주 (ODNO={odno or 'N/A'})")
                 try:
-                    current_price = px or self._quote_price_for_record(ticker)
+                    current_price = px or self._quote_price_for_record(
+                        ticker,
+                        fallback_px=fallback_px,
+                        ovrs_excg_hint=ovrs_excg_hint,
+                    )
                     from recorder import record_trade
                     try:
                         from db_debug import log_trade_in as _db_dbg_trade_in
@@ -655,7 +765,13 @@ class RiskManager:
         return df
 
     # ── screener_core 호출로 실시간 지표/레벨 ───────────────────────────
-    def compute_realtime_levels(self, ticker: str, entry_price: float) -> Dict:
+    def compute_realtime_levels(
+        self,
+        ticker: str,
+        entry_price: float,
+        *,
+        ovrs_excg_hint: Optional[str] = None,
+    ) -> Dict:
         """
         손절가/목표가/RSI 계산(파일 참조 없이 함수 호출).
         - entry_price: 진입가가 없다면 현재가를 그대로 넣어도 됨
@@ -719,6 +835,7 @@ class RiskManager:
                 end_dt.strftime("%Y%m%d"),
                 market=_market(),
                 kis=self._kis,
+                ovrs_excg_hint=ovrs_excg_hint,
             )
             if df is not None and not df.empty:
                 # 컬럼명 정규화
@@ -1098,10 +1215,27 @@ class RiskManager:
         return basic_decision, basic_reason, basic_context
 
     def _check_basic_rules(self, holding: Dict, stock_info: Dict) -> Tuple[str, str, Dict]:
-        """Phase 1: 당일 매도 방지 체크 추가"""
+        """기본 매도 규칙 — EmergencyDrop 은 min_holding_hours 예외."""
         ticker = normalize_ticker_6(holding.get("pdno", ""), os.getenv("MARKET", "SP500"))
-        
-        # Phase 1.4: 당일 매도 방지 체크
+        name = holding.get("prdt_name", "N/A")
+        qty = _to_int(holding.get("hldg_qty", 0))
+        cur_price = _to_int(holding.get("prpr", 0))
+        levels_source_early = str(stock_info.get("source") or "").strip() or "unknown"
+
+        now_kst = datetime.now(KST)
+        sell_wins = self._effective_sell_time_windows()
+        sell_win_ok = True if not sell_wins else in_time_windows(now_kst, sell_wins, tz=KST)
+
+        # 0) 긴급 낙폭 — min_holding_hours(336h) 적용 전에 우선 판단
+        emergency = self._try_emergency_drop(
+            holding,
+            levels_source=levels_source_early,
+            sell_win_ok=sell_win_ok,
+        )
+        if emergency is not None:
+            return emergency
+
+        # Phase 1.4: 최소 보유시간 (EmergencyDrop 제외)
         trading_params = self.config.get("trading_params", {})
         min_holding_hours = trading_params.get("min_holding_hours", 0)
         if min_holding_hours > 0:
@@ -1122,13 +1256,6 @@ class RiskManager:
                         }
                     }
                 )
-        
-        # 기존 로직 계속
-        """기본 매도 규칙 체크 (기존 로직)"""
-        ticker = normalize_ticker_6(holding.get("pdno", ""), os.getenv("MARKET", "SP500"))
-        name = holding.get("prdt_name", "N/A")
-        qty = _to_int(holding.get("hldg_qty", 0))
-        cur_price = _to_int(holding.get("prpr", 0))
 
         # 입력 손절/목표 우선
         stop_px_in = _to_float(stock_info.get("손절가"), 0.0)
@@ -1166,10 +1293,7 @@ class RiskManager:
         rsi_note = " (지표부재)" if rsi_missing else ""
         logger.debug(f"[{ticker}] RSI: {rsi:.1f}{rsi_note}, RSI_TP 임계값={self.rules.rsi_take_profit}")
 
-        # 공통: 시간대 허용 여부
-        now_kst = datetime.now(KST)
-        sell_wins = self._effective_sell_time_windows()
-        sell_win_ok = True if not sell_wins else in_time_windows(now_kst, sell_wins, tz=KST)
+        # 공통: 시간대 허용 여부 (sell_win_ok 는 상단에서 계산)
         tp_base = self.rules.time_windows_for_take_profit or sell_wins
         tp_win_ok = True if not tp_base else in_time_windows(now_kst, tp_base)
         logger.debug(f"[{ticker}] 시간대 체크: 현재={now_kst.strftime('%H:%M:%S')}, 매도허용={sell_win_ok}, 이익실현허용={tp_win_ok}, 매도시간대={sell_wins}")
@@ -1181,37 +1305,6 @@ class RiskManager:
             f"목표: 현재가={_money(cur_price)} vs 임계값={_money(tp_threshold)} ({'도달' if cur_price >= tp_threshold else '미도달'}) | "
             f"RSI: {rsi:.1f} vs {self.rules.rsi_take_profit} ({'과열' if (self.rules.rsi_take_profit and rsi >= self.rules.rsi_take_profit) else '정상'})"
         )
-
-        # 0) [NEW] 긴급 낙폭(드로우다운) 손절 (평가손익률 기반)
-        logger.debug(f"[{ticker}] 긴급낙폭체크] 임계값={self.emergency_drop_pct:.2%}, 시간대허용={sell_win_ok}")
-        try:
-            pl_rate = holding.get("evlu_pfls_rt")
-            profit_pct = None
-            if pl_rate is not None and str(pl_rate) != "":
-                profit_pct = float(str(pl_rate).replace("%", "").replace(",", "")) / 100.0
-            else:
-                avg_price = _to_float(holding.get("pchs_avg_pric"), 0.0)
-                if avg_price > 0 and cur_price > 0:
-                    profit_pct = (float(cur_price) - float(avg_price)) / float(avg_price)
-            if profit_pct is not None:
-                logger.debug(f"[{ticker}] 긴급낙폭] 손익률={profit_pct:.4f}, 임계값={-abs(self.emergency_drop_pct):.4f}, 도달여부={profit_pct <= -abs(self.emergency_drop_pct)}")
-            if profit_pct is not None and self.emergency_drop_pct > 0 and profit_pct <= -abs(self.emergency_drop_pct) and sell_win_ok:
-                logger.info(f"[{ticker}] ✅ 긴급낙폭 손절 조건 충족: {name}({ticker}) 손익률 {profit_pct:.2%} ≤ -{self.emergency_drop_pct:.2%}")
-                return (
-                    "SELL",
-                    f"긴급 낙폭 손절({profit_pct:.2%} ≤ -{self.emergency_drop_pct:.2%}) | 전략=EmergencyDrop, levels_source={levels_source} | win={self.rules.time_windows_for_sells or 'ALL'}",
-                    {
-                        "type": "EmergencyDrop",
-                        "context": {
-                            "profit_pct": profit_pct,
-                            "threshold": -abs(self.emergency_drop_pct),
-                            "levels_source": levels_source,
-                            "time_window": self.rules.time_windows_for_sells or 'ALL'
-                        }
-                    }
-                )
-        except Exception:
-            pass
 
         # 1) 손절 전략 (시간대 필터 적용)
         logger.debug(f"[{ticker}] 손절가체크] 손절가={_money(stop_px)}, 임계값={_money(stop_threshold)}, 현재가={_money(cur_price)}, 조건={stop_threshold > 0 and cur_price <= stop_threshold}")
@@ -2060,8 +2153,16 @@ def _run_cycle(rm: RiskManager, *, notify_summary: bool = True) -> None:
                     continue
 
                 holding_for_check = {**h, "prpr": str(cur_price)}
+                ovrs_hint = rm._holding_ovrs_hint(h)
+                entry_for_levels = _to_float(h.get("pchs_avg_pric"), 0.0)
+                if entry_for_levels <= 0:
+                    entry_for_levels = float(cur_price)
                 logger.debug(f"[리스크체크] [{idx}/{len(valid_holdings)}] {ticker} 실시간 레벨 계산 시작")
-                stock_info = rm.compute_realtime_levels(ticker, float(cur_price))
+                stock_info = rm.compute_realtime_levels(
+                    ticker,
+                    entry_for_levels,
+                    ovrs_excg_hint=ovrs_hint,
+                )
                 logger.debug(f"[리스크체크] [{idx}/{len(valid_holdings)}] {ticker} 매도 조건 판단 시작")
                 decision, reason, structured_context = rm.check_sell_condition(holding_for_check, stock_info)
                 if decision == "SELL":
@@ -2076,15 +2177,25 @@ def _run_cycle(rm: RiskManager, *, notify_summary: bool = True) -> None:
                     logger.info(f"[리스크체크] [{idx}/{len(valid_holdings)}] {ticker} 매도 판단 상세: 타입={sell_type}, 이유={reason}")
                     
                     # [NEW] 즉시 매도 실행(옵션)
-                    if rm._can_direct_sell_now(ticker):
+                    if rm._can_direct_sell_now(
+                        ticker,
+                        bypass_min_holding=(sell_type == "EmergencyDrop"),
+                    ):
                         qty = int(h.get("hldg_qty", 0))
                         logger.info(f"[리스크체크] [{idx}/{len(valid_holdings)}] {ticker} [DIRECT_SELL] 즉시 매도 시도: {name} {qty:,}주")
-                        ok = rm._direct_execute_sell(ticker, holding_for_check.get("prdt_name", ""), qty, {
-                            "type": sell_type,
-                            "reason": reason,
-                            "time_window": rm.rules.time_windows_for_sells or 'ALL',
-                            **(structured_context.get("context", {}) if structured_context else {})
-                        })
+                        ok = rm._direct_execute_sell(
+                            ticker,
+                            holding_for_check.get("prdt_name", ""),
+                            qty,
+                            {
+                                "type": sell_type,
+                                "reason": reason,
+                                "time_window": rm.rules.time_windows_for_sells or 'ALL',
+                                **(structured_context.get("context", {}) if structured_context else {})
+                            },
+                            fallback_px=cur_price,
+                            ovrs_excg_hint=ovrs_hint,
+                        )
                         if ok:
                             logger.info(f"[리스크체크] [{idx}/{len(valid_holdings)}] {ticker} [DIRECT_SELL] ✅ 즉시 매도 주문 제출 성공")
                         else:

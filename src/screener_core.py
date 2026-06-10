@@ -255,6 +255,7 @@ def get_historical_prices(
     *,
     market: Optional[str] = None,
     kis: Optional[Any] = None,
+    ovrs_excg_hint: Optional[str] = None,
 ) -> Optional[pd.DataFrame]:
     """
     과거 시세 조회 — KIS 우선, 실패 시 pykrx/fdr (US는 KIS만).
@@ -289,6 +290,7 @@ def get_historical_prices(
             market=mkt,
             kis=kis,
             retries=retries,
+            ovrs_excg_hint=ovrs_excg_hint,
         )
         if df_kis is not None and not df_kis.empty:
             return df_kis

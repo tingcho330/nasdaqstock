@@ -66,8 +66,12 @@ __all__ = [
     "resolve_us_excd",
     "resolve_us_ovrs_excg",
     "resolve_us_sell_order_params",
+    "resolve_us_buy_order_params",
     "set_us_ticker_excd_map",
     "set_us_ticker_ovrs_excg_map",
+    "load_us_ticker_exchange_maps",
+    "ovrs_excg_to_excd",
+    "resolve_us_excd_candidates",
     "us_regime_benchmark",
     "get_us_regime_config",
     "min_trading_value_5d_avg",
@@ -617,6 +621,8 @@ _US_OVRS_EXCG_MAP = {
     "US": "NASD",
 }
 _EXCD_TO_OVRS = {"NAS": "NASD", "NYS": "NYSE", "AMS": "AMEX"}
+_OVRS_TO_EXCD = {"NASD": "NAS", "NYSE": "NYS", "AMEX": "AMS", "NAS": "NAS", "NYS": "NYS", "AMS": "AMS"}
+_US_EXCD_TRY_ORDER = ("NYS", "NAS", "AMS")
 _US_TICKER_EXCD: Dict[str, str] = {}
 _US_TICKER_OVRS: Dict[str, str] = {}
 
@@ -637,6 +643,38 @@ def set_us_ticker_ovrs_excg_map(mapping: Dict[str, str]) -> None:
         for k, v in (mapping or {}).items()
         if k and v
     }
+
+
+def load_us_ticker_exchange_maps(market: Optional[str] = None) -> int:
+    """SP500 마스터 → 티커별 EXCD/OvrsExcg 맵 로드. 반환: 티커 수."""
+    mkt = (market or os.getenv("MARKET", "SP500")).upper().strip()
+    if not is_us_market(mkt):
+        return 0
+    try:
+        from kis_master import load_kis_master
+
+        mst = load_kis_master(mkt, cache_key=datetime.now(KST).strftime("%Y%m%d"))
+        if mst is None or mst.empty:
+            return 0
+        if "EXCD" in mst.columns:
+            set_us_ticker_excd_map(dict(zip(mst.index.astype(str), mst["EXCD"].astype(str))))
+        if "OvrsExcg" in mst.columns:
+            set_us_ticker_ovrs_excg_map(dict(zip(mst.index.astype(str), mst["OvrsExcg"].astype(str))))
+        return len(mst)
+    except Exception as e:
+        logging.getLogger(__name__).warning("US 거래소 맵 로드 실패: %s", e)
+        return 0
+
+
+def ovrs_excg_to_excd(ovrs_excg_cd: Optional[str]) -> Optional[str]:
+    """TTTS3012R ovrs_excg_cd(NASD/NYSE/AMEX) → HHDFS EXCD(NAS/NYS/AMS)."""
+    s = str(ovrs_excg_cd or "").strip().upper()
+    if not s:
+        return None
+    if s in _OVRS_TO_EXCD:
+        mapped = _OVRS_TO_EXCD[s]
+        return mapped if mapped in ("NAS", "NYS", "AMS") else None
+    return None
 
 
 _DEFAULT_US_MARKET_REGIME: Dict[str, Any] = {
@@ -677,16 +715,52 @@ def us_regime_benchmark(market: Optional[str] = None) -> str:
     return str(fb.get("symbol") or "SPY").strip().upper()
 
 
-def resolve_us_excd(ticker: str, market: Optional[str] = None) -> str:
-    """티커별 KIS EXCD (NAS/NYS/AMS). 마스터 맵 → MARKET 폴백."""
+def resolve_us_excd_candidates(
+    ticker: str,
+    market: Optional[str] = None,
+    ovrs_excg_hint: Optional[str] = None,
+) -> List[str]:
+    """HHDFS 시세 TR용 EXCD 후보 (우선순위 순, 중복 제거)."""
     t = norm_ticker(ticker, market)
+    out: List[str] = []
+
+    def _add(excd: Optional[str]) -> None:
+        x = str(excd or "").strip().upper()
+        if x in ("NAS", "NYS", "AMS") and x not in out:
+            out.append(x)
+
+    _add(ovrs_excg_to_excd(ovrs_excg_hint))
     if t and t in _US_TICKER_EXCD:
-        return _US_TICKER_EXCD[t]
+        _add(_US_TICKER_EXCD[t])
     m = (market or os.getenv("MARKET", "SP500")).upper().strip()
-    return _US_EXCD_MAP.get(m, "NAS")
+    _add(_US_EXCD_MAP.get(m, "NAS"))
+    for fb in _US_EXCD_TRY_ORDER:
+        _add(fb)
+    return out or ["NAS"]
 
 
-def resolve_us_ovrs_excg(ticker: str, market: Optional[str] = None) -> str:
+def resolve_us_excd(
+    ticker: str,
+    market: Optional[str] = None,
+    ovrs_excg_hint: Optional[str] = None,
+) -> str:
+    """티커별 KIS EXCD (NAS/NYS/AMS). 잔고 hint → 마스터 → MARKET 폴백."""
+    return resolve_us_excd_candidates(ticker, market, ovrs_excg_hint)[0]
+
+
+def resolve_us_ovrs_excg(
+    ticker: str,
+    market: Optional[str] = None,
+    ovrs_excg_hint: Optional[str] = None,
+) -> str:
+    """TTTT1006U 등 주문 TR용 OVRS_EXCG_CD (NASD/NYSE/AMEX)."""
+    if ovrs_excg_hint:
+        s = str(ovrs_excg_hint).strip().upper()
+        if s in ("NASD", "NYSE", "AMEX"):
+            return s
+        excd = ovrs_excg_to_excd(s)
+        if excd:
+            return _EXCD_TO_OVRS.get(excd, "NASD")
     t = norm_ticker(ticker, market)
     if t and t in _US_TICKER_OVRS:
         return _US_TICKER_OVRS[t]
@@ -1263,6 +1337,30 @@ def resolve_us_sell_order_params(
     if sell_price <= 0:
         sell_price = max(1, px)
     return "00", sell_price
+
+
+def resolve_us_buy_order_params(
+    current_price: int,
+    *,
+    urgency: str = "normal",
+    slippage_bps: Optional[int] = None,
+) -> Tuple[str, int]:
+    """
+    KIS TTTT1002U(미국 매수): ORD_DVSN=00(지정가) + OVRS_ORD_UNPR>0.
+    US 매수 시장가(01+unpr=0)는 output 없이 거절되는 경우가 많아 지정가+슬리피지 사용.
+    urgent: 100bps, normal: 30bps (매수는 현재가 대비 상향).
+    """
+    px = int(current_price or 0)
+    if px <= 0:
+        raise ValueError(f"US buy requires current_price > 0, got {current_price!r}")
+    if slippage_bps is None:
+        slippage_bps = 100 if str(urgency).lower() == "urgent" else 30
+    slippage_factor = 1.0 + (float(slippage_bps) / 10000.0)
+    target_price = px * slippage_factor
+    buy_price = round_to_tick(target_price, mode="up")
+    if buy_price <= 0:
+        buy_price = max(1, px)
+    return "00", buy_price
 
 
 # ────────────────────────────────

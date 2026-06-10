@@ -53,18 +53,9 @@ def main():
 
         if is_us_market(market):
             try:
-                from kis_master import load_kis_master
+                from utils import load_us_ticker_exchange_maps
 
-                mst = load_kis_master(market, cache_key=datetime.now(KST).strftime("%Y%m%d"))
-                if mst is not None and not mst.empty:
-                    if "EXCD" in mst.columns:
-                        set_us_ticker_excd_map(
-                            dict(zip(mst.index.astype(str), mst["EXCD"].astype(str)))
-                        )
-                    if "OvrsExcg" in mst.columns:
-                        set_us_ticker_ovrs_excg_map(
-                            dict(zip(mst.index.astype(str), mst["OvrsExcg"].astype(str)))
-                        )
+                load_us_ticker_exchange_maps(market)
             except Exception as e:
                 logger.warning("US 거래소 맵 로드 실패: %s", e)
 

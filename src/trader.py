@@ -48,6 +48,8 @@ from utils import (
     check_min_holding_hours,
     extract_broker_order_id,
     resolve_us_sell_order_params,
+    resolve_us_buy_order_params,
+    resolve_us_ovrs_excg,
 )
 from api.kis_auth import KIS
 from risk_manager import RiskManager
@@ -260,20 +262,13 @@ class Trader:
         self.min_order_cash = int(self.trading_params.get("min_order_cash", 0))
         self.market = os.getenv("MARKET", "SP500")
         if is_us_market(self.market):
-            try:
-                from datetime import datetime as _dt
-                from kis_master import load_kis_master
-                from utils import set_us_ticker_excd_map, set_us_ticker_ovrs_excg_map
+            from utils import load_us_ticker_exchange_maps
 
-                _mst = load_kis_master(self.market, cache_key=_dt.now(KST).strftime("%Y%m%d"))
-                if _mst is not None and not _mst.empty:
-                    if "EXCD" in _mst.columns:
-                        set_us_ticker_excd_map(dict(zip(_mst.index.astype(str), _mst["EXCD"].astype(str))))
-                    if "OvrsExcg" in _mst.columns:
-                        set_us_ticker_ovrs_excg_map(dict(zip(_mst.index.astype(str), _mst["OvrsExcg"].astype(str))))
-                    logger.info("US 거래소 맵 로드: %d tickers", len(_mst))
-            except Exception as e:
-                logger.warning("US 거래소 맵 로드 실패(티커별 EXCD 폴백): %s", e)
+            n = load_us_ticker_exchange_maps(self.market)
+            if n > 0:
+                logger.info("US 거래소 맵 로드: %d tickers", n)
+            else:
+                logger.warning("US 거래소 맵 로드 실패(티커별 EXCD 폴백)")
         self.rebuy_atr_k = float(self.trading_params.get("rebuy_atr_k", 0.0))
         self.rebuy_rsi_ceiling = float(self.trading_params.get("rebuy_rsi_ceiling", 100.0))
         self.min_cash_reserve = int(self.trading_params.get("min_cash_reserve", 0))
@@ -526,6 +521,62 @@ class Trader:
             f"reserve={self._money(meta.get('reserve_applied', 0))}"
         )
 
+    def _ovrs_hint_for_ticker(self, ticker: str) -> Optional[str]:
+        """TTTT1002U/1006U용 OVRS_EXCG_CD hint (마스터 맵 또는 NASD 폴백)."""
+        if not is_us_market(self.market):
+            return None
+        return resolve_us_ovrs_excg(self._t(ticker), self.market)
+
+    def _get_kis_orderable_cash(self, force: bool = False) -> int:
+        """KIS summary 기준 USD 주문가능금액 (ord_psbl_frcr_amt / available_cash)."""
+        try:
+            cash, _, cash_map = self._get_optimized_account_info(force=force)
+            if isinstance(cash_map, dict) and cash_map.get("available_cash", 0) > 0:
+                return int(cash_map["available_cash"])
+            return int(cash or 0)
+        except Exception as e:
+            logger.debug("KIS orderable cash 조회 실패: %s", e)
+            return 0
+
+    def _sync_remaining_cash_with_kis(self, remaining_cash: int) -> int:
+        """trader remaining_cash를 KIS 주문가능 USD 이하로 동기화 (APBK0952 방지)."""
+        kis_cash = self._get_kis_orderable_cash(force=True)
+        if kis_cash <= 0:
+            return remaining_cash
+        if kis_cash < remaining_cash:
+            logger.info(
+                "KIS 주문가능금액 동기화: %s → %s",
+                self._money(remaining_cash),
+                self._money(kis_cash),
+            )
+            return kis_cash
+        return remaining_cash
+
+    def _cap_buy_to_orderable(self, quantity: int, order_price: int) -> int:
+        """주문 직전 qty cap — (qty×price)+reserve+fee_buffer ≤ KIS orderable."""
+        qty = _to_int(quantity)
+        px = _to_int(order_price)
+        if qty <= 0 or px <= 0:
+            return 0
+        orderable = self._get_kis_orderable_cash(force=True)
+        reserve = int(self.min_cash_reserve or 0)
+        max_spend = max(0, orderable - reserve)
+        max_spend = int(max_spend * (1 - max(0.0, self.fee_buffer_pct)))
+        cost = qty * px
+        if cost <= max_spend:
+            return qty
+        new_qty = int(max_spend // px) if px > 0 else 0
+        if new_qty < qty:
+                logger.warning(
+                    "주문가능금액 초과 방지: qty %s→%s (orderable=%s, max_spend=%s, cost=%s)",
+                    qty,
+                    new_qty,
+                    self._money(orderable),
+                    self._money(max_spend),
+                    self._money(cost),
+                )
+        return max(0, new_qty)
+
     # ── 스크리너 전체 데이터 로드 ──────────────────────────────────────
     def _load_all_stock_data(self) -> Dict[str, Dict]:
         # 확장된 Screener 데이터 우선 로드
@@ -777,10 +828,14 @@ class Trader:
             # ticker가 전달되면 pdno로 변환
             if 'ticker' in kwargs and 'pdno' not in kwargs:
                 kwargs['pdno'] = kwargs.pop('ticker')
-            valid_params = ['ord_dv', 'pdno', 'ord_dvsn', 'ord_qty', 'ord_unpr']
+            valid_params = ['ord_dv', 'pdno', 'ord_dvsn', 'ord_qty', 'ord_unpr', 'ovrs_excg_hint']
             filtered_kwargs = {k: v for k, v in kwargs.items() if k in valid_params}
             if filtered_kwargs.get("pdno"):
                 filtered_kwargs["pdno"] = self._t(filtered_kwargs["pdno"])
+            if is_us_market(self.market) and not filtered_kwargs.get("ovrs_excg_hint"):
+                pdno = filtered_kwargs.get("pdno")
+                if pdno:
+                    filtered_kwargs["ovrs_excg_hint"] = resolve_us_ovrs_excg(pdno, self.market)
             ord_dv = str(filtered_kwargs.get("ord_dv", "") or "")
             is_sell = ord_dv in ("01", "1", "sell", "s")
             if is_us_market(self.market) and is_sell:
@@ -807,7 +862,7 @@ class Trader:
                     logger.debug("[order_raw:df-empty] %s", _mask_sensitive(out))
                     return out
                 rec = res.to_dict('records')[0]
-                rt_cd = rec.get('rt_cd', '')
+                rt_cd = str(rec.get('rt_cd', '') or '')
                 
                 # 개선된 성공 판단 로직
                 # ODNO(주문번호)가 있으면 부분 성공으로 간주
@@ -913,6 +968,12 @@ class Trader:
         txt = f"{result.get('msg1','')} {result.get('rt_cd','')} {result.get('msg_cd','')}".upper()
         return ('REJECT' in txt) or ('거절' in txt) or ('BROKER' in txt)
 
+    @staticmethod
+    def _is_insufficient_funds(result: Dict[str, Any]) -> bool:
+        msg_cd = str(result.get("msg_cd") or "").upper()
+        msg1 = str(result.get("msg1") or "")
+        return msg_cd == "APBK0952" or "주문가능금액" in msg1
+
     def _order_cash_retry(self, max_retries: int = 3, backoff_base: float = 0.5, **kwargs) -> Dict[str, Any]:
         """
         주문 재시도 래퍼:
@@ -929,6 +990,12 @@ class Trader:
             res = self._order_cash_safe(**kwargs)
             last_res = res
             if res.get('ok'):
+                return res
+            if self._is_insufficient_funds(res):
+                logger.warning(
+                    "주문가능금액 부족(APBK0952) — 재시도 생략: %s",
+                    res.get("msg1"),
+                )
                 return res
 
             # 가격대역/호가 오류 → 1회 가격 보정 재시도
@@ -3338,7 +3405,12 @@ class Trader:
     def _get_realtime_price_with_quotes(self, ticker: str) -> Dict[str, Any]:
         """실시간 현재가 및 호가 정보 조회"""
         try:
-            price_info = self.kis.get_realtime_price_with_quotes(ticker)
+            hint = self._ovrs_hint_for_ticker(ticker)
+            price_info = self.kis.get_realtime_price_with_quotes(
+                ticker,
+                market=self.market,
+                ovrs_excg_hint=hint,
+            )
             if price_info:
                 return price_info
             else:
@@ -3463,7 +3535,7 @@ class Trader:
         return {'status': 'submitted', 'executed': False, 'executed_qty': 0, 'wait_time': 1}
 
     def _execute_market_order(self, ticker: str, name: str, quantity: int, batch_name: str, pre_qty: int = None) -> Dict[str, Any]:
-        """시장가 주문 실행 - 개선된 체결 확인 로직"""
+        """시장가 주문 실행 — US: 지정가+슬리피지(TTTT1002U), KR: 시장가."""
         # quantity를 정수로 변환 (문자열이 전달될 수 있는 경우 대비)
         quantity = _to_int(quantity)
         if pre_qty is not None:
@@ -3472,15 +3544,54 @@ class Trader:
         
         try:
             # 주문 전 보유 수량 확인 (중복 주문 방지)
-            # pre_qty가 전달되지 않으면 현재 스냅샷에서 읽기
             if pre_qty is None:
                 _, holdings_before, _ = self._get_optimized_account_info(force=True)
                 pre_qty = self._get_qty(holdings_before, ticker)
-            
-            result = self._order_cash_retry(
-                ord_dv="02", pdno=ticker, ord_dvsn="01",  # 시장가 주문
-                ord_qty=str(quantity), ord_unpr="0"  # 시장가는 가격 0
-            )
+
+            ovrs_hint = self._ovrs_hint_for_ticker(ticker)
+
+            if is_us_market(self.market):
+                quote = self._get_realtime_price_with_quotes(ticker)
+                px = 0
+                if quote:
+                    px = _to_int(
+                        quote.get("ask_price")
+                        or quote.get("current_price")
+                        or quote.get("bid_price")
+                    )
+                if px <= 0:
+                    logger.error(
+                        "US 시장성 매수 실패: %s(%s) 유효 시세 없음",
+                        name,
+                        ticker,
+                    )
+                    return {"status": "failed", "error": "no valid price for US buy fallback"}
+                quantity = self._cap_buy_to_orderable(quantity, px)
+                if quantity <= 0:
+                    return {"status": "failed", "error": "insufficient orderable cash (APBK0952 prevention)"}
+                ord_dvsn, ord_unpr = resolve_us_buy_order_params(px, urgency="urgent")
+                logger.info(
+                    "US 시장성 매수(지정가+슬리피지): %s(%s) %s주 @ %s ord_dvsn=%s",
+                    name,
+                    ticker,
+                    quantity,
+                    self._money(ord_unpr),
+                    ord_dvsn,
+                )
+                result = self._order_cash_retry(
+                    ord_dv="02",
+                    pdno=ticker,
+                    ord_dvsn=ord_dvsn,
+                    ord_qty=str(quantity),
+                    ord_unpr=str(int(ord_unpr)),
+                    ovrs_excg_hint=ovrs_hint,
+                )
+            else:
+                result = self._order_cash_retry(
+                    ord_dv="02", pdno=ticker, ord_dvsn="01",
+                    ord_qty=str(quantity), ord_unpr="0",
+                    ovrs_excg_hint=ovrs_hint,
+                )
             
             logger.info(f"시장가 주문 응답: {result}")
             
@@ -4341,7 +4452,7 @@ class Trader:
                         logger.info(f"[{name}({ticker})] 쿨다운 중 → 신규매수 제외")
                         continue
                     new_targets.append(plan)
-        remaining_cash = available_cash
+        remaining_cash = self._sync_remaining_cash_with_kis(available_cash)
         any_order_placed = False
         def _execute_buy_batch(plans: List[Dict], batch_name: str):
             nonlocal remaining_cash, any_order_placed, effective_slots
@@ -4371,6 +4482,8 @@ class Trader:
                 if not self._prevent_duplicate_orders(ticker, batch_name):
                     logger.info(f"  -> [{name}({ticker})] 중복 주문 방지로 스킵")
                     continue
+
+                remaining_cash = self._sync_remaining_cash_with_kis(remaining_cash)
 
                 # 최신 현금 기준으로 슬롯 사용량 재평가
                 if self.trading_guards.get("auto_shrink_slots", False):
@@ -4442,6 +4555,15 @@ class Trader:
                             "batch": batch_name
                         }
                     }), key=f"phase:buy_insufficient:{ticker}:{self.run_id}", cooldown=120)
+                    continue
+
+                quantity = self._cap_buy_to_orderable(quantity, order_price)
+                if quantity <= 0:
+                    logger.info(
+                        "  -> [%s(%s)] KIS 주문가능금액 부족으로 매수 스킵",
+                        name,
+                        ticker,
+                    )
                     continue
 
                 pre_qty = 0  # 신규/리밸런스에서는 0 기준
@@ -4934,6 +5056,11 @@ class Trader:
                 if remaining_cash <= max(self.min_order_cash, self.min_cash_reserve):
                     logger.info(f"잔여 현금 부족({self._money(remaining_cash)})으로 매수 중단")
                     break
+
+                remaining_cash = self._sync_remaining_cash_with_kis(remaining_cash)
+                if remaining_cash <= max(self.min_order_cash, self.min_cash_reserve):
+                    logger.info(f"KIS 주문가능금액 부족({self._money(remaining_cash)})으로 매수 중단")
+                    break
                     
                 info = plan.get("stock_info", {})
                 for k, dv in SCHEMA_DEFAULTS.items():
@@ -5048,6 +5175,17 @@ class Trader:
             if quantity <= 0 or (self.min_order_cash > 0 and (quantity * order_price) < self.min_order_cash):
                 logger.warning(f"  -> [{name}({ticker})] 최소 주문 금액 미충족")
                 return False
+
+            quantity = self._cap_buy_to_orderable(quantity, order_price)
+            if quantity <= 0:
+                logger.warning(
+                    "  -> [%s(%s)] KIS 주문가능금액 부족으로 매수 스킵 (APBK0952 방지)",
+                    name,
+                    ticker,
+                )
+                return False
+
+            ovrs_hint = self._ovrs_hint_for_ticker(ticker)
             
             logger.info(f"  -> 매수 준비: {name}({ticker}), 수량: {quantity}주, 지정가: {self._money(order_price)} [라운드{round_num}]")
             
@@ -5094,7 +5232,8 @@ class Trader:
                 logger.info(f"  -> 단일 지정가 주문 시도: {name}({ticker}) {quantity}주 @ {self._money(order_price)}")
                 res = self._order_cash_retry(
                     ord_dv="02", pdno=ticker, ord_dvsn="00",
-                    ord_qty=str(quantity), ord_unpr=str(int(order_price))
+                    ord_qty=str(quantity), ord_unpr=str(int(order_price)),
+                    ovrs_excg_hint=ovrs_hint,
                 )
                 logger.info(f"  -> 주문 응답: {res}")
                 
@@ -5213,7 +5352,8 @@ class Trader:
                         logger.info(f"  -> 시장성 지정가 주문 시도: {name}({ticker}) {quantity}주 @ {self._money(px)}")
                         alt_res = self._order_cash_retry(
                             ord_dv="02", pdno=ticker, ord_dvsn="00",
-                            ord_qty=str(quantity), ord_unpr=str(int(px))
+                            ord_qty=str(quantity), ord_unpr=str(int(px)),
+                            ovrs_excg_hint=ovrs_hint,
                         )
                         exec_res = self._enhanced_execution_check(ticker, alt_res, quantity)
                         if exec_res.get('executed'):

@@ -332,14 +332,21 @@ class KIS(DomesticStock, OverseasStock):
         """서버시간과 로컬시간의 차이를 반영한 현재시간을 반환"""
         return datetime.utcnow() + timedelta(seconds=self.get_time_diff_ratio())
 
-    def get_realtime_price_with_quotes(self, ticker: str, market=None):
+    def get_realtime_price_with_quotes(
+        self,
+        ticker: str,
+        market=None,
+        ovrs_excg_hint=None,
+    ):
         """국내/해외 실시간 시세·호가 (MARKET 또는 market 인자로 분기)."""
         import os
         from utils import is_us_market
 
         mkt = market or os.getenv("MARKET", "SP500")
         if is_us_market(mkt):
-            return OverseasStock.get_realtime_price_with_quotes(self, ticker, mkt)
+            return OverseasStock.get_realtime_price_with_quotes(
+                self, ticker, mkt, ovrs_excg_hint=ovrs_excg_hint
+            )
         return DomesticStock.get_realtime_price_with_quotes(self, ticker)
 
     def inquire_price(self, fid_cond_mrkt_div_code: str, fid_input_iscd: str, market=None):
@@ -364,7 +371,16 @@ class KIS(DomesticStock, OverseasStock):
             )
         return DomesticStock.inquire_price(self, fid_cond_mrkt_div_code, fid_input_iscd)
 
-    def order_cash(self, ord_dv: str, pdno: str, ord_dvsn: str, ord_qty: int, ord_unpr: int, market=None):
+    def order_cash(
+        self,
+        ord_dv: str,
+        pdno: str,
+        ord_dvsn: str,
+        ord_qty: int,
+        ord_unpr: int,
+        market=None,
+        ovrs_excg_hint=None,
+    ):
         """
         국내/해외 주문 라우팅.
         - KR: DomesticStock.order_cash (ord_dv 01=매도, 02=매수)
@@ -384,6 +400,6 @@ class KIS(DomesticStock, OverseasStock):
                 ord_dvsn=ord_dvsn,
                 ord_qty=int(ord_qty),
                 ord_unpr=int(ord_unpr),
-                ovrs_excg_cd=resolve_us_ovrs_excg(sym, mkt),
+                ovrs_excg_cd=resolve_us_ovrs_excg(sym, mkt, ovrs_excg_hint=ovrs_excg_hint),
             )
         return DomesticStock.order_cash(self, ord_dv, pdno, ord_dvsn, ord_qty, ord_unpr)

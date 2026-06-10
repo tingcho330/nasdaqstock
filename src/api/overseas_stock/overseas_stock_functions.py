@@ -55,6 +55,10 @@ class OverseasStock:
             or row.get("stck_prpr")
             or row.get("prpr")
         )
+        price_source = "last"
+        if px_f <= 0:
+            px_f = _pf(row.get("base") or row.get("stck_sdpr"))
+            price_source = "base"
         if px_f <= 0:
             return None
         px = int(round(px_f))
@@ -75,12 +79,18 @@ class OverseasStock:
             "low_price": int(round(_pf(row.get("low") or row.get("stck_lwpr")))) or px,
             "open_price": int(round(_pf(row.get("open") or row.get("stck_oprc")))) or px,
             "prev_close": int(round(_pf(row.get("base") or row.get("stck_sdpr") or row.get("pvol")))) or px,
+            "price_source": price_source,
         }
 
-    def get_realtime_price_with_quotes(self, ticker: str, market: Optional[str] = None):
-        """해외주식 실시간 현재가·호가 (HHDFS00000300)."""
+    def get_realtime_price_with_quotes(
+        self,
+        ticker: str,
+        market: Optional[str] = None,
+        ovrs_excg_hint: Optional[str] = None,
+    ):
+        """해외주식 실시간 현재가·호가 (HHDFS00000300, EXCD 폴백 + HHDFS76200200)."""
         import os
-        from utils import is_us_market, norm_ticker, resolve_us_excd
+        from utils import is_us_market, norm_ticker, resolve_us_excd_candidates
 
         mkt = market or os.getenv("MARKET", "SP500")
         if not is_us_market(mkt):
@@ -88,31 +98,84 @@ class OverseasStock:
         symb = norm_ticker(ticker, mkt)
         if not symb:
             return None
-        excd = resolve_us_excd(symb, mkt)
-        df = self.overseas_price(excd, symb)
-        if df is None or df.empty:
-            logger.warning("해외 실시간 시세 빈 응답: %s@%s", symb, excd)
-            return None
-        row = df.iloc[0]
-        info = self._parse_overseas_quote_row(row.to_dict() if hasattr(row, "to_dict") else dict(row))
-        if not info:
-            logger.warning(
-                "해외 실시간 시세 파싱 실패: %s@%s keys=%s",
-                symb,
-                excd,
-                list(row.index) if hasattr(row, "index") else [],
-            )
-            return None
-        if os.getenv("KIS_TRACE", "").strip() in ("1", "true", "yes"):
+        excds = resolve_us_excd_candidates(symb, mkt, ovrs_excg_hint)
+        last_keys: List[str] = []
+
+        for excd in excds:
+            df = self.overseas_price(excd, symb)
+            if df is None or df.empty:
+                logger.debug("해외 현재가 빈 응답: %s@%s", symb, excd)
+                continue
+            row = df.iloc[0]
+            last_keys = list(row.index) if hasattr(row, "index") else []
+            info = self._parse_overseas_quote_row(row.to_dict() if hasattr(row, "to_dict") else dict(row))
+            if info and int(info.get("current_price") or 0) > 0:
+                if excd != excds[0]:
+                    logger.info(
+                        "해외 시세 EXCD 폴백: %s@%s → %s (px=%s source=%s)",
+                        symb,
+                        excds[0],
+                        excd,
+                        info.get("current_price"),
+                        info.get("price_source"),
+                    )
+                if os.getenv("KIS_TRACE", "").strip() in ("1", "true", "yes"):
+                    logger.info(
+                        "KIS_TRACE overseas quote %s@%s px=%s bid=%s ask=%s source=%s",
+                        symb,
+                        excd,
+                        info.get("current_price"),
+                        info.get("bid_price"),
+                        info.get("ask_price"),
+                        info.get("price_source"),
+                    )
+                return info
+
+        for excd in excds[:3]:
+            detail = self.overseas_price_detail(excd, symb)
+            if detail is None or detail.empty:
+                continue
+            drow = detail.iloc[0].to_dict() if hasattr(detail.iloc[0], "to_dict") else dict(detail.iloc[0])
+            px_f = 0.0
+            for key in ("last", "stck_prpr", "prpr", "base", "stck_sdpr"):
+                try:
+                    raw = drow.get(key)
+                    if raw is not None and str(raw).strip() != "":
+                        px_f = float(str(raw).replace(",", "").strip())
+                except (TypeError, ValueError):
+                    px_f = 0.0
+                if px_f > 0:
+                    break
+            if px_f <= 0:
+                continue
+            px = int(round(px_f))
             logger.info(
-                "KIS_TRACE overseas quote %s@%s px=%s bid=%s ask=%s",
+                "해외 시세 price-detail 폴백: %s@%s px=%s",
                 symb,
                 excd,
-                info.get("current_price"),
-                info.get("bid_price"),
-                info.get("ask_price"),
+                px,
             )
-        return info
+            return {
+                "current_price": px,
+                "bid_price": px,
+                "ask_price": px,
+                "volume": 0,
+                "change_rate": 0.0,
+                "change_amount": 0,
+                "high_price": px,
+                "low_price": px,
+                "open_price": px,
+                "prev_close": px,
+                "price_source": "price_detail",
+            }
+
+        logger.warning(
+            "해외 실시간 시세 파싱 실패: %s tried=%s keys=%s",
+            symb,
+            excds,
+            last_keys,
+        )
+        return None
 
     def overseas_price_detail(self, excd: str, symb: str) -> pd.DataFrame:
         """해외주식 현재가상세 — HHDFS76200200 (PER/PBR 등)"""
@@ -454,12 +517,23 @@ class OverseasStock:
             row.setdefault("msg_cd", body.get("msg_cd", ""))
             row.setdefault("msg1", body.get("msg1", ""))
             return pd.DataFrame([row])
+        rt_cd = str(body.get("rt_cd", "") or "")
+        msg_cd = str(body.get("msg_cd", "") or "")
+        msg1 = str(body.get("msg1", "") or "")
+        if rt_cd or msg_cd or msg1:
+            logger.warning(
+                "해외 주문 응답 output 없음 %s %s rt_cd=%s msg_cd=%s msg1=%s",
+                excd,
+                symb,
+                rt_cd,
+                msg_cd,
+                msg1,
+            )
+            return pd.DataFrame([{"rt_cd": rt_cd, "msg_cd": msg_cd, "msg1": msg1}])
         logger.warning(
-            "해외 주문 응답 output 없음 %s %s rt_cd=%s msg_cd=%s msg1=%s",
+            "해외 주문 응답 output 없음 %s %s (body keys=%s)",
             excd,
             symb,
-            body.get("rt_cd"),
-            body.get("msg_cd"),
-            body.get("msg1"),
+            list(body.keys())[:20],
         )
         return pd.DataFrame()

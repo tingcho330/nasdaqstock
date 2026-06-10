@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 
-from utils import get_us_regime_config, is_us_market, norm_ticker, resolve_us_excd
+from utils import get_us_regime_config, is_us_market, norm_ticker, resolve_us_excd_candidates
 
 logger = logging.getLogger(__name__)
 
@@ -349,6 +349,7 @@ def get_historical_prices_kis(
     market: Optional[str] = None,
     kis: Any = None,
     retries: int = 3,
+    ovrs_excg_hint: Optional[str] = None,
 ) -> Optional[pd.DataFrame]:
     """
     KIS API로 OHLCV 조회.
@@ -372,21 +373,39 @@ def get_historical_prices_kis(
     for attempt in range(max(1, retries)):
         try:
             if is_us_market(mkt):
-                excd = resolve_us_excd(code, mkt)
-                df = _fetch_overseas_daily_pages(
-                    client, code, excd, start_date, end_date
-                )
+                excds = resolve_us_excd_candidates(code, mkt, ovrs_excg_hint)
+                for excd in excds:
+                    df = _fetch_overseas_daily_pages(
+                        client, code, excd, start_date, end_date
+                    )
+                    if df is not None and not df.empty:
+                        if excd != excds[0]:
+                            logger.info(
+                                "KIS OHLCV EXCD 폴백: %s %s → %s rows=%d",
+                                code,
+                                excds[0],
+                                excd,
+                                len(df),
+                            )
+                        logger.debug(
+                            "KIS OHLCV %s %s~%s rows=%d",
+                            code,
+                            start_date,
+                            end_date,
+                            len(df),
+                        )
+                        return df
             else:
                 df = _fetch_domestic_period(client, code, start_date, end_date)
-            if df is not None and not df.empty:
-                logger.debug(
-                    "KIS OHLCV %s %s~%s rows=%d",
-                    code,
-                    start_date,
-                    end_date,
-                    len(df),
-                )
-                return df
+                if df is not None and not df.empty:
+                    logger.debug(
+                        "KIS OHLCV %s %s~%s rows=%d",
+                        code,
+                        start_date,
+                        end_date,
+                        len(df),
+                    )
+                    return df
         except Exception as e:
             last_err = e
             if attempt < retries - 1:
