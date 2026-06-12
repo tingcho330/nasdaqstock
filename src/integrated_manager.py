@@ -394,6 +394,15 @@ def _parse_amount(val) -> int:
         return 0
 
 
+def _parse_float_amount(val) -> float:
+    try:
+        if val is None or val == "":
+            return 0.0
+        return round(float(str(val).replace(",", "").strip()), 2)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def _fmt_krw(amount: int) -> str:
     return f"{int(amount):,}원"
 
@@ -435,47 +444,48 @@ def _load_summary_row_from_path(path: Path) -> Dict:
         return {}
 
 
+def _summary_date_for_snapshot(snap: Dict) -> Optional[str]:
+    """summary_YYYYMMDD.json 조회용 — KST 캡처일 우선 (US open의 session_close_date 제외)."""
+    return snap.get("date") or snap.get("file_date")
+
+
 def _kis_metrics_from_snapshot(snap: Dict) -> Dict[str, int]:
     """balance 스냅샷에 embedded kis_summary 또는 summary_*.json 참조."""
+    date_key = _summary_date_for_snapshot(snap)
+    if date_key:
+        row = _load_summary_row_from_path(OUTPUT_DIR / f"summary_{date_key}.json")
+        if row:
+            return _kis_metrics_from_row(row)
+
     embedded = snap.get("kis_summary")
     if isinstance(embedded, dict) and embedded:
         return _kis_metrics_from_row(embedded)
 
     summary_path = snap.get("summary_file")
-    if summary_path:
+    if summary_path and date_key:
         p = Path(summary_path)
         if not p.is_file():
             p = OUTPUT_DIR / p.name
-        row = _load_summary_row_from_path(p)
-        if row:
-            return _kis_metrics_from_row(row)
-
-    for date_key in (
-        snap.get("file_date"),
-        snap.get("session_close_date"),
-        snap.get("date"),
-    ):
-        if not date_key:
-            continue
-        row = _load_summary_row_from_path(OUTPUT_DIR / f"summary_{date_key}.json")
-        if row:
-            return _kis_metrics_from_row(row)
+        if date_key in p.name:
+            row = _load_summary_row_from_path(p)
+            if row:
+                return _kis_metrics_from_row(row)
 
     return _kis_metrics_from_row({})
 
 
 def _holdings_detail_from_rows(holdings: List[Dict]) -> List[Dict]:
-    """보유 종목 상세 (USD 소수 현재가 허용)."""
+    """보유 종목 상세 (USD 소수 현재가·평가금액 허용)."""
     mkt = MARKET
     out: List[Dict] = []
     for h in holdings:
         qty = _parse_amount(h.get("hldg_qty", 0))
         if qty <= 0:
             continue
-        price = _parse_amount(h.get("prpr", 0))
-        evlu = _parse_amount(h.get("evlu_amt", 0))
+        price = _parse_float_amount(h.get("prpr", 0))
+        evlu = _parse_float_amount(h.get("evlu_amt", 0))
         if evlu <= 0 and price > 0:
-            evlu = qty * price
+            evlu = round(qty * price, 2)
         out.append({
             "ticker": normalize_ticker_6(h.get("pdno", ""), mkt),
             "name": h.get("prdt_name", "N/A"),
@@ -486,20 +496,20 @@ def _holdings_detail_from_rows(holdings: List[Dict]) -> List[Dict]:
     return out
 
 
-def _holdings_value_from_rows(holdings: List[Dict]) -> int:
+def _holdings_value_from_rows(holdings: List[Dict]) -> float:
     return sum(h["value"] for h in _holdings_detail_from_rows(holdings))
 
 
 def _portfolio_totals_from_cash_map(
     cash_map: Dict, holdings: List[Dict]
-) -> Tuple[int, int, int]:
+) -> Tuple[int, int, float]:
     """(총평가, 예수금, 보유평가) — US는 예수금+보유평가가 KIS 총평가보다 신뢰될 때 우선."""
     hv = _holdings_value_from_rows(holdings)
     if hv <= 0:
-        hv = sum(_parse_amount(h.get("evlu_amt")) for h in holdings)
+        hv = sum(_parse_float_amount(h.get("evlu_amt")) for h in holdings)
         if hv <= 0:
             hv = sum(
-                _parse_amount(h.get("hldg_qty")) * _parse_amount(h.get("prpr"))
+                _parse_amount(h.get("hldg_qty")) * _parse_float_amount(h.get("prpr"))
                 for h in holdings
             )
 
@@ -534,12 +544,12 @@ def _portfolio_totals_from_cash_map(
     return total, cash, hv
 
 
-def _portfolio_totals_from_snapshot(snap: Dict) -> Tuple[int, int, int]:
+def _portfolio_totals_from_snapshot(snap: Dict) -> Tuple[int, int, float]:
     """저장된 스냅샷의 총평가 보정 (과거 cash-only total_balance 호환)."""
     cash = _parse_amount(snap.get("cash"))
-    hv = _parse_amount(snap.get("holdings_value"))
+    hv = _parse_float_amount(snap.get("holdings_value"))
     if hv <= 0 and snap.get("holdings_detail"):
-        hv = sum(_parse_amount(h.get("value")) for h in snap["holdings_detail"])
+        hv = sum(_parse_float_amount(h.get("value")) for h in snap["holdings_detail"])
     total = _parse_amount(snap.get("total_balance"))
     computed = cash + hv
     orderable = cash
@@ -708,8 +718,8 @@ def compare_balances(open_balance: Dict, close_balance: Dict) -> Dict:
             close_total = cm["tot_evlu_amt_krw"]
             open_cash = om["ord_psbl_frcr_amt"]
             close_cash = cm["ord_psbl_frcr_amt"]
-            open_hv = om["evlu_pfls_smtl_amt"]
-            close_hv = cm["evlu_pfls_smtl_amt"]
+            _, _, open_hv = _portfolio_totals_from_snapshot(open_balance)
+            _, _, close_hv = _portfolio_totals_from_snapshot(close_balance)
         else:
             open_total, open_cash, open_hv = _portfolio_totals_from_snapshot(open_balance)
             close_total, close_cash, close_hv = _portfolio_totals_from_snapshot(close_balance)
