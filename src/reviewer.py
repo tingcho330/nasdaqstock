@@ -8,7 +8,10 @@ import logging
 import os
 import json
 import shutil
+import subprocess
+import re
 import numpy as np
+import requests
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any, List, Tuple
 from dataclasses import dataclass
@@ -378,6 +381,381 @@ DEFAULT_MAX_REL_CHANGE = 0.30
 # 프롬프트에 포함할 코스피 뉴스 최대 개수
 NEWS_MAX_ITEMS = 40
 
+# GitHub 커밋 조회 (코드 변경 ↔ 이상 거래 교차 검증)
+DEFAULT_GITHUB_REPO_URL = "https://github.com/tingcho330/nasdaqstock.git"
+DEFAULT_GITHUB_BRANCH = "main"
+DEFAULT_COMMIT_BUFFER_HOURS = 72
+TRADING_CRITICAL_PATH_PREFIXES = (
+    "src/trader.py",
+    "src/risk_manager.py",
+    "src/recorder.py",
+    "src/order_reconciler.py",
+    "src/gpt_analyzer.py",
+    "src/screener.py",
+    "src/screener_core.py",
+    "src/integrated_manager.py",
+    "src/kis_overseas_account.py",
+    "src/kis_market_data.py",
+    "src/rotation_policy.py",
+    "src/rotation_manager.py",
+    "config/config.json",
+)
+
+
+def _normalize_dt(dt: datetime) -> datetime:
+    """naive/aware datetime → UTC aware."""
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _trade_timestamp(trade: Any) -> datetime:
+    ts = getattr(trade, "timestamp", None) or datetime.min.replace(tzinfo=timezone.utc)
+    return _normalize_dt(ts)
+
+
+def _parse_github_repo_url(url: str) -> Tuple[str, str]:
+    """https://github.com/owner/repo(.git) → (owner, repo)."""
+    url = (url or "").strip().rstrip("/")
+    m = re.match(r"(?:https?://)?github\.com/([^/]+)/([^/.]+)", url)
+    if not m:
+        raise ValueError(f"invalid GitHub repo URL: {url}")
+    return m.group(1), m.group(2)
+
+
+def _github_headers() -> Dict[str, str]:
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "nasdaqstock-reviewer",
+    }
+    token = os.getenv("GITHUB_TOKEN") or os.getenv("REVIEWER_GITHUB_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+def _commit_entry_from_api(item: Dict[str, Any]) -> Dict[str, Any]:
+    commit = item.get("commit") or {}
+    author = commit.get("author") or {}
+    date_str = author.get("date") or ""
+    committed_at = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+    return {
+        "sha": (item.get("sha") or "")[:12],
+        "full_sha": item.get("sha") or "",
+        "message": (commit.get("message") or "").split("\n")[0][:200],
+        "committed_at": committed_at.isoformat(),
+        "author": author.get("name") or "",
+        "html_url": item.get("html_url") or "",
+        "files": [],
+        "source": "github_api",
+    }
+
+
+def _fetch_github_commits_api(
+    owner: str,
+    repo: str,
+    since: datetime,
+    until: datetime,
+    branch: str,
+) -> List[Dict[str, Any]]:
+    """GitHub REST API로 기간 내 커밋 목록을 페이지네이션 조회."""
+    since_utc = _normalize_dt(since)
+    until_utc = _normalize_dt(until)
+    url = f"https://api.github.com/repos/{owner}/{repo}/commits"
+    params: Dict[str, Any] = {
+        "sha": branch,
+        "since": since_utc.isoformat().replace("+00:00", "Z"),
+        "until": until_utc.isoformat().replace("+00:00", "Z"),
+        "per_page": 100,
+    }
+    out: List[Dict[str, Any]] = []
+    page = 1
+    while page <= 10:
+        params["page"] = page
+        resp = requests.get(url, params=params, headers=_github_headers(), timeout=30)
+        if resp.status_code != 200:
+            logger.warning(f"GitHub commits API 실패 ({resp.status_code}): {resp.text[:300]}")
+            break
+        batch = resp.json()
+        if not isinstance(batch, list) or not batch:
+            break
+        for item in batch:
+            entry = _commit_entry_from_api(item)
+            committed = datetime.fromisoformat(entry["committed_at"].replace("Z", "+00:00"))
+            if since_utc <= committed <= until_utc:
+                out.append(entry)
+        if len(batch) < 100:
+            break
+        page += 1
+    out.sort(key=lambda c: c["committed_at"])
+    return out
+
+
+def _fetch_github_commit_files(owner: str, repo: str, full_sha: str) -> List[str]:
+    """단일 커밋의 변경 파일 목록."""
+    if not full_sha:
+        return []
+    url = f"https://api.github.com/repos/{owner}/{repo}/commits/{full_sha}"
+    resp = requests.get(url, headers=_github_headers(), timeout=30)
+    if resp.status_code != 200:
+        return []
+    data = resp.json()
+    files = data.get("files") or []
+    return [str(f.get("filename") or "") for f in files if f.get("filename")]
+
+
+def _commit_touches_trading_code(files: List[str]) -> bool:
+    if not files:
+        return True
+    for path in files:
+        for prefix in TRADING_CRITICAL_PATH_PREFIXES:
+            if path == prefix or path.startswith(prefix.rstrip("/") + "/"):
+                return True
+    return False
+
+
+def _fetch_commits_local_git(
+    repo_path: str,
+    since: datetime,
+    until: datetime,
+    branch: str,
+) -> List[Dict[str, Any]]:
+    """로컬 .git 이 있을 때 git log 로 커밋 조회 (API 폴백)."""
+    git_dir = os.path.join(repo_path, ".git")
+    if not os.path.isdir(git_dir):
+        return []
+    fmt = "%H%x1f%an%x1f%ad%x1f%s"
+    cmd = [
+        "git", "-C", repo_path, "log",
+        f"--since={_normalize_dt(since).isoformat()}",
+        f"--until={_normalize_dt(until).isoformat()}",
+        branch, f"--format={fmt}", "--date=iso-strict",
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30, check=False)
+    except Exception as e:
+        logger.debug(f"local git log 실패: {e}")
+        return []
+    if proc.returncode != 0:
+        return []
+    out: List[Dict[str, Any]] = []
+    for line in proc.stdout.splitlines():
+        parts = line.split("\x1f", 3)
+        if len(parts) < 4:
+            continue
+        full_sha, author, date_str, message = parts
+        try:
+            committed_at = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        files: List[str] = []
+        try:
+            show = subprocess.run(
+                ["git", "-C", repo_path, "show", "--name-only", "--pretty=format:", full_sha],
+                capture_output=True, text=True, timeout=15, check=False,
+            )
+            if show.returncode == 0:
+                files = [ln.strip() for ln in show.stdout.splitlines() if ln.strip()]
+        except Exception:
+            pass
+        out.append({
+            "sha": full_sha[:12],
+            "full_sha": full_sha,
+            "message": message[:200],
+            "committed_at": committed_at.isoformat(),
+            "author": author,
+            "html_url": "",
+            "files": files,
+            "source": "local_git",
+        })
+    out.sort(key=lambda c: c["committed_at"])
+    return out
+
+
+def fetch_repo_commits(
+    since: datetime,
+    until: datetime,
+    repo_url: Optional[str] = None,
+    branch: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """GitHub API(우선) 또는 로컬 git 으로 분석 기간 커밋을 수집."""
+    repo_url = repo_url or os.getenv("REVIEWER_GITHUB_REPO_URL", DEFAULT_GITHUB_REPO_URL)
+    branch = branch or os.getenv("REVIEWER_GITHUB_BRANCH", DEFAULT_GITHUB_BRANCH)
+    filter_files = os.getenv("REVIEWER_GITHUB_FILTER_FILES", "1") == "1"
+    max_detail = int(os.getenv("REVIEWER_GITHUB_MAX_COMMIT_DETAILS", "50"))
+
+    commits: List[Dict[str, Any]] = []
+    try:
+        owner, repo = _parse_github_repo_url(repo_url)
+        commits = _fetch_github_commits_api(owner, repo, since, until, branch)
+        if filter_files and commits:
+            for i, c in enumerate(commits[:max_detail]):
+                files = _fetch_github_commit_files(owner, repo, c.get("full_sha", ""))
+                c["files"] = files
+                c["touches_trading_code"] = _commit_touches_trading_code(files)
+            for c in commits[max_detail:]:
+                c["touches_trading_code"] = True
+        else:
+            for c in commits:
+                c["touches_trading_code"] = True
+    except Exception as e:
+        logger.warning(f"GitHub 커밋 조회 실패 → local git 시도: {e}")
+
+    if not commits:
+        local_path = os.getenv("REVIEWER_GITHUB_LOCAL_PATH", "")
+        if not local_path:
+            local_path = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        commits = _fetch_commits_local_git(local_path, since, until, branch)
+        for c in commits:
+            c["touches_trading_code"] = _commit_touches_trading_code(c.get("files") or [])
+
+    relevant = [c for c in commits if c.get("touches_trading_code", True)]
+    logger.info(f"[github] commits total={len(commits)} trading_relevant={len(relevant)}")
+    return relevant
+
+
+def build_commit_windows(
+    commits: List[Dict[str, Any]],
+    buffer_hours: int,
+) -> List[Dict[str, Any]]:
+    """커밋 시각 이후 buffer_hours 동안을 '코드 변경 영향 구간'으로 본다."""
+    windows: List[Dict[str, Any]] = []
+    for c in commits:
+        try:
+            start = datetime.fromisoformat(c["committed_at"].replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        end = start + timedelta(hours=buffer_hours)
+        windows.append({
+            "sha": c.get("sha", ""),
+            "message": c.get("message", ""),
+            "window_start": start.isoformat(),
+            "window_end": end.isoformat(),
+            "committed_at": c.get("committed_at", ""),
+        })
+    return windows
+
+
+def _trade_in_commit_window(trade_ts: datetime, windows: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    """거래 시각이 속한 커밋 영향 구간 목록."""
+    trade_ts = _normalize_dt(trade_ts)
+    hits: List[Dict[str, str]] = []
+    for w in windows:
+        try:
+            start = datetime.fromisoformat(w["window_start"].replace("Z", "+00:00"))
+            end = datetime.fromisoformat(w["window_end"].replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if start <= trade_ts <= end:
+            hits.append({"sha": w.get("sha", ""), "message": w.get("message", "")})
+    return hits
+
+
+def detect_suspicious_sell(trade: Any, sell_pnls: List[float]) -> Tuple[bool, List[str]]:
+    """매도 거래의 이상 징후를 탐지한다."""
+    if str(getattr(trade, "action", "")).lower() != "sell":
+        return False, []
+
+    reasons: List[str] = []
+    pl = float(getattr(trade, "profit_loss", 0.0) or 0.0)
+    qty = int(getattr(trade, "quantity", 0) or 0)
+    price = float(getattr(trade, "price", 0.0) or 0.0)
+    amount = float(getattr(trade, "amount", 0.0) or 0.0)
+    status = str(getattr(trade, "order_status", "executed") or "executed").lower()
+    exec_qty = int(getattr(trade, "executed_qty", 0) or 0)
+
+    if qty <= 0 or price <= 0:
+        reasons.append("invalid_qty_or_price")
+    if status not in ("executed", ""):
+        reasons.append(f"non_executed_status:{status}")
+    if qty > 0 and exec_qty == 0:
+        reasons.append("zero_executed_qty")
+    if pl == 0 and amount > 0:
+        reasons.append("zero_pnl_sell")
+
+    if len(sell_pnls) >= 5:
+        arr = np.array(sell_pnls, dtype=float)
+        std = float(np.std(arr))
+        if std > 0 and abs(pl - float(np.mean(arr))) > 2 * std:
+            reasons.append("pnl_outlier")
+
+    return len(reasons) > 0, reasons
+
+
+def filter_trades_for_analysis(
+    trades: List[Any],
+    commits: List[Dict[str, Any]],
+    buffer_hours: int,
+) -> Tuple[List[Any], Dict[str, Any]]:
+    """이상 매도 + 코드 변경 영향 구간 겹침 거래를 종합 분석에서 제외."""
+    windows = build_commit_windows(commits, buffer_hours)
+    sells = [t for t in trades if str(getattr(t, "action", "")).lower() == "sell"]
+    sell_pnls = [float(getattr(t, "profit_loss", 0.0) or 0.0) for t in sells]
+
+    excluded_keys: set = set()
+    excluded_details: List[Dict[str, Any]] = []
+
+    for trade in trades:
+        if str(getattr(trade, "action", "")).lower() != "sell":
+            continue
+        suspicious, sus_reasons = detect_suspicious_sell(trade, sell_pnls)
+        if not suspicious:
+            continue
+        nearby = _trade_in_commit_window(_trade_timestamp(trade), windows)
+        if not nearby:
+            continue
+        key = (
+            getattr(trade, "ticker", ""),
+            _trade_timestamp(trade).isoformat(),
+            getattr(trade, "order_id", ""),
+        )
+        excluded_keys.add(key)
+        excluded_details.append({
+            "ticker": getattr(trade, "ticker", ""),
+            "timestamp": _trade_timestamp(trade).isoformat(),
+            "action": "sell",
+            "profit_loss": float(getattr(trade, "profit_loss", 0.0) or 0.0),
+            "order_id": getattr(trade, "order_id", ""),
+            "reason_code": getattr(trade, "reason_code", ""),
+            "suspicious_reasons": sus_reasons,
+            "nearby_commits": nearby,
+            "exclusion_reason": "suspicious_trade_during_code_change_window",
+        })
+
+    filtered = []
+    for trade in trades:
+        if str(getattr(trade, "action", "")).lower() != "sell":
+            filtered.append(trade)
+            continue
+        key = (
+            getattr(trade, "ticker", ""),
+            _trade_timestamp(trade).isoformat(),
+            getattr(trade, "order_id", ""),
+        )
+        if key not in excluded_keys:
+            filtered.append(trade)
+
+    meta = {
+        "commits_count": len(commits),
+        "commit_windows": windows,
+        "commits": [
+            {
+                "sha": c.get("sha"),
+                "message": c.get("message"),
+                "committed_at": c.get("committed_at"),
+                "files": (c.get("files") or [])[:8],
+            }
+            for c in commits
+        ],
+        "total_trades": len(trades),
+        "sell_trades": len(sells),
+        "excluded_sell_trades": len(excluded_details),
+        "analyzed_sell_trades": len(sells) - len(excluded_details),
+        "excluded_details": excluded_details,
+        "buffer_hours": buffer_hours,
+    }
+    return filtered, meta
+
 
 def _clamp(value: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, value))
@@ -547,8 +925,9 @@ def _extract_tunable(cfg: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def gpt_propose_config_changes(stats: Dict[str, Any], news: List[Dict[str, str]],
-                               cfg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """GPT 에 승패 통계 + 코스피 뉴스 + 현재 설정을 주고 변경안을 받는다.
+                               cfg: Dict[str, Any],
+                               commit_context: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+    """GPT 에 승패 통계 + 코스피 뉴스 + GitHub 커밋 + 현재 설정을 주고 변경안을 받는다.
 
     반환 형식(검증 전): {"screener_params": {...}, "risk_params": {...},
                        "strategy_params": {...}, "reasons": [...]} 또는 None
@@ -564,15 +943,38 @@ def gpt_propose_config_changes(stats: Dict[str, Any], news: List[Dict[str, str]]
         f"- [{n.get('date','')}] {n.get('title','')} :: {n.get('desc','')}" for n in news
     ) or "(수집된 뉴스 없음)"
 
+    commit_lines = "(커밋 정보 없음)"
+    if commit_context:
+        commits = commit_context.get("commits") or []
+        excluded = commit_context.get("excluded_details") or []
+        commit_lines = "\n".join(
+            f"- [{c.get('committed_at','')[:10]}] {c.get('sha','')}: {c.get('message','')}"
+            for c in commits[:20]
+        ) or "(분석 기간 내 코드 변경 없음)"
+        if excluded:
+            ex_lines = "\n".join(
+                f"- {e.get('ticker')} @ {e.get('timestamp','')[:19]} "
+                f"PnL={e.get('profit_loss')} (제외: {', '.join(e.get('suspicious_reasons', []))})"
+                for e in excluded[:10]
+            )
+            commit_lines += (
+                f"\n\n## 분석에서 제외된 거래 (코드 변경 영향 구간 + 이상 징후)\n{ex_lines}"
+            )
+
     system_prompt = (
         "당신은 한국 주식 자동매매 시스템의 리스크/전략 파라미터를 검토하는 퀀트 전문가입니다. "
-        "최근 한 달 실제 매매 승패 통계와 코스피 시장 뉴스를 근거로, 주어진 설정값을 점진적으로 개선하세요. "
+        "최근 한 달 실제 매매 승패 통계, 코스피 시장 뉴스, GitHub 코드 변경 이력을 근거로 "
+        "주어진 설정값을 점진적으로 개선하세요. "
+        "코드 변경 직후 발생한 이상 거래는 이미 분석에서 제외되었으므로, "
+        "제외된 거래를 전략 성과로 해석하지 마세요. "
         "반드시 보수적으로 조정하고(한 번에 큰 변화 금지), 근거가 약하면 변경하지 마세요. "
         "응답은 반드시 단일 JSON 객체여야 합니다."
     )
     user_prompt = (
-        "## 최근 매매 승패 통계 (최근 한 달)\n"
+        "## 최근 매매 승패 통계 (코드 변경 영향 거래 제외 후)\n"
         f"{json.dumps(stats, ensure_ascii=False)}\n\n"
+        "## GitHub 코드 변경 이력 (분석 기간)\n"
+        f"{commit_lines}\n\n"
         "## 코스피 한 달 주요 뉴스\n"
         f"{news_lines}\n\n"
         "## 현재 설정값 (이 키들만 조정 가능)\n"
@@ -681,7 +1083,8 @@ def _apply_changes_to_cfg(cfg: Dict[str, Any], changes: Dict[str, Any]) -> None:
 
 
 def _notify_summary(stats: Dict[str, Any], changes: Dict[str, Any], reasons: List[str],
-                    lookback_days: int, applied: bool, news_count: int, source: str) -> None:
+                    lookback_days: int, applied: bool, news_count: int, source: str,
+                    commit_meta: Optional[Dict[str, Any]] = None) -> None:
     """Discord 로 분석/튜닝 요약 전송(실패는 조용히 무시)."""
     try:
         from notifier import send_discord_message, WEBHOOK_URL, is_valid_webhook
@@ -697,6 +1100,14 @@ def _notify_summary(stats: Dict[str, Any], changes: Dict[str, Any], reasons: Lis
             {"name": "💰 순손익", "value": f"{stats.get('net_pnl', 0):,}", "inline": True},
             {"name": "📰 뉴스/판단", "value": f"{news_count}건 / {source}", "inline": True},
         ]
+        if commit_meta:
+            excluded = int(commit_meta.get("excluded_sell_trades", 0))
+            commits_n = int(commit_meta.get("commits_count", 0))
+            fields.append({
+                "name": "🔧 GitHub 커밋",
+                "value": f"{commits_n}건 (분석 제외 매도 {excluded}건)",
+                "inline": True,
+            })
         if reasons:
             change_lines = "\n".join(f"• {r}" for r in reasons)
             status = "✅ 적용됨" if applied else "🧪 미적용(드라이런)"
@@ -717,7 +1128,7 @@ def _notify_summary(stats: Dict[str, Any], changes: Dict[str, Any], reasons: Lis
 
 
 def run_review() -> Dict[str, Any]:
-    """파이프라인 진입점: 최근 N일 DB 승패 + 코스피 뉴스를 GPT 가 리뷰해
+    """파이프라인 진입점: GitHub 커밋 + DB 승패 + 코스피 뉴스를 GPT 가 리뷰해
     config.json 의 screener_params/risk_params/strategy_params 를 조정한다."""
     from utils import setup_logging, CONFIG_PATH, OUTPUT_DIR
     setup_logging()
@@ -726,14 +1137,23 @@ def run_review() -> Dict[str, Any]:
     min_trades = int(os.getenv("REVIEWER_MIN_TRADES", "10"))
     dry_run = os.getenv("REVIEWER_DRY_RUN", "0") == "1"
     max_rel_change = float(os.getenv("REVIEWER_MAX_REL_CHANGE", str(DEFAULT_MAX_REL_CHANGE)))
+    commit_buffer_hours = int(
+        os.getenv("REVIEWER_COMMIT_BUFFER_HOURS", str(DEFAULT_COMMIT_BUFFER_HOURS))
+    )
 
     end_dt = datetime.now()
     start_dt = end_dt - timedelta(days=lookback_days)
 
-    logger.info(f"=== reviewer start (lookback={lookback_days}d, min_trades={min_trades}, "
-                f"dry_run={dry_run}, max_rel_change={max_rel_change}) ===")
+    logger.info(
+        f"=== reviewer start (lookback={lookback_days}d, min_trades={min_trades}, "
+        f"dry_run={dry_run}, max_rel_change={max_rel_change}, "
+        f"commit_buffer={commit_buffer_hours}h) ==="
+    )
 
-    # 1) DB 에서 기간 내 거래 조회
+    # 1) GitHub 커밋 조회 (코드 변경 ↔ 이상 거래 교차 검증)
+    commits = fetch_repo_commits(start_dt, end_dt)
+
+    # 2) DB 에서 기간 내 거래 조회
     try:
         from recorder import get_recorder
         recorder = get_recorder()
@@ -742,15 +1162,24 @@ def run_review() -> Dict[str, Any]:
         logger.error(f"거래 기록 조회 실패: {e}")
         trades = []
 
-    # 2) 승패 분석
-    stats = analyze_win_loss(trades)
-    logger.info(f"[stats] {stats}")
+    # 3) 코드 변경 영향 구간의 이상 거래 제외
+    filtered_trades, commit_meta = filter_trades_for_analysis(
+        trades, commits, commit_buffer_hours,
+    )
+    stats_raw = analyze_win_loss(trades)
+    stats = analyze_win_loss(filtered_trades)
+    logger.info(f"[stats] raw={stats_raw} filtered={stats}")
+    if commit_meta.get("excluded_sell_trades"):
+        logger.info(
+            f"[exclude] {commit_meta['excluded_sell_trades']}건 매도 제외 "
+            f"(commits={commit_meta['commits_count']}, buffer={commit_buffer_hours}h)"
+        )
 
-    # 3) 코스피 한 달 주요 뉴스 수집
+    # 4) 코스피 한 달 주요 뉴스 수집
     news = collect_kospi_news(lookback_days)
     logger.info(f"[news] 수집 {len(news)}건")
 
-    # 4) config 로드
+    # 5) config 로드
     config_path = CONFIG_PATH
     try:
         with open(config_path, "r", encoding="utf-8") as f:
@@ -763,6 +1192,8 @@ def run_review() -> Dict[str, Any]:
         "timestamp": end_dt.isoformat(),
         "lookback_days": lookback_days,
         "stats": stats,
+        "stats_raw": stats_raw,
+        "github_commits": commit_meta,
         "news_count": len(news),
         "changes": {},
         "reasons": [],
@@ -772,7 +1203,7 @@ def run_review() -> Dict[str, Any]:
         "config_path": str(config_path),
     }
 
-    # 5) 표본 부족/설정 로드 실패 시 스킵
+    # 6) 표본 부족/설정 로드 실패 시 스킵
     if stats["sell_trades"] < min_trades:
         result["skipped"] = True
         result["skip_reason"] = f"매도 거래 {stats['sell_trades']}건 < 최소 {min_trades}건"
@@ -785,8 +1216,8 @@ def run_review() -> Dict[str, Any]:
         reasons: List[str] = []
         source = "none"
 
-        # 6) GPT 리뷰 → 변경 제안
-        proposal = gpt_propose_config_changes(stats, news, cfg)
+        # 7) GPT 리뷰 → 변경 제안
+        proposal = gpt_propose_config_changes(stats, news, cfg, commit_context=commit_meta)
         if proposal:
             result["gpt_raw_proposal"] = proposal
             changes, notes = _sanitize_proposal(proposal, cfg, max_rel_change)
@@ -795,7 +1226,7 @@ def run_review() -> Dict[str, Any]:
             if changes:
                 source = "gpt"
 
-        # 7) GPT 불가/무변경 시 규칙 기반 auto_sell 폴백
+        # 8) GPT 불가/무변경 시 규칙 기반 auto_sell 폴백
         if not changes:
             auto_sell = cfg.setdefault("risk_params", {}).setdefault("auto_sell", {})
             fb_changes, fb_reasons = decide_autosell_adjustments(stats, auto_sell)
@@ -824,7 +1255,7 @@ def run_review() -> Dict[str, Any]:
         else:
             logger.info("[no-change] 적용할 변경 없음")
 
-    # 8) review_log.json 저장
+    # 9) review_log.json 저장
     try:
         out_path = OUTPUT_DIR / "review_log.json"
         with open(out_path, "w", encoding="utf-8") as f:
@@ -833,10 +1264,11 @@ def run_review() -> Dict[str, Any]:
     except Exception as e:
         logger.error(f"review_log 저장 실패: {e}")
 
-    # 9) Discord 요약
+    # 10) Discord 요약
     _notify_summary(stats, result.get("changes", {}), result.get("reasons", []),
                     lookback_days, result.get("applied", False),
-                    len(news), result.get("source", "none"))
+                    len(news), result.get("source", "none"),
+                    commit_meta=commit_meta)
 
     logger.info("=== reviewer done ===")
     return result
