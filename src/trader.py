@@ -5802,20 +5802,10 @@ if __name__ == "__main__":
         trader._update_account_info(force=True)
         cash0, holdings0, _ = trader.get_account_info_from_files()
 
-        # 세션 시작 가드
-        usable_cash = cash0
         if trader.reporting.get("include_cash_breakdown", False):
-            logger.info(f"usable_cash={trader._money(usable_cash)}")
-        min_trade = int(trader.trading_guards.get("min_total_cash_to_trade", 0))
-        if trader.trading_guards.get("skip_when_low_funds", False) and usable_cash < min_trade:
-            trader._set_summary_reason(
-                "SKIPPED_LOW_FUNDS_SESSION",
-                f"cash {trader._money(usable_cash)} < min_total_cash_to_trade {trader._money(min_trade)}",
-            )
-            trader.emit_final_summary(start_ts, status="SUCCESS", warnings=0)
-            sys.exit(0)
+            logger.info(f"usable_cash={trader._money(cash0)}")
 
-        # 매도 로직 실행
+        # 매도 로직 실행 (저자금 가드와 무관하게 항상 실행)
         executed_sells = False
         if holdings0:
             executed_sells = trader.run_sell_logic(holdings0)
@@ -5852,8 +5842,20 @@ if __name__ == "__main__":
         # 회전 샌드박스 제안 로깅
         trader._log_gpt_rotation_sandbox()
 
-        # 매수 로직 실행 (갱신된 현금과 보유 종목 사용)
-        trader.run_buy_logic(cash1, holdings1)
+        # 매수 로직 실행 (갱신된 현금과 보유 종목 사용; 저자금이면 매수만 스킵)
+        min_trade = int(trader.trading_guards.get("min_total_cash_to_trade", 0))
+        if trader.trading_guards.get("skip_when_low_funds", False) and cash1 < min_trade:
+            trader._set_summary_reason(
+                "SKIPPED_LOW_FUNDS_SESSION",
+                f"cash {trader._money(cash1)} < min_total_cash_to_trade {trader._money(min_trade)}",
+            )
+            logger.info(
+                "저자금으로 매수 스킵: cash %s < min_total_cash_to_trade %s (매도는 실행됨)",
+                trader._money(cash1),
+                trader._money(min_trade),
+            )
+        else:
+            trader.run_buy_logic(cash1, holdings1)
 
         # 15시 20분 일괄 체결 확인 실행
         if trader.should_run_batch_check():
