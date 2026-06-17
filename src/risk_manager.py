@@ -32,6 +32,14 @@ from utils import (
     resolve_us_sell_order_params,
     risk_session_windows,
 )
+from partial_sell_state import (
+    compute_partial_qty,
+    had_partial_sell,
+    mark_partial_sell,
+    has_open_sell_order,
+    has_buy_record,
+    add_post_partial_buy_cooldown,
+)
 from notifier import (
     DiscordLogHandler,
     WEBHOOK_URL,
@@ -334,6 +342,14 @@ class RiskManager:
         # [NEW] 즉시 매도 옵션 및 브로커 초기화
         auto_sell_cfg = rp.get("auto_sell", {}) or {}
         self._direct_execute_sell_enabled: bool = bool(auto_sell_cfg.get("direct_execute", False))
+        if "direct_execute_partial" in auto_sell_cfg:
+            self._direct_execute_partial_enabled = bool(auto_sell_cfg.get("direct_execute_partial"))
+        else:
+            self._direct_execute_partial_enabled = True
+        self._partial_execute_once: bool = bool(auto_sell_cfg.get("partial_execute_once", True))
+        self._partial_full_if_rounding_zero: bool = bool(
+            auto_sell_cfg.get("partial_full_if_rounding_zero", True)
+        )
         self._direct_sell_cooldown: int = int(auto_sell_cfg.get("cooldown_sec_per_ticker", 20))
         # [NEW] 긴급 낙폭(드로우다운) 임계값(없으면 stop_pct 사용)
         self.emergency_drop_pct: float = float(auto_sell_cfg.get("emergency_drop_pct", rp.get("stop_pct", 0.0)))
@@ -597,6 +613,7 @@ class RiskManager:
         *,
         fallback_px: int = 0,
         ovrs_excg_hint: Optional[str] = None,
+        urgency: str = "urgent",
     ) -> bool:
         """즉시 매도 — US: ORD_DVSN=00 + 현재가 지정가, KR: 시장가(ord_dvsn=01)."""
         try:
@@ -615,7 +632,7 @@ class RiskManager:
                 return False
 
             if is_us_market(mkt):
-                ord_dvsn, ord_unpr = resolve_us_sell_order_params(px, urgency="urgent")
+                ord_dvsn, ord_unpr = resolve_us_sell_order_params(px, urgency=urgency)
             else:
                 ord_dvsn, ord_unpr = "01", 0
 
@@ -702,6 +719,109 @@ class RiskManager:
             logger.error(f"[DIRECT_SELL] exception: {e}")
         return False
 
+    def _keep_if_min_holding_hours_not_met(self, ticker: str) -> Optional[Tuple[str, str, Dict]]:
+        """PartialProfit 제외 매도 공통 — min_holding_hours(14일) 미충족 시 KEEP."""
+        trading_params = self.config.get("trading_params", {}) or {}
+        min_holding_hours = int(trading_params.get("min_holding_hours", 0) or 0)
+        if min_holding_hours <= 0:
+            return None
+        is_eligible, holding_hours = check_min_holding_hours(ticker, min_holding_hours)
+        if is_eligible:
+            return None
+        logger.info(
+            f"[{ticker}] ⚠️ 최소 보유시간 미충족: {holding_hours:.1f}h < {min_holding_hours}h → 유지"
+        )
+        return (
+            "KEEP",
+            f"최소 보유시간 미충족 ({holding_hours:.1f}h < {min_holding_hours}h)",
+            {
+                "type": "KEEP_MIN_HOLDING_HOURS",
+                "context": {
+                    "holding_hours": holding_hours,
+                    "min_holding_hours": min_holding_hours,
+                    "reason": "min_holding_hours_not_met",
+                },
+            },
+        )
+
+    def _partial_sell_flag_ttl_days(self) -> int:
+        tp = self.config.get("trading_params", {}) or {}
+        return int(tp.get("partial_sell_flag_ttl_days", 7) or 7)
+
+    def _post_partial_buy_cooldown_days(self) -> int:
+        tp = self.config.get("trading_params", {}) or {}
+        return int(tp.get("post_partial_sell_buy_cooldown_days", 5) or 5)
+
+    def _can_direct_partial_sell_now(
+        self,
+        ticker: str,
+        *,
+        partial_qty: int,
+    ) -> Tuple[bool, str]:
+        if not self._direct_execute_partial_enabled:
+            return False, "direct_execute_partial disabled"
+        if self._kis is None:
+            return False, "KIS not initialized"
+        if partial_qty <= 0:
+            return False, "partial_qty<=0"
+        if not has_buy_record(ticker):
+            return False, "no_buy_record"
+        if self._partial_execute_once and had_partial_sell(ticker, self._partial_sell_flag_ttl_days()):
+            return False, "already_partial_sell"
+        if has_open_sell_order(ticker):
+            return False, "open_sell_order"
+
+        now = pytime.time()
+        last = self._recent_direct_sell.get(ticker, 0.0)
+        if now - last < self._direct_sell_cooldown:
+            return False, f"cooldown ({now - last:.0f}s)"
+
+        now_kst = datetime.now(KST)
+        if not is_market_open_day(market=_market()):
+            return False, "non-trading day"
+        sell_wins = self._effective_sell_time_windows()
+        if sell_wins and not in_time_windows(now_kst, sell_wins, tz=KST):
+            return False, "outside sell window"
+
+        self._recent_direct_sell[ticker] = now
+        return True, ""
+
+    def _direct_execute_partial_sell(
+        self,
+        ticker: str,
+        name: str,
+        qty: int,
+        reason_meta: Dict,
+        *,
+        fallback_px: int = 0,
+        ovrs_excg_hint: Optional[str] = None,
+    ) -> bool:
+        meta = {
+            **reason_meta,
+            "mode": "direct_execute_partial",
+            "partial_qty": qty,
+        }
+        ok = self._direct_execute_sell(
+            ticker,
+            name,
+            qty,
+            meta,
+            fallback_px=fallback_px,
+            ovrs_excg_hint=ovrs_excg_hint,
+            urgency="normal",
+        )
+        if ok:
+            try:
+                mark_partial_sell(ticker)
+                add_post_partial_buy_cooldown(
+                    ticker,
+                    self._post_partial_buy_cooldown_days(),
+                    reason="부분익절 후 매수 차단(direct_partial)",
+                )
+            except Exception as e:
+                logger.debug("[%s] partial sell 후처리 실패: %s", ticker, e)
+        return ok
+
     def _ensure_summary_file_exists(self):
         """요약 파일이 없으면 account.py를 실행하여 생성"""
         try:
@@ -782,13 +902,32 @@ class RiskManager:
         risk_params = self.config.get("risk_params", {}) or {}
         strategy_params = self.config.get("strategy_params", {}) or {}  # Phase 1: strategy_params 추가
 
+        if ep <= 0 and self._kis is not None:
+            try:
+                quote = self._kis.get_realtime_price_with_quotes(
+                    t,
+                    market=_market(),
+                    ovrs_excg_hint=ovrs_excg_hint,
+                )
+                qpx = _to_int(quote.get("current_price", 0)) if quote else 0
+                if qpx > 0:
+                    ep = float(qpx)
+                    logger.debug(
+                        f"[{t}] entry_price 보정: HHDFS → {_money(qpx)} "
+                        f"(source={quote.get('price_source') if quote else 'N/A'})"
+                    )
+            except Exception as e:
+                logger.debug(f"[{t}] entry_price HHDFS 보정 실패: {e}")
+
         # 기본 페이로드 + 퍼센트 백업(선적용, 이후 코어 계산 성공 시 덮어씀)
         out: Dict = {
             "Ticker": t,
-            "Price": int(round(ep)),
+            "Price": int(round(ep)) if ep > 0 else 0,
             "RSI": 50.0,
-            **_percent_backup_levels(ep, risk_params),
+            **_percent_backup_levels(ep if ep > 0 else 0.0, risk_params),
         }
+
+        levels: Dict = {}
 
         # 1) 손절/목표가 (성공 시만 덮어쓰기)
         try:
@@ -888,6 +1027,7 @@ class RiskManager:
                     end_dt.strftime("%Y%m%d"),
                     market=_market(),
                     kis=self._kis,
+                    ovrs_excg_hint=ovrs_excg_hint,
                 )
 
                 if df is not None and not df.empty:
@@ -926,7 +1066,7 @@ class RiskManager:
                             out["MA200"] = round(float(ma200.iloc[-1]), 2)
                         
                         # ATR 계산 (DynamicAtrStrategy용)
-                        if "ATR" in levels:
+                        if isinstance(levels, dict) and "ATR" in levels:
                             out["ATR"] = float(levels.get("ATR", 0.0))
                         
                         # daily_chart 데이터 (AdvancedTechnicalStrategy용)
@@ -970,6 +1110,7 @@ class RiskManager:
                     end_dt.strftime("%Y%m%d"),
                     market=_market(),
                     kis=self._kis,
+                    ovrs_excg_hint=ovrs_excg_hint,
                 )
 
                 if df is not None and not df.empty:
@@ -1235,28 +1376,6 @@ class RiskManager:
         if emergency is not None:
             return emergency
 
-        # Phase 1.4: 최소 보유시간 (EmergencyDrop 제외)
-        trading_params = self.config.get("trading_params", {})
-        min_holding_hours = trading_params.get("min_holding_hours", 0)
-        if min_holding_hours > 0:
-            is_eligible, holding_hours = check_min_holding_hours(ticker, min_holding_hours)
-            if not is_eligible:
-                logger.info(
-                    f"[{ticker}] ⚠️ 당일 매도 방지: 보유시간 {holding_hours:.1f}시간 < 최소 {min_holding_hours}시간 → 유지"
-                )
-                return (
-                    "KEEP",
-                    f"당일 매도 방지 (보유시간 {holding_hours:.1f}시간 < 최소 {min_holding_hours}시간)",
-                    {
-                        "type": "KEEP_SAME_DAY",
-                        "context": {
-                            "holding_hours": holding_hours,
-                            "min_holding_hours": min_holding_hours,
-                            "reason": "same_day_sell_prevented"
-                        }
-                    }
-                )
-
         # 입력 손절/목표 우선
         stop_px_in = _to_float(stock_info.get("손절가"), 0.0)
         take_px_in = _to_float(stock_info.get("목표가"), 0.0)
@@ -1305,6 +1424,63 @@ class RiskManager:
             f"목표: 현재가={_money(cur_price)} vs 임계값={_money(tp_threshold)} ({'도달' if cur_price >= tp_threshold else '미도달'}) | "
             f"RSI: {rsi:.1f} vs {self.rules.rsi_take_profit} ({'과열' if (self.rules.rsi_take_profit and rsi >= self.rules.rsi_take_profit) else '정상'})"
         )
+
+        # Phase 2: 부분 익절 (min_holding_hours/days 면제)
+        auto_sell_config = self.config.get("risk_params", {}).get("auto_sell", {})
+        partial_profit_pct = auto_sell_config.get("partial_profit_pct", 0.0)
+        partial_profit_ratio = auto_sell_config.get("partial_profit_ratio", 0.0)
+        
+        if partial_profit_pct > 0 and partial_profit_ratio > 0:
+            avg_price = _to_float(holding.get("pchs_avg_pric"), 0.0)
+            if avg_price > 0 and take_px > 0:
+                profit_pct = (cur_price - avg_price) / avg_price
+                target_profit_pct = (take_px / avg_price - 1.0) if avg_price > 0 else 1.0
+                
+                if profit_pct >= partial_profit_pct and profit_pct < target_profit_pct:
+                    partial_win_ok = tp_win_ok
+                    if not partial_win_ok:
+                        logger.info(
+                            f"[{ticker}] ⚠️ 부분 익절 조건 충족했으나 매도 시간대 아님: "
+                            f"수익률 {profit_pct:.2%} ≥ {partial_profit_pct:.2%}, "
+                            f"시간대={self.rules.time_windows_for_take_profit or self.rules.time_windows_for_sells}"
+                        )
+                        return (
+                            "KEEP",
+                            f"부분 익절 조건 충족했으나 매도 시간대 아님 ({profit_pct:.2%} ≥ {partial_profit_pct:.2%})",
+                            {
+                                "type": "KEEP_TIME_WINDOW",
+                                "context": {
+                                    "profit_pct": profit_pct,
+                                    "partial_profit_pct": partial_profit_pct,
+                                    "time_window": self.rules.time_windows_for_take_profit or self.rules.time_windows_for_sells,
+                                    "reason": "time_window_not_allowed"
+                                }
+                            }
+                        )
+                    
+                    logger.info(
+                        f"[{ticker}] ✅ 부분 익절 조건 충족: 수익률 {profit_pct:.2%} ≥ {partial_profit_pct:.2%}, "
+                        f"일부 {partial_profit_ratio:.0%} 익절 (min_holding 면제)"
+                    )
+                    return (
+                        "PARTIAL_SELL",
+                        f"부분 익절({profit_pct:.2%} ≥ {partial_profit_pct:.2%}, {partial_profit_ratio:.0%} 익절) | 전략=PartialProfit, levels_source={levels_source} | win={self.rules.time_windows_for_take_profit or self.rules.time_windows_for_sells or 'ALL'}",
+                        {
+                            "type": "PartialProfit",
+                            "context": {
+                                "current_price": cur_price,
+                                "profit_pct": profit_pct,
+                                "partial_profit_pct": partial_profit_pct,
+                                "partial_profit_ratio": partial_profit_ratio,
+                                "levels_source": levels_source,
+                                "time_window": self.rules.time_windows_for_take_profit or self.rules.time_windows_for_sells or 'ALL'
+                            }
+                        }
+                    )
+
+        keep_hours = self._keep_if_min_holding_hours_not_met(ticker)
+        if keep_hours is not None:
+            return keep_hours
 
         # 1) 손절 전략 (시간대 필터 적용)
         logger.debug(f"[{ticker}] 손절가체크] 손절가={_money(stop_px)}, 임계값={_money(stop_threshold)}, 현재가={_money(cur_price)}, 조건={stop_threshold > 0 and cur_price <= stop_threshold}")
@@ -1370,64 +1546,6 @@ class RiskManager:
                     f"win={self.rules.time_windows_for_sells or 'ALL'}",
                     context
                 )
-        # Phase 2: 부분 익절 체크 (목표가 도달 전)
-        auto_sell_config = self.config.get("risk_params", {}).get("auto_sell", {})
-        partial_profit_pct = auto_sell_config.get("partial_profit_pct", 0.0)
-        partial_profit_ratio = auto_sell_config.get("partial_profit_ratio", 0.0)
-        
-        if partial_profit_pct > 0 and partial_profit_ratio > 0:
-            avg_price = _to_float(holding.get("pchs_avg_pric"), 0.0)
-            if avg_price > 0:
-                profit_pct = (cur_price - avg_price) / avg_price
-                # 수정: tp_threshold 대신 take_px 사용 (목표가 기준 비교)
-                # take_px가 0이거나 유효하지 않으면 부분 익절을 건너뜀 (목표가가 없으면 부분 익절 불가)
-                if take_px > 0:
-                    target_profit_pct = (take_px / avg_price - 1.0) if avg_price > 0 else 1.0
-                    
-                    if profit_pct >= partial_profit_pct and profit_pct < target_profit_pct:
-                        # 부분 익절 조건 충족 (목표가 도달 전)
-                        # 시간대 필터 확인 (부분 익절도 매도이므로 시간대 체크 필요)
-                        partial_win_ok = tp_win_ok  # 목표가 시간대 필터 사용 (없으면 매도 시간대 사용)
-                        if not partial_win_ok:
-                            logger.info(
-                                f"[{ticker}] ⚠️ 부분 익절 조건 충족했으나 매도 시간대 아님: "
-                                f"수익률 {profit_pct:.2%} ≥ {partial_profit_pct:.2%}, "
-                                f"시간대={self.rules.time_windows_for_take_profit or self.rules.time_windows_for_sells}"
-                            )
-                            # 시간대가 아니면 유지 (다음 사이클에서 다시 체크)
-                            return (
-                                "KEEP",
-                                f"부분 익절 조건 충족했으나 매도 시간대 아님 ({profit_pct:.2%} ≥ {partial_profit_pct:.2%})",
-                                {
-                                    "type": "KEEP_TIME_WINDOW",
-                                    "context": {
-                                        "profit_pct": profit_pct,
-                                        "partial_profit_pct": partial_profit_pct,
-                                        "time_window": self.rules.time_windows_for_take_profit or self.rules.time_windows_for_sells,
-                                        "reason": "time_window_not_allowed"
-                                    }
-                                }
-                            )
-                        
-                        logger.info(
-                            f"[{ticker}] ✅ 부분 익절 조건 충족: 수익률 {profit_pct:.2%} ≥ {partial_profit_pct:.2%}, "
-                            f"일부 {partial_profit_ratio:.0%} 익절"
-                        )
-                        return (
-                            "PARTIAL_SELL",
-                            f"부분 익절({profit_pct:.2%} ≥ {partial_profit_pct:.2%}, {partial_profit_ratio:.0%} 익절) | 전략=PartialProfit, levels_source={levels_source} | win={self.rules.time_windows_for_take_profit or self.rules.time_windows_for_sells or 'ALL'}",
-                            {
-                                "type": "PartialProfit",
-                                "context": {
-                                    "current_price": cur_price,
-                                    "profit_pct": profit_pct,
-                                    "partial_profit_pct": partial_profit_pct,
-                                    "partial_profit_ratio": partial_profit_ratio,
-                                    "levels_source": levels_source,
-                                    "time_window": self.rules.time_windows_for_take_profit or self.rules.time_windows_for_sells or 'ALL'
-                                }
-                            }
-                        )
         
         # 2) 목표가 전략 (시간대 필터 적용: 없으면 전반 윈도우 사용)
         logger.debug(f"[{ticker}] 목표가체크] 목표가={_money(take_px)}, 임계값={_money(tp_threshold)}, 현재가={_money(cur_price)}, 조건={tp_threshold > 0 and cur_price >= tp_threshold and tp_win_ok}")
@@ -2206,16 +2324,67 @@ def _run_cycle(rm: RiskManager, *, notify_summary: bool = True) -> None:
                 elif decision == "PARTIAL_SELL":
                     log_msg = f" 부분 익절 판단: {reason}"
                     logger.info(f"[리스크체크] [{idx}/{len(valid_holdings)}] {name}({ticker}) ℹ️ {log_msg}")
-                    # 하이라이트된 embed 메시지 전송
                     _notify_sell_embed(holding_for_check, reason, "PARTIAL_SELL", structured_context,
                                      key="risk_partial_sell", cooldown_sec=300)
                     
-                    # 부분 익절 타입 확인
                     sell_type = structured_context.get("type", "PartialProfit") if structured_context else "PartialProfit"
                     logger.info(f"[리스크체크] [{idx}/{len(valid_holdings)}] {ticker} 부분 익절 판단 상세: 타입={sell_type}, 이유={reason}")
                     
-                    # 부분 익절은 trader.py에서 처리 (수량 계산 등 복잡한 로직)
-                    logger.info(f"[리스크체크] [{idx}/{len(valid_holdings)}] {ticker} 부분 익절 판단되었으나 trader.py에서 처리 필요.")
+                    ctx = structured_context.get("context", {}) if structured_context else {}
+                    partial_ratio = float(ctx.get("partial_profit_ratio", 0.5) or 0.5)
+                    partial_qty = compute_partial_qty(
+                        qty,
+                        partial_ratio,
+                        full_if_rounding_zero=rm._partial_full_if_rounding_zero,
+                    )
+                    if partial_qty <= 0:
+                        logger.warning(
+                            f"[리스크체크] [{idx}/{len(valid_holdings)}] {ticker} 부분 익절 스킵: "
+                            f"수량={qty}, ratio={partial_ratio:.0%}, computed={partial_qty}"
+                        )
+                    elif partial_qty == qty and int(qty * partial_ratio) <= 0:
+                        logger.info(
+                            f"[리스크체크] [{idx}/{len(valid_holdings)}] {ticker} "
+                            f"partial_ratio={partial_ratio:.0%} → 전량 treat ({partial_qty}주)"
+                        )
+                    
+                    can_partial, skip_reason = rm._can_direct_partial_sell_now(
+                        ticker, partial_qty=partial_qty
+                    )
+                    if can_partial:
+                        logger.info(
+                            f"[리스크체크] [{idx}/{len(valid_holdings)}] {ticker} "
+                            f"[DIRECT_PARTIAL] 즉시 부분 매도 시도: {name} {partial_qty:,}주"
+                        )
+                        ok = rm._direct_execute_partial_sell(
+                            ticker,
+                            holding_for_check.get("prdt_name", ""),
+                            partial_qty,
+                            {
+                                "type": sell_type,
+                                "reason": reason,
+                                "partial_profit_ratio": partial_ratio,
+                                "time_window": rm.rules.time_windows_for_sells or 'ALL',
+                                **ctx,
+                            },
+                            fallback_px=cur_price,
+                            ovrs_excg_hint=ovrs_hint,
+                        )
+                        if ok:
+                            logger.info(
+                                f"[리스크체크] [{idx}/{len(valid_holdings)}] {ticker} "
+                                f"[DIRECT_PARTIAL] ✅ 주문 제출 성공 ({partial_qty}주)"
+                            )
+                        else:
+                            logger.warning(
+                                f"[리스크체크] [{idx}/{len(valid_holdings)}] {ticker} "
+                                f"[DIRECT_PARTIAL] ❌ 주문 실패 (다음 사이클 재시도)"
+                            )
+                    else:
+                        logger.info(
+                            f"[리스크체크] [{idx}/{len(valid_holdings)}] {ticker} "
+                            f"부분 익절 direct 스킵: {skip_reason} (trader fallback 가능)"
+                        )
                 else:
                     logger.info(f"[리스크체크] [{idx}/{len(valid_holdings)}] {name}({ticker}) ✅ 유지 판단: {reason}")
             

@@ -349,15 +349,23 @@ class KIS(DomesticStock, OverseasStock):
             )
         return DomesticStock.get_realtime_price_with_quotes(self, ticker)
 
-    def inquire_price(self, fid_cond_mrkt_div_code: str, fid_input_iscd: str, market=None):
-        """주식 현재가 — US는 해외 시세 API, KR은 국내 inquire-price."""
+    def inquire_price(
+        self,
+        fid_cond_mrkt_div_code: str,
+        fid_input_iscd: str,
+        market=None,
+        ovrs_excg_hint=None,
+    ):
+        """주식 현재가 — US: HHDFS00000300/76200200, KR: FHKST01010100 inquire-price."""
         import os
         from utils import is_us_market, norm_ticker
 
         mkt = market or os.getenv("MARKET", "SP500")
         if is_us_market(mkt):
             sym = norm_ticker(fid_input_iscd, mkt)
-            info = OverseasStock.get_realtime_price_with_quotes(self, sym, mkt)
+            info = OverseasStock.get_realtime_price_with_quotes(
+                self, sym, mkt, ovrs_excg_hint=ovrs_excg_hint
+            )
             if not info:
                 return pd.DataFrame()
             return pd.DataFrame(
@@ -366,6 +374,7 @@ class KIS(DomesticStock, OverseasStock):
                         "stck_prpr": info["current_price"],
                         "bidp": info.get("bid_price", info["current_price"]),
                         "askp": info.get("ask_price", info["current_price"]),
+                        "price_source": info.get("price_source"),
                     }
                 ]
             )

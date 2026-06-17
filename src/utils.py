@@ -1542,8 +1542,9 @@ def check_min_holding_period(ticker: str, min_days: int, current_time: Optional[
 
 def check_min_holding_hours(ticker: str, min_hours: int, current_time: Optional[datetime] = None) -> Tuple[bool, float]:
     """
-    최소 보유시간 체크 (당일 매도 방지)
+    최소 보유시간 체크 (매수일 기준).
     Returns: (is_eligible, holding_hours)
+    - DB 매수 기록 없음 / 오류 → strict 차단 (False, 0)
     """
     logger = logging.getLogger(__name__)
     
@@ -1553,7 +1554,6 @@ def check_min_holding_hours(ticker: str, min_hours: int, current_time: Optional[
     if min_hours <= 0:
         return True, 0.0
     
-    # DB 조회 시 '0280360' vs '280360' 형식 불일치 방지 (당일 매도 방지 우회 버그 수정)
     ticker = normalize_ticker_6(ticker)
     
     try:
@@ -1561,9 +1561,9 @@ def check_min_holding_hours(ticker: str, min_hours: int, current_time: Optional[
         
         trades = fetch_trades_by_tickers([ticker])
         if not trades or ticker not in trades or not trades[ticker]:
-            return True, 0.0
+            logger.warning(f"[{ticker}] 최소 보유시간: 매수 기록 없음 → strict 차단")
+            return False, 0.0
         
-        # 취소된 주문 제외, executed·pending만 사용 (당일 매도 방지는 주문 접수 시각부터 적용)
         def _valid_buy(t):
             if t.get('action', '').upper() != 'BUY':
                 return False
@@ -1572,34 +1572,23 @@ def check_min_holding_hours(ticker: str, min_hours: int, current_time: Optional[
         
         buy_trades = [t for t in trades[ticker] if _valid_buy(t)]
         if not buy_trades:
-            return True, 0.0
+            logger.warning(f"[{ticker}] 최소 보유시간: 유효 BUY 없음 → strict 차단")
+            return False, 0.0
         
-        # 당일 매도 방지: 당일 최초 매수(또는 주문 접수) 시각 기준으로 보유시간 계산.
-        # 11시 pending → 15시 20분 체결 시 두 건 있으면, 가장 이른 시각(11시)을 써서 당일 매도 차단.
-        today = current_time.date()
-        today_buys = []
-        for t in buy_trades:
-            ts = t.get('timestamp')
-            if ts is None:
-                continue
-            if isinstance(ts, str):
-                ts = datetime.fromisoformat(ts.replace('Z', '+00:00'))
-            if ts.tzinfo is None:
-                ts = ts.replace(tzinfo=KST)
-            if ts.date() == today:
-                today_buys.append(ts)
+        latest_buy = max(buy_trades, key=lambda x: x.get('timestamp', datetime.min))
+        buy_time = latest_buy.get('timestamp')
+        if buy_time is None:
+            logger.warning(f"[{ticker}] 최소 보유시간: BUY timestamp 없음 → strict 차단")
+            return False, 0.0
+        if isinstance(buy_time, str):
+            buy_time = datetime.fromisoformat(buy_time.replace('Z', '+00:00'))
+        if buy_time.tzinfo is None:
+            buy_time = buy_time.replace(tzinfo=KST)
         
-        if not today_buys:
-            return True, 0.0
-        
-        # 당일 매수 중 가장 이른 시각 기준
-        buy_time = min(today_buys)
         holding_hours = (current_time - buy_time).total_seconds() / 3600.0
-        is_eligible = holding_hours >= min_hours
+        is_eligible = holding_hours >= float(min_hours)
         return is_eligible, holding_hours
     except Exception as e:
-        # 보유시간 체크는 "당일 매도 방지" 안전장치이므로,
-        # 실패 시 보수적으로 '매도 불가'로 처리한다.
         logger.warning(f"[{ticker}] 최소 보유시간 체크 실패(보수적 차단): {e}")
         return False, 0.0
 
@@ -1625,6 +1614,16 @@ def validate_config_consistency(config: Dict) -> List[str]:
     
     if strategy_tp and auto_tp and abs(strategy_tp - auto_tp) > 0.001:
         errors.append(f"익절 불일치: strategy_params={strategy_tp}, auto_sell={auto_tp}")
+
+    tp = config.get("trading_params", {}) or {}
+    rot = config.get("rotation", {}) or {}
+    min_hours = int(tp.get("min_holding_hours", 0) or 0)
+    min_days = int(rot.get("min_holding_days", 0) or 0)
+    if min_hours > 0 and min_days > 0 and (min_days * 24) != min_hours:
+        errors.append(
+            f"최소 보유기간 불일치: min_holding_hours={min_hours} "
+            f"vs min_holding_days={min_days} ({min_days * 24}h)"
+        )
     
     return errors
 

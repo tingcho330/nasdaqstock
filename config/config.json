@@ -77,7 +77,10 @@
       "partial_profit_pct": 0.025,   // 부분 익절 트리거 %
       "partial_profit_ratio": 0.5,   // 부분 익절 비율
       "emergency_drop_pct": 0.13,    // 급락 시 즉시 매도 % (손익률 ≤ -13%)
-      "direct_execute": true,        // true: risk_manager가 직접 주문
+      "direct_execute": true,        // true: risk_manager가 SELL 즉시 주문
+      "direct_execute_partial": true, // true: PARTIAL_SELL 즉시 주문 (기본 true)
+      "partial_execute_once": true,   // 종목당 부분익절 1회
+      "partial_full_if_rounding_zero": true,  // 1주×50% → 전량 treat
       "cooldown_sec_per_ticker": 20  // 종목별 재매도 방지(초)
     },
     "rsi_take_profit": 82.0,         // RSI 과열 익절 기준
@@ -180,7 +183,7 @@
       "max_shares_per_order": null,    // null=무제한(예산 내 최대 주수), 정수=종목당 상한
       "reserve_final_cash": true       // 마지막 rank 매수 시 min_cash_reserve 유지
     },
-    "min_holding_hours": 336,        // 최소 보유 시간 (14일, EmergencyDrop 제외)
+    "min_holding_hours": 336,        // 최소 보유 14일 (PartialProfit 부분익절 제외)
     "min_order_cash": 100,           // 최소 주문 금액 (USD)
     "rebuy_atr_k": 0.5,
     "rebuy_rsi_ceiling": 72.0,
@@ -263,7 +266,7 @@
   // ── 종목 회전 (rotation_manager) ──────────────────────────────────
   "rotation": {
     "enabled": false,
-    "min_holding_days": 10,
+    "min_holding_days": 14,          // rotation/손절·RSI — min_holding_hours(336h)와 동일 14일
     "delta_score_min": 0.12          // 교체 최소 점수 차이
   },
 

@@ -53,6 +53,13 @@ from utils import (
 )
 from api.kis_auth import KIS
 from risk_manager import RiskManager
+from partial_sell_state import (
+    compute_partial_qty,
+    had_partial_sell as _had_partial_sell_flag,
+    mark_partial_sell as _mark_partial_sell_flag,
+    clear_partial_sell_flag as _clear_partial_sell_flag_fn,
+    has_open_sell_order,
+)
 from settings import settings
 from rotation_manager import RotationManager
 
@@ -342,6 +349,7 @@ class Trader:
 
         # 요약/통계 (실거래 기준)
         self.stats = {"buy": 0, "sell": 0, "hold": 0}
+        self.run_warnings = 0
         self.recomm_stats = {"buy": 0, "sell": 0}  # 추천 집계(표시만)
         self.summary_reason_code: Optional[str] = None
         self.summary_reason_detail: Optional[str] = None
@@ -526,6 +534,87 @@ class Trader:
         if not is_us_market(self.market):
             return None
         return resolve_us_ovrs_excg(self._t(ticker), self.market)
+
+    @staticmethod
+    def _holding_ovrs_hint(holding: Optional[Dict]) -> Optional[str]:
+        """TTTS3012R ovrs_excg_cd → HHDFS/TTTT1006U hint."""
+        if not holding:
+            return None
+        hint = str(holding.get("ovrs_excg_cd") or "").strip()
+        return hint or None
+
+    def _normalize_price_source(self, raw: Optional[str]) -> str:
+        src = str(raw or "").strip().lower()
+        if src in ("last", "base"):
+            return "HHDFS00000300"
+        if src == "price_detail":
+            return "HHDFS76200200"
+        if src in ("hhfs00000300",):  # typo guard
+            return "HHDFS00000300"
+        if src.startswith("hh"):
+            return raw.strip().upper() if raw else "HHDFS00000300"
+        return raw or "HHDFS00000300"
+
+    def _resolve_execution_price(
+        self,
+        holding: Optional[Dict] = None,
+        *,
+        ticker: Optional[str] = None,
+        stock_info: Optional[Dict] = None,
+        allow_balance_fallback: bool = True,
+    ) -> Tuple[int, str]:
+        """
+        매도 판단·주문 공통 실행가.
+        1) HHDFS00000300 (+76200200 폴백)  2) TTTS3012R prpr  3) screener Price
+        """
+        t = self._t(ticker or (holding or {}).get("pdno", ""))
+        if not t:
+            return 0, "none"
+
+        hint = self._holding_ovrs_hint(holding) or self._ovrs_hint_for_ticker(t)
+
+        try:
+            price_info = self.kis.get_realtime_price_with_quotes(
+                t,
+                market=self.market,
+                ovrs_excg_hint=hint,
+            )
+            if price_info:
+                px = _to_int(price_info.get("current_price", 0))
+                if px > 0:
+                    src = self._normalize_price_source(price_info.get("price_source"))
+                    logger.debug(
+                        "[%s] execution_price=%s source=%s ovrs_hint=%s",
+                        t,
+                        self._money(px),
+                        src,
+                        hint or "?",
+                    )
+                    return px, src
+        except Exception as e:
+            logger.debug("[%s] HHDFS 시세 조회 실패: %s", t, e)
+
+        if allow_balance_fallback and holding:
+            bal_px = _to_int(holding.get("prpr", 0))
+            if bal_px > 0:
+                logger.warning(
+                    "[%s] HHDFS 시세 조회 실패 → TTTS3012R prpr 폴백: %s (ovrs_hint=%s)",
+                    t,
+                    self._money(bal_px),
+                    hint or "?",
+                )
+                return bal_px, "balance_prpr"
+
+        if stock_info:
+            si_px = _to_int(stock_info.get("Price", 0))
+            if si_px > 0:
+                return si_px, "screener"
+
+        return 0, "none"
+
+    def _bump_run_warning(self, reason: str) -> None:
+        self.run_warnings += 1
+        logger.warning("RUN_WARNING[%s]: %s (total=%d)", self.run_warnings, reason, self.run_warnings)
 
     def _get_kis_orderable_cash(self, force: bool = False) -> int:
         """KIS summary 기준 USD 주문가능금액 (ord_psbl_frcr_amt / available_cash)."""
@@ -1298,16 +1387,24 @@ class Trader:
                     executed_qty = expected_qty
                     logger.info(f"✅ 매도 체결 확인: {name}({ticker}) {executed_qty}주")
                     
-                    # 매도 시 가격이 0이면 현재가 조회
+                    # 매도 시 가격이 0이면 현재가 조회 (HHDFS → TTTS3012R prpr)
                     final_price = price
                     if price <= 0:
-                        try:
-                            price_df = self.kis.inquire_price(fid_cond_mrkt_div_code="J", fid_input_iscd=ticker)
-                            if price_df is not None and not price_df.empty and 'stck_prpr' in price_df.columns:
-                                final_price = _to_int(price_df['stck_prpr'].iloc[0])
-                                logger.info(f"  -> 매도 체결가 조회: {self._money(final_price)}")
-                        except Exception as e:
-                            logger.warning(f"  -> 매도 체결가 조회 실패: {e}")
+                        holding_row = next(
+                            (h for h in holdings if self._t(h.get("pdno", "")) == ticker),
+                            None,
+                        )
+                        final_price, price_src = self._resolve_execution_price(
+                            holding_row, ticker=ticker
+                        )
+                        if final_price > 0:
+                            logger.info(
+                                "  -> 매도 체결가 조회: %s (source=%s)",
+                                self._money(final_price),
+                                price_src,
+                            )
+                        else:
+                            logger.warning("  -> 매도 체결가 조회 실패: %s", ticker)
                     
                     # 거래 기록 저장
                     _batch_sell_payload = {
@@ -1853,20 +1950,24 @@ class Trader:
         if self.is_real_trading:
             pre_qty = quantity
 
-            px = 0
-            try:
-                price_info = self._get_realtime_price_with_quotes(ticker)
-                px = _to_int(price_info.get("current_price", 0)) if price_info else 0
-            except Exception:
-                px = 0
+            holding_row = {"pdno": ticker, "ovrs_excg_cd": self._ovrs_hint_for_ticker(ticker)}
+            px, price_src = self._resolve_execution_price(holding_row, ticker=ticker)
             if px <= 0:
                 logger.warning("[REBALANCE] %s(%s) 매도 스킵: 유효 현재가 없음", name, ticker)
                 return {"status": "sell_fail", "filled_qty": 0, "rt_cd": None, "msg1": "no valid price"}
+            logger.info(
+                "[REBALANCE] %s(%s) execution_price=%s source=%s",
+                name,
+                ticker,
+                self._money(px),
+                price_src,
+            )
 
             ord_dvsn, ord_unpr = self._sell_order_params(px)
             result = self._order_cash_retry(
                 ord_dv="01", pdno=ticker, ord_dvsn=ord_dvsn,
-                ord_qty=str(quantity), ord_unpr=str(ord_unpr)
+                ord_qty=str(quantity), ord_unpr=str(ord_unpr),
+                ovrs_excg_hint=self._holding_ovrs_hint(holding_row),
             )
 
             time.sleep(2)
@@ -1875,12 +1976,10 @@ class Trader:
             post_qty = self._get_qty(holdings_after, ticker)
             filled_qty = max(0, pre_qty - post_qty)
 
-            # 체결가 근사(시세 조회 실패 시 0 허용)
-            try:
-                price_df = self.kis.inquire_price(fid_cond_mrkt_div_code="J", fid_input_iscd=ticker)
-                current_price = _to_int(price_df['stck_prpr'].iloc[0]) if (price_df is not None and not price_df.empty) else 0
-            except Exception:
-                current_price = 0
+            # 체결가 근사 (HHDFS → TTTS3012R prpr)
+            current_price, _ = self._resolve_execution_price(
+                holding_row, ticker=ticker
+            )
 
             # 결과 기록 및 쿨다운 처리
             if result.get('ok') or filled_qty > 0:
@@ -2235,18 +2334,19 @@ class Trader:
             logger.info(f"[{batch_name}] 예산 부족으로 매수 불가: {name}({ticker}), budget={self._money(budget)}")
             return False
 
-        # 현재가 조회 (실패 시 stock_info 가격 사용)
-        current_price = _to_int(stock_info.get("Price", 0))
-        if current_price <= 0:
-            try:
-                price_df = self.kis.inquire_price(fid_cond_mrkt_div_code="J", fid_input_iscd=ticker)
-                if price_df is not None and not price_df.empty and 'stck_prpr' in price_df.columns:
-                    current_price = _to_int(price_df['stck_prpr'].iloc[0])
-            except Exception:
-                current_price = 0
+        # 현재가 조회 (HHDFS00000300 → screener Price)
+        current_price, price_src = self._resolve_execution_price(
+            None, ticker=ticker, stock_info=stock_info, allow_balance_fallback=False
+        )
         if current_price <= 0:
             logger.info(f"[{batch_name}] 현재가 조회 실패: {name}({ticker})")
             return False
+        logger.debug(
+            "[%s] BUY price=%s source=%s",
+            ticker,
+            self._money(current_price),
+            price_src,
+        )
 
         # 지정가 = (현재가에 슬리피지 -bps 적용) → 하향 라운딩
         order_price = self._apply_buy_slippage_and_round(current_price)
@@ -2445,6 +2545,13 @@ class Trader:
             for k, dv in SCHEMA_DEFAULTS.items():
                 stock_info.setdefault(k, dv)
 
+            ovrs_hint = self._holding_ovrs_hint(holding)
+            current_price, price_source = self._resolve_execution_price(
+                holding, ticker=ticker, stock_info=stock_info
+            )
+            if current_price > 0:
+                stock_info["Price"] = current_price
+
             # 실시간 레벨/RSI/Price 오버레이
             try:
                 # positions(영속 레벨) 우선 오버레이
@@ -2462,19 +2569,12 @@ class Trader:
                 except Exception:
                     pass
 
-                current_price = 0
-                try:
-                    price_df = self.kis.inquire_price(fid_cond_mrkt_div_code="J", fid_input_iscd=ticker)
-                    if price_df is not None and not price_df.empty and 'stck_prpr' in price_df.columns:
-                        current_price = _to_int(price_df['stck_prpr'].iloc[0])
-                except Exception:
-                    current_price = 0
-                if current_price <= 0:
-                    current_price = _to_int(stock_info.get("Price", 0))
-                if current_price > 0:
-                    stock_info["Price"] = current_price
-
-                rt_levels = self.risk_manager.compute_realtime_levels(ticker, current_price) or {}
+                entry_for_levels = float(current_price) if current_price > 0 else 0.0
+                rt_levels = self.risk_manager.compute_realtime_levels(
+                    ticker,
+                    entry_for_levels,
+                    ovrs_excg_hint=ovrs_hint,
+                ) or {}
                 if "RSI" in rt_levels and rt_levels["RSI"] is not None:
                     stock_info["RSI"] = float(rt_levels["RSI"])
                 # positions가 있으면 손절/목표는 positions 우선 (실시간 계산은 보조)
@@ -2482,34 +2582,56 @@ class Trader:
                     stock_info["손절가"] = _to_int(rt_levels["손절가"])
                 if stock_info.get("목표가") in (None, 0, "0") and "목표가" in rt_levels and rt_levels["목표가"] is not None:
                     stock_info["목표가"] = _to_int(rt_levels["목표가"])
-                if "Price" in rt_levels and rt_levels["Price"] is not None:
+                if "Price" in rt_levels and rt_levels["Price"] is not None and _to_int(rt_levels["Price"]) > 0:
                     stock_info["Price"] = _to_int(rt_levels["Price"])
                 if "source" in rt_levels and rt_levels["source"]:
                     stock_info["source"] = rt_levels["source"]
             except Exception as e:
                 logger.debug(f"[{ticker}] 실시간 레벨 오버레이 실패: {e}")
 
-            decision, reason, structured_context = self.risk_manager.check_sell_condition(holding, stock_info)
+            holding_for_check = (
+                {**holding, "prpr": str(current_price)}
+                if current_price > 0
+                else holding
+            )
+            if current_price > 0:
+                logger.info(
+                    "[%s] execution_price=%s source=%s (판단·주문 공통)",
+                    ticker,
+                    self._money(current_price),
+                    price_source,
+                )
+
+            decision, reason, structured_context = self.risk_manager.check_sell_condition(
+                holding_for_check, stock_info
+            )
             
             # reason_code는 모든 결정에 대해 먼저 파싱
             reason_code = self._parse_reason_code(reason, structured_context)
             
             # Phase 2: 부분 익절 처리
             if decision == "PARTIAL_SELL":
-                # Phase 1.4: 당일 매도 방지 체크 (부분 익절도 매도이므로 체크 필요)
-                trading_params = self.settings.get("trading_params", {})
-                min_holding_hours = trading_params.get("min_holding_hours", 0)
-                if min_holding_hours > 0:
-                    is_eligible, holding_hours = check_min_holding_hours(ticker, min_holding_hours)
-                    if not is_eligible:
-                        logger.info(
-                            f"[{ticker}] ⚠️ 부분 익절 당일 매도 방지: 보유시간 {holding_hours:.1f}시간 < 최소 {min_holding_hours}시간 → 유지"
-                        )
-                        self.stats["hold"] += 1
-                        continue
-                
+                if _had_partial_sell_flag(ticker, self.partial_sell_flag_ttl_days):
+                    logger.info(
+                        f"[{ticker}] 부분 익절 스킵: risk direct 또는 이전 실행 이력 (partial_sell_flags)"
+                    )
+                    self.stats["hold"] += 1
+                    continue
+                if has_open_sell_order(ticker):
+                    logger.info(f"[{ticker}] 부분 익절 스킵: pending/partial SELL 주문 존재")
+                    self.stats["hold"] += 1
+                    continue
+
                 partial_ratio = structured_context.get("context", {}).get("partial_profit_ratio", 0.5) if structured_context else 0.5
-                partial_qty = int(quantity * partial_ratio)
+                partial_qty = compute_partial_qty(
+                    quantity,
+                    partial_ratio,
+                    full_if_rounding_zero=True,
+                )
+                if int(quantity * partial_ratio) <= 0 and partial_qty == quantity and quantity >= 1:
+                    logger.info(
+                        f"[{ticker}] partial_ratio={partial_ratio:.0%} → 전량 treat ({partial_qty}주)"
+                    )
                 
                 if partial_qty <= 0:
                     logger.warning(f"⚠️ 부분 익절 수량 계산 오류: {name}({ticker}) 수량={quantity}, 비율={partial_ratio:.0%}, 계산된 수량={partial_qty}")
@@ -2534,12 +2656,24 @@ class Trader:
                 
                 logger.info(f"부분 익절 실행: {name}({ticker}) {partial_qty}주 ({partial_ratio:.0%})")
                 if current_price <= 0:
+                    self._bump_run_warning(
+                        f"{ticker} PARTIAL_SELL 판단 후 주문 스킵: 유효 현재가 없음"
+                    )
                     logger.warning(f"⚠️ [{ticker}] 부분 익절 스킵: 유효 현재가 없음")
                     self.stats["hold"] += 1
                     continue
                 order_type, order_price = self._determine_sell_order_type(current_price, structured_context)
+                logger.info(
+                    "[%s] TTTT1006U 부분매도 ord_dvsn=%s unpr=%s (ref_px=%s source=%s)",
+                    ticker,
+                    order_type,
+                    order_price,
+                    current_price,
+                    price_source,
+                )
                 result = self._order_cash_retry(
-                    ord_dv="01", pdno=ticker, ord_dvsn=order_type, ord_qty=str(partial_qty), ord_unpr=str(order_price)
+                    ord_dv="01", pdno=ticker, ord_dvsn=order_type, ord_qty=str(partial_qty), ord_unpr=str(order_price),
+                    ovrs_excg_hint=ovrs_hint,
                 )
                 if result:
                     self.stats["sell"] += 1
@@ -2603,6 +2737,9 @@ class Trader:
                 pre_qty = self._get_qty(holdings, ticker)
 
                 if current_price <= 0:
+                    self._bump_run_warning(
+                        f"{ticker} SELL 판단 후 주문 스킵: 유효 현재가 없음 (평단 fallback 금지)"
+                    )
                     logger.warning(
                         "⚠️ [%s] 매도 스킵: 유효 현재가 없음 (평단 fallback은 주문에 사용하지 않음)",
                         ticker,
@@ -2610,11 +2747,20 @@ class Trader:
                     self.stats["hold"] += 1
                     continue
 
-                # 매도 주문 타입 결정 (시장가 vs 지정가)
+                # 매도 주문 타입 결정 (TTTT1006U: ORD_DVSN=00 + OVRS_ORD_UNPR>0)
                 order_type, order_price = self._determine_sell_order_type(current_price, structured_context)
+                logger.info(
+                    "[%s] TTTT1006U 매도 ord_dvsn=%s unpr=%s (ref_px=%s source=%s)",
+                    ticker,
+                    order_type,
+                    order_price,
+                    current_price,
+                    price_source,
+                )
                 
                 result = self._order_cash_retry(
-                    ord_dv="01", pdno=ticker, ord_dvsn=order_type, ord_qty=str(quantity), ord_unpr=str(order_price)
+                    ord_dv="01", pdno=ticker, ord_dvsn=order_type, ord_qty=str(quantity), ord_unpr=str(order_price),
+                    ovrs_excg_hint=ovrs_hint,
                 )
 
                 # 향상된 매도 체결 확인 로직 적용
@@ -2630,20 +2776,16 @@ class Trader:
                     post_qty = self._get_qty(holdings_after, ticker)
                     filled_qty = max(0, pre_qty - post_qty)
 
-                try:
-                    price_df = self.kis.inquire_price(fid_cond_mrkt_div_code="J", fid_input_iscd=ticker)
-                    current_price = _to_int(price_df['stck_prpr'].iloc[0]) if (price_df is not None and not price_df.empty) else 0
-                except Exception:
-                    current_price = 0
-                
-                # 가격 조회 실패 시 보유 평균가 사용 (최후의 수단)
-                if current_price <= 0:
-                    avg_price = _to_float(holding.get("pchs_avg_pric"), 0.0)
-                    if avg_price > 0:
-                        current_price = int(avg_price)
-                        logger.warning(f"⚠️ [{ticker}] 가격 조회 실패, 보유 평균가 사용: {self._money(current_price)}")
-                    else:
-                        logger.error(f"❌ [{ticker}] 가격 정보 없음 (API 조회 실패, 평균가도 없음)")
+                record_px, record_src = self._resolve_execution_price(
+                    holding, ticker=ticker, stock_info=stock_info
+                )
+                if record_px > 0:
+                    current_price = record_px
+                elif current_price <= 0:
+                    logger.error(
+                        "❌ [%s] 체결 기록용 가격 없음 (HHDFS/TTTS3012R 모두 실패, 평단 fallback 금지)",
+                        ticker,
+                    )
 
                 parent_trade_id = None
                 pnl_amount = None
@@ -3151,15 +3293,16 @@ class Trader:
             
             # 매도 주문 실행
             if self.is_real_trading:
-                px = 0
-                try:
-                    price_info = self._get_realtime_price_with_quotes(ticker)
-                    px = _to_int(price_info.get("current_price", 0)) if price_info else 0
-                except Exception:
-                    px = 0
+                px, price_src = self._resolve_execution_price(holding, ticker=ticker)
                 if px <= 0:
                     logger.warning("종목 %s 비중 조정 매도 스킵: 유효 현재가 없음", ticker)
                     return False
+                logger.info(
+                    "종목 %s 비중조정 execution_price=%s source=%s",
+                    ticker,
+                    self._money(px),
+                    price_src,
+                )
 
                 ord_dvsn, ord_unpr = self._sell_order_params(px)
                 result = self._order_cash_retry(
@@ -3168,6 +3311,7 @@ class Trader:
                     ord_dvsn=ord_dvsn,
                     ord_qty=str(sell_qty),
                     ord_unpr=str(ord_unpr),
+                    ovrs_excg_hint=self._holding_ovrs_hint(holding),
                 )
                 
                 # 향상된 체결 확인 로직 적용
@@ -3402,10 +3546,14 @@ class Trader:
         return updated_holdings
 
     # ── 실시간 가격 조회 및 동적 지정가 계산 ───────────────────────────
-    def _get_realtime_price_with_quotes(self, ticker: str) -> Dict[str, Any]:
-        """실시간 현재가 및 호가 정보 조회"""
+    def _get_realtime_price_with_quotes(
+        self,
+        ticker: str,
+        ovrs_excg_hint: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """실시간 현재가 및 호가 정보 조회 (HHDFS00000300 / 76200200)."""
         try:
-            hint = self._ovrs_hint_for_ticker(ticker)
+            hint = ovrs_excg_hint or self._ovrs_hint_for_ticker(ticker)
             price_info = self.kis.get_realtime_price_with_quotes(
                 ticker,
                 market=self.market,
@@ -5674,43 +5822,18 @@ class Trader:
             json.dump(self.partial_sell_flags, f, indent=2, ensure_ascii=False)
 
     def _mark_partial_sell(self, ticker: str):
-        self.partial_sell_flags[ticker] = datetime.now(KST).isoformat()
-        self._save_partial_sell_flags()
+        t = self._t(ticker)
+        _mark_partial_sell_flag(t)
+        self.partial_sell_flags[t] = datetime.now(KST).isoformat()
 
     def _had_partial_sell(self, ticker: str) -> bool:
-        """
-        최근 N일(ttl) 내 부분익절 이력이 있는지 판단한다.
-        - TTL이 지나면 flag를 자동 정리한다.
-        """
-        raw = self.partial_sell_flags.get(ticker)
-        if not isinstance(raw, str) or not raw:
-            return False
-        try:
-            ts = datetime.fromisoformat(raw)
-        except Exception:
-            # 파싱 실패 시 안전하게 제거
-            try:
-                del self.partial_sell_flags[ticker]
-                self._save_partial_sell_flags()
-            except Exception:
-                pass
-            return False
-
-        ttl = int(getattr(self, "partial_sell_flag_ttl_days", 7) or 7)
-        if datetime.now(KST) - ts <= timedelta(days=max(1, ttl)):
-            return True
-
-        # TTL 경과 → 정리
-        try:
-            del self.partial_sell_flags[ticker]
-            self._save_partial_sell_flags()
-        except Exception:
-            pass
-        return False
+        return _had_partial_sell_flag(self._t(ticker), self.partial_sell_flag_ttl_days)
 
     def _clear_partial_sell_flag(self, ticker: str):
-        if ticker in self.partial_sell_flags:
-            del self.partial_sell_flags[ticker]
+        t = self._t(ticker)
+        _clear_partial_sell_flag_fn(t)
+        if t in self.partial_sell_flags:
+            del self.partial_sell_flags[t]
             self._save_partial_sell_flags()
 
     # ── 코히어런트 요약 ──────────────────────────────────────────────
@@ -5898,7 +6021,7 @@ if __name__ == "__main__":
                         key=f"phase:done:{trader.run_id}", cooldown=60)
 
         # 최종 요약
-        trader.emit_final_summary(start_ts, status="SUCCESS", warnings=0)
+        trader.emit_final_summary(start_ts, status="SUCCESS", warnings=trader.run_warnings)
 
         # 종료 시점 간단 상태 로그(참고용)
         if trader.is_real_trading:
