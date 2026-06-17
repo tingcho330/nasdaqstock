@@ -55,9 +55,9 @@ from api.kis_auth import KIS
 from risk_manager import RiskManager
 from partial_sell_state import (
     compute_partial_qty,
-    had_partial_sell as _had_partial_sell_flag,
-    mark_partial_sell as _mark_partial_sell_flag,
-    clear_partial_sell_flag as _clear_partial_sell_flag_fn,
+    had_partial_sell,
+    mark_partial_sell,
+    clear_partial_sell_flag,
     has_open_sell_order,
 )
 from settings import settings
@@ -160,7 +160,6 @@ def _notify_embed(embed: Dict, key: str, cooldown: int = DEFAULT_COOLDOWN_SEC):
 
 # ── 경로/상수 ─────────────────────────────────────────────────────────
 COOLDOWN_FILE = OUTPUT_DIR / "cooldown.json"
-PARTIAL_SELL_FLAGS_FILE = OUTPUT_DIR / "partial_sell_flags.json"
 ACCOUNT_SCRIPT_PATH = str(Path(__file__).resolve().parent / "account.py")
 
 # ── 보조 파서 ─────────────────────────────────────────────────────────
@@ -360,9 +359,6 @@ class Trader:
         _default_batch = "06:05" if is_us_market(os.getenv("MARKET", "SP500")) else "15:20"
         self.batch_check_time = batch_config.get("check_time", _default_batch)
         self.batch_check_enabled = batch_config.get("enabled", True)
-
-        # 부분익절 이력(전량매도 후 재진입 차단 갱신에 사용)
-        self.partial_sell_flags = self._load_partial_sell_flags()
 
         initialize_db()
         logger.info("거래 기록용 데이터베이스가 초기화되었습니다.")
@@ -2611,7 +2607,7 @@ class Trader:
             
             # Phase 2: 부분 익절 처리
             if decision == "PARTIAL_SELL":
-                if _had_partial_sell_flag(ticker, self.partial_sell_flag_ttl_days):
+                if self._had_partial_sell(ticker):
                     logger.info(
                         f"[{ticker}] 부분 익절 스킵: risk direct 또는 이전 실행 이력 (partial_sell_flags)"
                     )
@@ -5805,36 +5801,15 @@ class Trader:
             self._save_cooldown_list()
             return False
 
-    # ── 부분익절 이력(전량매도 후 재진입 차단 갱신용) ────────────────────
-    def _load_partial_sell_flags(self) -> dict:
-        if not PARTIAL_SELL_FLAGS_FILE.exists():
-            return {}
-        try:
-            with open(PARTIAL_SELL_FLAGS_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            return data if isinstance(data, dict) else {}
-        except (IOError, json.JSONDecodeError):
-            return {}
-
-    def _save_partial_sell_flags(self):
-        PARTIAL_SELL_FLAGS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with open(PARTIAL_SELL_FLAGS_FILE, "w", encoding="utf-8") as f:
-            json.dump(self.partial_sell_flags, f, indent=2, ensure_ascii=False)
-
+    # ── 부분익절 이력 (partial_sell_flags.json 위임) ─────────────────────
     def _mark_partial_sell(self, ticker: str):
-        t = self._t(ticker)
-        _mark_partial_sell_flag(t)
-        self.partial_sell_flags[t] = datetime.now(KST).isoformat()
+        mark_partial_sell(self._t(ticker))
 
     def _had_partial_sell(self, ticker: str) -> bool:
-        return _had_partial_sell_flag(self._t(ticker), self.partial_sell_flag_ttl_days)
+        return had_partial_sell(self._t(ticker), self.partial_sell_flag_ttl_days)
 
     def _clear_partial_sell_flag(self, ticker: str):
-        t = self._t(ticker)
-        _clear_partial_sell_flag_fn(t)
-        if t in self.partial_sell_flags:
-            del self.partial_sell_flags[t]
-            self._save_partial_sell_flags()
+        clear_partial_sell_flag(self._t(ticker))
 
     # ── 코히어런트 요약 ──────────────────────────────────────────────
     def _set_summary_reason(self, code: str, detail: str = ""):
