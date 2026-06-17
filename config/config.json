@@ -273,7 +273,7 @@
   // ── 일일 요약 (integrated_manager) ────────────────────────────────
   "daily_summary": {
     "enabled": true,
-    "balance_open_time": "23:55",   // KST 장 시작 전 잔고
+    "balance_open_time": "22:45",   // KST 장 시작 전 잔고
     "balance_close_time": "06:00",    // KST 장 마감 후 잔고
     "summary_send_time": "06:15"      // Discord 요약 발송
   },
@@ -316,7 +316,8 @@
   // ── 체결 확인·주문 리컨실 (integrated_manager) ────────────────────
   "batch_execution_check": {
     "enabled": true,
-    "check_time": "06:05"
+    "check_time": "06:05",
+    "window_minutes": 5
   },
   "order_reconcile": {
     "enabled": true,

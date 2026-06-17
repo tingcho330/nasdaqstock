@@ -39,6 +39,7 @@ from utils import (
     is_us_market,
     fmt_money,
     KST,
+    kst_window_to_us_order_dates,
     in_time_windows,
     get_account_snapshot_cached,
     get_tick_size,
@@ -359,6 +360,7 @@ class Trader:
         _default_batch = "06:05" if is_us_market(os.getenv("MARKET", "SP500")) else "15:20"
         self.batch_check_time = batch_config.get("check_time", _default_batch)
         self.batch_check_enabled = batch_config.get("enabled", True)
+        self.batch_window_minutes = int(batch_config.get("window_minutes", 5) or 5)
 
         initialize_db()
         logger.info("거래 기록용 데이터베이스가 초기화되었습니다.")
@@ -1286,15 +1288,50 @@ class Trader:
                 key=f"pending_order_{ticker}_{side}", cooldown_sec=60)
 
     def should_run_batch_check(self) -> bool:
-        """15시 20분 일괄 체결 확인 실행 여부 확인"""
+        """설정 시각(KST) 일괄 체결 확인 실행 여부 — batch_check_time ±window_minutes."""
         if not self.batch_check_enabled:
             return False
-        now = datetime.now(KST)
-        current_time = now.strftime("%H:%M")
-        return current_time >= self.batch_check_time
+        return self._is_batch_window()
+
+    def _hydrate_pending_orders_from_db(self) -> int:
+        """DB open(pending/partial) 주문을 인메모리 pending_orders에 병합."""
+        try:
+            since_ts = (datetime.now(KST) - timedelta(hours=48)).isoformat()
+            rows = get_recorder().get_open_orders(since_ts=since_ts, limit=200)
+            existing = {
+                str(o.get("order_id") or "").strip()
+                for o in self.pending_orders
+                if str(o.get("order_id") or "").strip()
+            }
+            added = 0
+            for r in rows:
+                oid = str(r.get("order_id") or "").strip()
+                if not oid or oid in existing:
+                    continue
+                action = str(r.get("action") or "").upper()
+                side = "buy" if action == "BUY" else "sell"
+                self.pending_orders.append({
+                    "ticker": self._t(r.get("ticker", "")),
+                    "name": self._t(r.get("ticker", "")),
+                    "side": side,
+                    "qty": _to_int(r.get("requested_qty") or r.get("quantity") or 0),
+                    "price": _to_int(r.get("price") or 0),
+                    "order_id": oid,
+                    "order_time": r.get("timestamp"),
+                    "status": "pending",
+                })
+                existing.add(oid)
+                added += 1
+            if added:
+                logger.info("DB pending %s건을 batch_check 대상에 병합", added)
+            return added
+        except Exception as e:
+            logger.warning("DB pending 하이드레이션 실패: %s", e)
+            return 0
 
     def batch_execution_check_and_cancel(self):
-        """15시 20분 일괄 체결 확인 + 미체결 주문 취소 처리"""
+        """일괄 체결 확인 + 미체결 주문 취소 처리"""
+        self._hydrate_pending_orders_from_db()
         if not self.pending_orders:
             logger.info("미체결 주문이 없습니다.")
             return
@@ -1306,7 +1343,9 @@ class Trader:
             f" 미체결 주문 상세: 총 {len(self.pending_orders)}개 | "
             f"매수: {buy_count}개, 매도: {sell_count}개"
         )
-        logger.info(f"15시 20분 일괄 체결 확인 시작: {len(self.pending_orders)}개 주문")
+        logger.info(
+            f"{self.batch_check_time} KST 일괄 체결 확인 시작: {len(self.pending_orders)}개 주문"
+        )
         
         # 계좌 스냅샷 갱신
         self._update_account_info(force=True)
@@ -1465,16 +1504,19 @@ class Trader:
             _notify(message, key="batch_check_result", cooldown_sec=0)
 
     # ── 지연 체결 확인 (개선된 버전) - 주문번호 기반 정확한 체결 확인 ──────────────────────────────────
-    def _check_delayed_execution(self, ticker: str, expected_qty: int = None, odno: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    def _check_delayed_execution(
+        self,
+        ticker: str,
+        expected_qty: int = None,
+        odno: Optional[str] = None,
+        pre_qty: Optional[int] = None,
+    ) -> Optional[Dict[str, Any]]:
         """
-        지연 체결 확인 - 주문번호 기반 정확한 체결 확인
-        BROKER_REJECT 응답이지만 실제로는 체결된 경우를 감지
+        지연 체결 확인 - KIS 주문 조회 + 잔고 delta 폴백
         """
-        # expected_qty를 정수로 변환 (문자열이 전달될 수 있는 경우 대비)
         if expected_qty is not None:
             expected_qty = _to_int(expected_qty)
         try:
-            # ODNO가 제공되면 해당 주문에 대해 우선 폴링(최대 3회)
             for _ in range(3):
                 recent_orders = self._get_recent_orders(ticker, limit=10)
                 if recent_orders:
@@ -1494,6 +1536,25 @@ class Trader:
                                 'status': 'executed'
                             }
                 time.sleep(0.6)
+
+            if pre_qty is not None:
+                _, holdings, _ = self._load_snapshot()
+                current_qty = self._get_qty(holdings, ticker)
+                delta = current_qty - _to_int(pre_qty)
+                if delta > 0:
+                    executed_qty = delta if not expected_qty else min(delta, expected_qty)
+                    logger.info(
+                        "[%s] 잔고 delta 체결 확인: %s주 (before=%s after=%s)",
+                        ticker, executed_qty, pre_qty, current_qty,
+                    )
+                    return {
+                        'executed_qty': executed_qty,
+                        'order_id': odno,
+                        'execution_time': '',
+                        'price': 0,
+                        'status': 'executed',
+                    }
+
             logger.debug(f"[{ticker}] 주문번호 기준 체결 확인 실패(ODNO={odno or 'N/A'})")
             return None
             
@@ -1514,14 +1575,99 @@ class Trader:
             logger.error(f"[{ticker}] 최근 주문 조회 실패: {e}")
             return []
 
+    def _orders_from_kis_df(
+        self,
+        df: pd.DataFrame,
+        *,
+        ticker: str,
+        side: Optional[str],
+        executed: Optional[bool],
+        limit: int,
+        overseas: bool,
+    ) -> List[Dict]:
+        if df is None or df.empty:
+            return []
+        work = df
+        if ticker and "pdno" in work.columns:
+            work = work[work["pdno"].astype(str).map(lambda x: self._t(x)) == self._t(ticker)]
+        side_col = "sll_buy_dvsn_cd" if "sll_buy_dvsn_cd" in work.columns else "sll_buy_dvsn"
+        if side in ("buy", "sell") and side_col in work.columns:
+            work = work[work[side_col].astype(str) == ("02" if side == "buy" else "01")]
+        exe_col = "ft_ccld_qty" if overseas and "ft_ccld_qty" in work.columns else "tot_ccld_qty"
+        if executed is not None and exe_col in work.columns:
+            exe = pd.to_numeric(work[exe_col], errors="coerce").fillna(0)
+            work = work[exe > 0] if executed else work[exe <= 0]
+        work = work.head(limit)
+        orders: List[Dict] = []
+        for _, row in work.iterrows():
+            if overseas:
+                qty = int(pd.to_numeric(row.get("ft_ord_qty", row.get("ord_qty", 0)), errors="coerce") or 0)
+                executed_qty = int(pd.to_numeric(row.get("ft_ccld_qty", row.get("tot_ccld_qty", 0)), errors="coerce") or 0)
+                price_key = "ft_ord_unpr3" if "ft_ord_unpr3" in row.index else "ord_unpr"
+            else:
+                qty = int(pd.to_numeric(row.get("ord_qty", 0), errors="coerce") or 0)
+                executed_qty = int(pd.to_numeric(row.get("tot_ccld_qty", 0), errors="coerce") or 0)
+                price_key = "ord_unpr"
+            side_cd = str(row.get(side_col, "") or "")
+            orders.append({
+                "order_id": str(row.get("odno", "") or ""),
+                "ticker": self._t(row.get("pdno", "")),
+                "side": "buy" if side_cd == "02" else "sell",
+                "quantity": qty,
+                "executed_qty": executed_qty,
+                "price": int(float(pd.to_numeric(row.get(price_key, 0), errors="coerce") or 0)),
+                "status": "executed" if executed_qty > 0 else "pending",
+                "execution_time": str(row.get("ord_tmd", "") or ""),
+                "order_time": str(row.get("ord_tmd", "") or ""),
+            })
+        return orders
+
+    def _list_orders_us(
+        self,
+        ticker: str,
+        side: Optional[str] = None,
+        executed: Optional[bool] = None,
+        limit: int = 10,
+    ) -> List[Dict]:
+        """해외주식 주문 목록 (inquire_nccs → inquire_ccnl)."""
+        by_id: Dict[str, Dict] = {}
+        try:
+            if hasattr(self.kis, "get_overseas_pending_orders"):
+                nccs_df = self.kis.get_overseas_pending_orders()
+                for o in self._orders_from_kis_df(
+                    nccs_df, ticker=ticker, side=side, executed=executed, limit=limit, overseas=True
+                ):
+                    by_id[o["order_id"]] = o
+        except Exception as e:
+            logger.debug("[%s] inquire_nccs 실패: %s", ticker, e)
+
+        try:
+            now = datetime.now(KST)
+            start_ymd, end_ymd = kst_window_to_us_order_dates(now - timedelta(days=2), now)
+            if hasattr(self.kis, "inquire_ccnl"):
+                ccnl_df = self.kis.inquire_ccnl(ord_strt_dt=start_ymd, ord_end_dt=end_ymd)
+                for o in self._orders_from_kis_df(
+                    ccnl_df, ticker=ticker, side=side, executed=executed, limit=limit, overseas=True
+                ):
+                    prev = by_id.get(o["order_id"])
+                    if not prev or o.get("executed_qty", 0) >= prev.get("executed_qty", 0):
+                        by_id[o["order_id"]] = o
+        except Exception as e:
+            logger.debug("[%s] inquire_ccnl 실패: %s", ticker, e)
+
+        out = list(by_id.values())[:limit]
+        if out:
+            logger.debug("[%s] 해외 주문 조회 성공: %s개", ticker, len(out))
+        return out
+
     def _list_orders(self, ticker: str, side: Optional[str] = None, executed: Optional[bool] = None, limit: int = 10) -> List[Dict]:
-        """주문 목록을 조회하여 공통 포맷으로 반환한다.
-        get_pending_orders()를 우선 사용하고, 실패 시 inquire_daily_order()로 폴백.
-        side: 'buy'|'sell'|None, executed: True|False|None
-        """
+        """주문 목록을 조회하여 공통 포맷으로 반환한다."""
         try:
             if not self.is_real_trading:
                 return []
+
+            if is_us_market(self.market):
+                return self._list_orders_us(ticker, side=side, executed=executed, limit=limit)
             
             # 1차: get_pending_orders() 우선 사용 (inquire_orders() 기반)
             try:
@@ -3612,27 +3758,30 @@ class Trader:
             hhmm = now.strftime("%H:%M")
             return hhmm >= "15:17" and hhmm <= "15:23"
 
-    def _enhanced_execution_check(self, ticker: str, order_result: Dict, expected_qty: int = 0) -> Dict[str, Any]:
+    def _enhanced_execution_check(
+        self,
+        ticker: str,
+        order_result: Dict,
+        expected_qty: int = 0,
+        pre_qty: Optional[int] = None,
+    ) -> Dict[str, Any]:
         """실시간 체결 확인: 배치 윈도우에만 비활성화, 평시에는 ODNO 기반 간단 폴링."""
         if self._is_batch_window():
-            logger.info(f"실시간 체결 확인 비활성화: {ticker} (15시 20분 일괄 처리)")
+            logger.info(f"실시간 체결 확인 비활성화: {ticker} ({self.batch_check_time} KST 일괄 처리)")
             if order_result.get('ok') and order_result.get('odno'):
-                logger.info(f"주문 제출 성공: {ticker} {expected_qty}주 (15시 20분 체결 확인)")
+                logger.info(f"주문 제출 성공: {ticker} {expected_qty}주 ({self.batch_check_time} KST 체결 확인)")
                 return {'status': 'submitted', 'executed': False, 'executed_qty': 0, 'wait_time': 0}
             else:
-                logger.info(f"주문 제출 실패: {ticker} {expected_qty}주 (15시 20분 체결 확인)")
+                logger.info(f"주문 제출 실패: {ticker} {expected_qty}주 ({self.batch_check_time} KST 체결 확인)")
                 return {'status': 'failed', 'executed': False, 'executed_qty': 0, 'wait_time': 0}
         
-        # 평시: ok=True + ODNO 있으면 주문 접수 성공으로 간주하고 체결 확인 시도
         if order_result.get('ok') and order_result.get('odno'):
             odno = order_result.get('odno')
-            exec_info = self._check_delayed_execution(ticker, expected_qty, odno)
+            exec_info = self._check_delayed_execution(ticker, expected_qty, odno, pre_qty=pre_qty)
             if exec_info:
                 return {'status': 'executed', 'executed': True, 'executed_qty': exec_info.get('executed_qty', 0), 'wait_time': 1}
-            # 주문 접수 성공, 미체결
             return {'status': 'submitted', 'executed': False, 'executed_qty': 0, 'wait_time': 0}
         
-        # ok=False인 경우에만 실패로 간주
         return {'status': 'failed', 'executed': False, 'executed_qty': 0, 'wait_time': 0}
 
     def _check_order_status_direct(self, order_raw: Dict) -> bool:
@@ -5248,7 +5397,7 @@ class Trader:
                     new_cash, new_holdings, _ = self._load_snapshot()
                     remaining_cash = new_cash
                     round_success = True
-                    logger.info(f"  -> ✅ {name}({ticker}) 매수 성공, 잔여 현금: {self._money(remaining_cash)}")
+                    logger.info(f"  -> ✅ {name}({ticker}) 매수 처리 완료, 잔여 현금: {self._money(remaining_cash)}")
                 else:
                     failed_targets.append(plan)
                     logger.info(f"  -> ❌ {name}({ticker}) 매수 실패")
@@ -5274,6 +5423,9 @@ class Trader:
         ticker, name = self._t(info.get("Ticker", "")), info.get("Name", "N/A")
         
         try:
+            _, holdings_before, _ = self._load_snapshot()
+            pre_qty = self._get_qty(holdings_before, ticker)
+
             # 실시간 가격 조회
             price_info = self._get_realtime_price_with_quotes(ticker)
             if not price_info:
@@ -5302,7 +5454,11 @@ class Trader:
                     quantity = min_qty_by_price
                     logger.info(f"  -> [{name}({ticker})] 최소 주문 금액 기준으로 수량 조정: {quantity}주")
                 else:
-                    logger.warning(f"  -> [{name}({ticker})] 수량 계산 실패 (예산: {self._money(budget)}, 최소주문: {self._money(self.min_order_cash)})")
+                    logger.warning(
+                        f"  -> [{name}({ticker})] 수량 계산 실패 "
+                        f"(배분예산: {self._money(budget)}, 현재가: {self._money(current_price)}, "
+                        f"1주 필요: {self._money(current_price)}, 최소주문: {self._money(self.min_order_cash)})"
+                    )
                     return False
             
             # 동적 지정가 계산
@@ -5333,43 +5489,45 @@ class Trader:
             
             logger.info(f"  -> 매수 준비: {name}({ticker}), 수량: {quantity}주, 지정가: {self._money(order_price)} [라운드{round_num}]")
             
-            # 예산이 충분하면 분할 매수 시도, 아니면 단일 주문
-            min_cash_per_slice = self.trading_params.get("split_buy", {}).get("min_cash_per_slice", 50000)
+            split_cfg = (self.trading_params.get("split_buy") or {})
+            min_cash_per_slice = int(split_cfg.get("min_cash_per_slice", 50000))
             total_order_value = quantity * order_price
             
-            if total_order_value >= min_cash_per_slice * 3:  # 분할 매수 가능한 경우
-                # 지정가 주문 시도 (분할 매수 사용)
+            if split_cfg.get("enabled") and total_order_value >= min_cash_per_slice * 3:
                 split_ok, spent_est = self._place_split_buy(name, ticker, quantity, order_price, "NEW")
                 
                 if split_ok:
                     logger.info(f"  -> ✅ 분할 지정가 주문 성공: {name}({ticker})")
                     return True
                 else:
-                    # 분할 매수가 거절되었지만, 시간차를 두고 실제 체결 여부 확인
-                    logger.warning(f"  -> 분할 지정가 주문 응답이 거절되었지만, 실제 체결 여부를 확인합니다: {name}({ticker})")
+                    logger.warning(f"  -> 분할 지정가 주문 실패, 단일 지정가로 폴백: {name}({ticker})")
                     
-                    # 지연 체결 확인 (개선된 버전) - 분할 주문의 마지막 ODNO 확인
                     last_odno = getattr(self, '_last_order_odno', None)
-                    delayed_execution = self._check_delayed_execution(ticker, quantity, last_odno)
+                    delayed_execution = self._check_delayed_execution(
+                        ticker, quantity, last_odno, pre_qty=pre_qty,
+                    )
                     if delayed_execution:
                         executed_qty = delayed_execution.get('executed_qty', 0)
-                        # 정확한 로그 출력
                         logger.info(f"  -> ✅ 분할 지정가 주문 실제 체결 확인: {name}({ticker}) {executed_qty}주 (지연 확인)")
                         
-                        # 정확한 거래 기록
                         record_trade({
                             "side": "buy", "ticker": ticker, "name": name,
-                            "qty": executed_qty, "price": order_price, "trade_status": "split_executed",
+                            "qty": executed_qty, "price": order_price, "trade_status": "limit_executed",
+                            "order_id": delayed_execution.get("order_id") or last_odno or "",
+                            "requested_qty": quantity,
+                            "executed_qty": executed_qty,
                             "strategy_details": {"batch": "NEW", "order_type": "split", "delayed_confirmation": True}
                         })
                         
-                        # 통계 업데이트
                         self.stats["buy"] += 1
                         return True
                     else:
-                        logger.warning(f"  -> 분할 지정가 주문 실패 확인, 단일 지정가 주문 시도: {name}({ticker})")
+                        logger.info(f"  -> 단일 지정가 주문 시도: {name}({ticker})")
             else:
-                logger.info(f"  -> 예산 부족으로 단일 지정가 주문 시도: {name}({ticker})")
+                if not split_cfg.get("enabled") and total_order_value >= min_cash_per_slice * 3:
+                    logger.debug(f"  -> 분할 매수 비활성(split_buy.enabled=false), 단일 주문: {name}({ticker})")
+                else:
+                    logger.info(f"  -> 예산 부족으로 단일 지정가 주문 시도: {name}({ticker})")
             
             # 단일 지정가 주문 시도
             if self.is_real_trading:
@@ -5381,27 +5539,32 @@ class Trader:
                 )
                 logger.info(f"  -> 주문 응답: {res}")
                 
-                # ok=True + ODNO 있으면 주문 접수 성공
                 if res.get('ok') and res.get('odno'):
-                    # 향상된 체결 확인 로직 적용
-                    execution_result = self._enhanced_execution_check(ticker, res, quantity)
+                    execution_result = self._enhanced_execution_check(
+                        ticker, res, quantity, pre_qty=pre_qty,
+                    )
                     
                     if execution_result.get('executed'):
                         executed_qty = execution_result.get('executed_qty', quantity)
-                        logger.info(f"  -> ✅ 단일 지정가 주문 성공: {name}({ticker}) {executed_qty}주 (확인방식: {execution_result.get('status', 'unknown')})")
+                        logger.info(f"  -> ✅ 단일 지정가 체결 확인: {name}({ticker}) {executed_qty}주 (확인방식: {execution_result.get('status', 'unknown')})")
+                        odno = self._extract_order_id(res)
                         record_trade({
                             "side": "buy", "ticker": ticker, "name": name,
                             "qty": executed_qty, "price": order_price, "trade_status": "limit_executed",
+                            "order_id": odno,
+                            "requested_qty": quantity,
+                            "executed_qty": executed_qty,
                             "strategy_details": {"broker_msg": res.get('msg1'), "batch": "NEW", "order_type": "limit"}
                         })
                         
-                        # 통계 업데이트
                         self.stats["buy"] += 1
                         
                         return True
                     else:
-                        # 주문 접수 성공, 미체결 상태
-                        logger.info(f"  -> 단일 지정가 주문 접수 완료: {name}({ticker}) {quantity}주 @ {self._money(order_price)} (미체결, 15시 20분 체결 확인)")
+                        logger.info(
+                            f"  -> 단일 지정가 주문 접수: {name}({ticker}) {quantity}주 @ {self._money(order_price)} "
+                            f"(미체결, {self.batch_check_time} KST 일괄 체결 확인)"
+                        )
                         odno = self._extract_order_id(res)
                         if odno:
                             record_trade({
@@ -5412,14 +5575,19 @@ class Trader:
                                 "executed_qty": 0,
                                 "strategy_details": {"broker_msg": res.get('msg1'), "batch": "NEW", "odno": odno}
                             })
-                        return True  # 주문 접수 성공으로 간주하고 종료
+                            self.add_pending_order(
+                                ticker, name, "buy", quantity, order_price, order_id=odno,
+                            )
+                        return True
                 else:
                     # ok=False인 경우에만 거절로 간주하고 체결 확인 시도
                     logger.warning(f"  -> 단일 지정가 주문 거절 응답, 실제 체결 여부 확인: {name}({ticker})")
                     
                     # 지연 체결 확인 (개선된 버전) - 주문 응답의 ODNO 사용
                     odno = res.get('odno')
-                    delayed_execution = self._check_delayed_execution(ticker, quantity, odno)
+                    delayed_execution = self._check_delayed_execution(
+                        ticker, quantity, odno, pre_qty=pre_qty,
+                    )
                     if delayed_execution:
                         executed_qty = delayed_execution.get('executed_qty', 0)
                         # 정확한 로그 출력
@@ -5955,9 +6123,9 @@ if __name__ == "__main__":
         else:
             trader.run_buy_logic(cash1, holdings1)
 
-        # 15시 20분 일괄 체결 확인 실행
+        # 일괄 체결 확인 실행
         if trader.should_run_batch_check():
-            logger.info("15시 20분 일괄 체결 확인 실행")
+            logger.info(f"{trader.batch_check_time} KST 일괄 체결 확인 실행")
             stats_before_batch = {
                 'buy': trader.stats['buy'],
                 'sell': trader.stats['sell'],

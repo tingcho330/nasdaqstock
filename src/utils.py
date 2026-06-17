@@ -775,6 +775,21 @@ def is_us_market(market: Optional[str] = None) -> bool:
     return m in _US_MARKETS
 
 
+def kst_window_to_us_order_dates(
+    since_dt: datetime,
+    until_dt: datetime,
+    *,
+    day_buffer: int = 1,
+) -> Tuple[str, str]:
+    """
+    KIS inquire-ccnl용 US ET 날짜 범위(YYYYMMDD).
+    KST 창을 ET로 변환한 뒤 앞뒤 day_buffer일을 더해 경계 누락을 방지한다.
+    """
+    start_et = since_dt.astimezone(_ET).date() - timedelta(days=max(0, day_buffer))
+    end_et = until_dt.astimezone(_ET).date() + timedelta(days=max(0, day_buffer))
+    return start_et.strftime("%Y%m%d"), end_et.strftime("%Y%m%d")
+
+
 def norm_ticker(ticker: str, market: Optional[str] = None) -> str:
     """KR: 6자리 숫자 코드 / US: 심볼 보존 (AAPL)."""
     s = str(ticker or "").strip().upper()

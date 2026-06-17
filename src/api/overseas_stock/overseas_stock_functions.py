@@ -428,6 +428,172 @@ class OverseasStock:
 
         return _df("output1"), _df("output2"), _df("output3")
 
+    def inquire_nccs(
+        self,
+        *,
+        ovrs_excg_cd: str = "NASD",
+        sort_sqn: str = "DS",
+        max_pages: int = 20,
+    ) -> pd.DataFrame:
+        """
+        해외주식 미체결내역 — TTTS3018R / VTTS3018R
+        (v1_해외주식-005) /uapi/overseas-stock/v1/trading/inquire-nccs
+        """
+        url = f"{self.url_base}/uapi/overseas-stock/v1/trading/inquire-nccs"
+        is_vps = getattr(self, "env", "prod") == "vps"
+        tr_id = "VTTS3018R" if is_vps else "TTTS3018R"
+        excd = "" if is_vps else str(ovrs_excg_cd or "NASD").upper()
+
+        frames: List[pd.DataFrame] = []
+        ctx_fk200 = ""
+        ctx_nk200 = ""
+        tr_cont = ""
+        for _page in range(max(1, max_pages)):
+            params = {
+                "CANO": self.cano,
+                "ACNT_PRDT_CD": self.acnt_prdt_cd,
+                "OVRS_EXCG_CD": excd,
+                "SORT_SQN": sort_sqn,
+                "CTX_AREA_FK200": ctx_fk200,
+                "CTX_AREA_NK200": ctx_nk200,
+            }
+            headers = self._trading_headers(tr_id)
+            if tr_cont:
+                headers["tr_cont"] = tr_cont
+
+            res = self.request_get(url, headers=headers, params=params)
+            if res.status_code != 200:
+                if res.status_code != 404:
+                    logger.warning(
+                        "해외 미체결 조회 실패 status=%s excd=%s: %s",
+                        res.status_code,
+                        excd or "NASD",
+                        (res.text or "")[:200],
+                    )
+                break
+
+            body = res.json()
+            rt_cd = str(body.get("rt_cd", "") or "")
+            if rt_cd and rt_cd != "0":
+                logger.warning(
+                    "해외 미체결 조회 rt_cd=%s msg=%s",
+                    rt_cd,
+                    str(body.get("msg1") or "")[:120],
+                )
+                break
+
+            rows = body.get("output") or body.get("output1") or []
+            if isinstance(rows, dict):
+                rows = [rows]
+            if rows:
+                frames.append(pd.DataFrame(rows))
+
+            tr_cont_resp = str(res.headers.get("tr_cont", "") or "").strip().upper()
+            ctx_fk200 = str(body.get("ctx_area_fk200", "") or "").strip()
+            ctx_nk200 = str(body.get("ctx_area_nk200", "") or "").strip()
+            if tr_cont_resp in ("F", "M") and ctx_nk200:
+                tr_cont = "N"
+                continue
+            break
+
+        if not frames:
+            return pd.DataFrame()
+        return pd.concat(frames, ignore_index=True)
+
+    def inquire_ccnl(
+        self,
+        *,
+        ord_strt_dt: str,
+        ord_end_dt: str,
+        ovrs_excg_cd: str = "NASD",
+        pdno: str = "%",
+        sll_buy_dvsn: str = "00",
+        ccld_nccs_dvsn: str = "00",
+        sort_sqn: str = "DS",
+        max_pages: int = 20,
+    ) -> pd.DataFrame:
+        """
+        해외주식 주문체결내역 — TTTS3035R / VTTS3035R
+        (v1_해외주식-007) /uapi/overseas-stock/v1/trading/inquire-ccnl
+        ORD_STRT_DT/ORD_END_DT: US 현지일(ET) YYYYMMDD
+        """
+        url = f"{self.url_base}/uapi/overseas-stock/v1/trading/inquire-ccnl"
+        is_vps = getattr(self, "env", "prod") == "vps"
+        tr_id = "VTTS3035R" if is_vps else "TTTS3035R"
+        symb = "" if is_vps else str(pdno or "%")
+        excd = "" if is_vps else str(ovrs_excg_cd or "NASD").upper()
+
+        frames: List[pd.DataFrame] = []
+        ctx_fk200 = ""
+        ctx_nk200 = ""
+        tr_cont = ""
+        for _page in range(max(1, max_pages)):
+            params = {
+                "CANO": self.cano,
+                "ACNT_PRDT_CD": self.acnt_prdt_cd,
+                "PDNO": symb,
+                "ORD_STRT_DT": ord_strt_dt,
+                "ORD_END_DT": ord_end_dt,
+                "SLL_BUY_DVSN": sll_buy_dvsn,
+                "CCLD_NCCS_DVSN": ccld_nccs_dvsn,
+                "OVRS_EXCG_CD": excd,
+                "SORT_SQN": sort_sqn,
+                "ORD_DT": "",
+                "ORD_GNO_BRNO": "",
+                "ODNO": "",
+                "CTX_AREA_FK200": ctx_fk200,
+                "CTX_AREA_NK200": ctx_nk200,
+            }
+            headers = self._trading_headers(tr_id)
+            if tr_cont:
+                headers["tr_cont"] = tr_cont
+
+            res = self.request_get(url, headers=headers, params=params)
+            if res.status_code != 200:
+                if res.status_code != 404:
+                    logger.warning(
+                        "해외 주문체결 조회 실패 status=%s %s~%s: %s",
+                        res.status_code,
+                        ord_strt_dt,
+                        ord_end_dt,
+                        (res.text or "")[:200],
+                    )
+                break
+
+            body = res.json()
+            rt_cd = str(body.get("rt_cd", "") or "")
+            if rt_cd and rt_cd != "0":
+                logger.warning(
+                    "해외 주문체결 조회 rt_cd=%s msg=%s",
+                    rt_cd,
+                    str(body.get("msg1") or "")[:120],
+                )
+                break
+
+            rows = body.get("output") or body.get("output1") or []
+            if isinstance(rows, dict):
+                rows = [rows]
+            if rows:
+                frames.append(pd.DataFrame(rows))
+
+            tr_cont_resp = str(res.headers.get("tr_cont", "") or "").strip().upper()
+            ctx_fk200 = str(body.get("ctx_area_fk200", "") or "").strip()
+            ctx_nk200 = str(body.get("ctx_area_nk200", "") or "").strip()
+            if tr_cont_resp in ("F", "M") and ctx_nk200:
+                tr_cont = "N"
+                continue
+            break
+
+        if not frames:
+            return pd.DataFrame()
+        return pd.concat(frames, ignore_index=True)
+
+    def get_overseas_pending_orders(self, ovrs_excg_cd: str = "NASD") -> pd.DataFrame:
+        """해외 미체결 주문 조회 (inquire_nccs 래퍼)."""
+        if not hasattr(self, "inquire_nccs"):
+            return pd.DataFrame()
+        return self.inquire_nccs(ovrs_excg_cd=ovrs_excg_cd)
+
     def overseas_order(
         self,
         ord_dv: str,

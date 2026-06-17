@@ -69,7 +69,7 @@
 - **장중 리스크** — `background_risk_manager` (US: `market_hours.SP500.risk_poll_windows`·`sell_time_windows`·`direct_execute`·`direct_execute_partial`·NYSE 거래일; 장외는 다음 세션까지 대기·스레드 자동 재시작; 잔고 `prpr=0` 시 KIS HHDFS00000300/76200200·`trader._resolve_execution_price`와 동일 계열 시세 보정; 손절/목표 기준가는 **평단(`pchs_avg_pric`)** 우선)
 - **EmergencyDrop·최소보유** — `emergency_drop_pct` **-13%** 급락 시 `min_holding_hours`(336h=**14일**) **예외** 즉시매도. 그 외 **전량·손절·RSI 등**은 매수일 기준 14일(`min_holding_hours`)·`rotation.min_holding_days`(14일) 적용. **부분익절(`PartialProfit`)은 14일 면제** — 장중 `direct_execute_partial` 또는 `trader` 파이프라인. 1주×50%는 **전량 treat**
 - **파이프라인 AM/PM 세션** — KST 시각·US ET 거래일 기준 `session`(`am`/`pm`)·`trade_date`를 산출물 파일명·환경변수로 고정 (자정 넘김 시 스크리너↔GPT 짝 유지)
-- **주문 정합성** — `order_reconciler.py` (DB `pending`/`partial` → KIS 미체결·일자별 주문 조회로 `executed` 갱신; `order_id` 없는 orphan 방지·`--backfill-only`)
+- **주문 정합성** — `order_reconciler.py` (DB `pending`/`partial` → KIS 조회: US `inquire-nccs`/`inquire-ccnl`, KR `inquire-orders`/`inquire-daily-ccld`로 `executed` 갱신; orphan `order_id` backfill·`--backfill-only`)
 - **영속 손절/목표(positions)** — `recorder.py`의 `positions` 테이블에 `stop_price/target_price`를 저장하고, `trader.run_sell_logic()`에서 **positions 레벨을 우선 적용**
 - **회전 정책 모듈화** — `rotation_policy.py`에서 최소 보유일·Δscore·예산/경제성·페어 상한(`max_pairs_per_run`)을 공통 정책으로 적용
 - **비밀값 분리** — API 키·계좌·웹훅은 `config/.env`만 사용
@@ -238,7 +238,8 @@ Git에는 `output/.gitkeep`만 추적합니다.
 | 단계 | 동작 |
 |------|------|
 | `risk_manager` `direct_execute` | 주문 성공 + `order_id` → `record_trade` **`pending`**, `executed_qty=0` |
-| `order_reconciler` (06:10 등) | DB open 주문 ↔ KIS `inquire_orders` → 없으면 `inquire_daily_order`로 체결 확인 → **`executed`**·`executed_qty` 갱신 |
+| `order_reconciler` (06:10 등) | DB open 주문 ↔ KIS 조회 — **US:** `inquire-nccs` → `inquire-ccnl` / **KR:** `inquire-orders` → `inquire-daily-ccld` → **`executed`**·`executed_qty` 갱신 |
+| `trader` 매수 직후 | `inquire-ccnl`·잔고 delta로 체결 확인, `pending` 시 `add_pending_order` + DB 기록 |
 | orphan 방지 | `pending`이면서 `order_id` 없으면 INSERT 생략 |
 
 리컨실 시 **체결가·`profit_loss`는 갱신하지 않음**(주문 시점 호가·추정 손익 유지). 정밀 손익은 KIS 체결가 기준 별도 검증 권장.
@@ -289,6 +290,8 @@ api/kis_auth.KIS (DomesticStock + OverseasStock)
 |----|------|
 | `TTTS3012R` / `VTTS3012R` | 해외주식 잔고 (`inquire_overseas_balance`) |
 | `CTRP6504R` / `VTRP6504R` | 체결기준 현재잔고 (`inquire_overseas_present_balance`) |
+| `TTTS3018R` / `VTTS3018R` | 해외주식 **미체결** (`inquire-nccs`) |
+| `TTTS3035R` / `VTTS3035R` | 해외주식 **주문체결내역** (`inquire-ccnl`, US ET 날짜) |
 | `TTTT1002U` / `TTTT1006U` | 미국 매수·매도 (`overseas_order`, 모의는 `V` 접두) |
 
 **미국 매수(`TTTT1002U`)·매도(`TTTT1006U`) ORD_DVSN:** 본 저장소는 **`00`(지정가)+`OVRS_ORD_UNPR>0`** 만 사용. 매수: `resolve_us_buy_order_params()`(현재가+슬리피지 상향). 매도: `resolve_us_sell_order_params()`(현재가−슬리피지 하향). `01`(시장가)+`unpr=0`은 거절·`output` 누락 빈발 — `overseas_order()`가 `rt_cd`/`msg1`만 담은 DataFrame 반환. 매도 TR의 `31`~`34`(MOO/LOO/MOC/LOC)는 미사용.
@@ -716,7 +719,7 @@ trading_bot_260530_NASDAQ/
 | 장중 리스크·즉시매도 (`direct_execute`) | ✅ `pending` DB 기록 → 리컨실 `executed` |
 | 리스크 세션 대기·세션 시작 재개 (`BackgroundRiskManager`) | ✅ `next_session_open_kst`·스레드 watchdog 재시작 · `22:30-05:00` KST |
 | 리스크 Discord (`DISCORD_WEBHOOK_URL_RISK`) | ✅ `config/.env` 단일 로드 (`docker-compose`에 `.env.risk` 없음) |
-| `order_reconciler`·`--backfill-only` | ✅ 미체결 0건·일자별 주문으로 체결 해소 |
+| `order_reconciler`·`--backfill-only` | ✅ US: `inquire-ccnl`·`inquire-nccs` / KR: 일자별 주문으로 체결 해소 |
 | US 일일 요약 open/close 짝 | ✅ `session_close_date`·`--capture-close` |
 | US 일일 요약 Discord 표기 | ✅ `tot_evlu_amt_krw`(원화)·`ord_psbl_frcr_amt`(USD)·`evlu_pfls_smtl_amt`(USD) 변화량 |
 | `trader` 매도 체결 수량 (`_get_qty`) | ✅ 인스턴스 메서드·티커 정규화 (긴급 손절 등 매도 후 체결 확인) |

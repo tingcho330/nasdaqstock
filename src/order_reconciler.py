@@ -18,7 +18,7 @@ from typing import Dict, Any, List, Optional
 from settings import settings
 import os
 
-from utils import setup_logging, KST, norm_ticker
+from utils import setup_logging, KST, norm_ticker, is_us_market, kst_window_to_us_order_dates
 from api.kis_auth import KIS
 from recorder import get_recorder
 
@@ -52,8 +52,8 @@ def _safe_int(x: Any, default: int = 0) -> int:
         return default
 
 
-def _normalize_order_row(row: Any) -> Optional[Dict[str, Any]]:
-    """KIS 주문 row(Series/dict)를 내부 표준 dict로 정규화."""
+def _normalize_domestic_order_row(row: Any) -> Optional[Dict[str, Any]]:
+    """KIS 국내주식 주문 row(Series/dict)를 내부 표준 dict로 정규화."""
     try:
         order_id = str(row.get("odno", "") or "").strip()
         if not order_id:
@@ -63,7 +63,6 @@ def _normalize_order_row(row: Any) -> Optional[Dict[str, Any]]:
         ticker = norm_ticker(str(row.get("pdno", "") or ""), os.getenv("MARKET", "SP500"))
         side = "buy" if str(row.get("sll_buy_dvsn_cd", "")) == "02" else "sell"
         order_time = str(row.get("ord_tmd", "") or "")
-        # 취소 여부(주식일별주문체결조회 output1.cncl_yn: Y/N)
         cancelled = str(row.get("cncl_yn", "") or "").strip().upper() == "Y"
 
         if executed_qty <= 0 and cancelled:
@@ -89,6 +88,101 @@ def _normalize_order_row(row: Any) -> Optional[Dict[str, Any]]:
         }
     except Exception:
         return None
+
+
+def _normalize_overseas_order_row(row: Any) -> Optional[Dict[str, Any]]:
+    """KIS 해외주식 주문 row(Series/dict)를 내부 표준 dict로 정규화."""
+    try:
+        order_id = str(row.get("odno", "") or "").strip()
+        if not order_id:
+            return None
+        qty = _safe_int(row.get("ft_ord_qty", row.get("ord_qty", 0)))
+        executed_qty = _safe_int(row.get("ft_ccld_qty", row.get("tot_ccld_qty", 0)))
+        ticker = norm_ticker(str(row.get("pdno", "") or ""), os.getenv("MARKET", "SP500"))
+        side_cd = str(row.get("sll_buy_dvsn_cd", row.get("sll_buy_dvsn", "")) or "")
+        side = "buy" if side_cd == "02" else "sell"
+        order_time = str(row.get("ord_tmd", "") or "")
+        rvse = str(row.get("rvse_cncl_dvsn", row.get("rvse_cncl_dvsn_cd", "")) or "").strip()
+        prcs = str(row.get("prcs_stat_name", "") or "")
+        cancelled = rvse in ("02", "2") or ("취소" in prcs and executed_qty <= 0)
+
+        if executed_qty <= 0 and cancelled:
+            status = "cancelled"
+        elif executed_qty <= 0:
+            status = "pending"
+        elif qty > 0 and executed_qty < qty:
+            status = "partial"
+        elif qty > 0 and executed_qty >= qty:
+            status = "executed"
+        else:
+            status = "partial"
+
+        return {
+            "order_id": order_id,
+            "ticker": ticker,
+            "side": side,
+            "quantity": qty,
+            "executed_qty": executed_qty,
+            "status": status,
+            "cancelled": cancelled,
+            "order_time": order_time,
+        }
+    except Exception:
+        return None
+
+
+def _normalize_order_row(row: Any, *, overseas: bool = False) -> Optional[Dict[str, Any]]:
+    if overseas:
+        return _normalize_overseas_order_row(row)
+    return _normalize_domestic_order_row(row)
+
+
+def _fetch_overseas_open_orders(
+    kis: KIS, *, ovrs_excg_cd: str = "NASD"
+) -> Dict[str, Dict[str, Any]]:
+    """KIS inquire_nccs(해외 미체결) → order_id dict."""
+    orders: List[Dict[str, Any]] = []
+    try:
+        if hasattr(kis, "inquire_nccs"):
+            df = kis.inquire_nccs(ovrs_excg_cd=ovrs_excg_cd)
+            if df is not None and not df.empty:
+                for _, row in df.iterrows():
+                    o = _normalize_order_row(row, overseas=True)
+                    if o:
+                        orders.append(o)
+    except Exception as e:
+        logger.debug(f"inquire_nccs() 조회 실패: {e}")
+
+    by_id: Dict[str, Dict[str, Any]] = {}
+    for o in orders:
+        by_id[o["order_id"]] = o
+    return by_id
+
+
+def _fetch_overseas_daily_orders(
+    kis: KIS, *, start_ymd: str, end_ymd: str, ovrs_excg_cd: str = "NASD"
+) -> Dict[str, Dict[str, Any]]:
+    """KIS inquire_ccnl(해외 주문체결내역) → order_id dict."""
+    orders: List[Dict[str, Any]] = []
+    try:
+        if hasattr(kis, "inquire_ccnl"):
+            df = kis.inquire_ccnl(
+                ord_strt_dt=start_ymd,
+                ord_end_dt=end_ymd,
+                ovrs_excg_cd=ovrs_excg_cd,
+            )
+            if df is not None and not df.empty:
+                for _, row in df.iterrows():
+                    o = _normalize_order_row(row, overseas=True)
+                    if o:
+                        orders.append(o)
+    except Exception as e:
+        logger.warning(f"inquire_ccnl() 조회 실패: {e}")
+
+    by_id: Dict[str, Dict[str, Any]] = {}
+    for o in orders:
+        by_id[o["order_id"]] = o
+    return by_id
 
 
 def _fetch_open_orders_inquire_orders(
@@ -145,7 +239,37 @@ def _fetch_open_orders_inquire_orders(
     return by_id
 
 
+def _fetch_open_orders(
+    kis: KIS, *, start_ymd: Optional[str] = None, end_ymd: Optional[str] = None
+) -> Dict[str, Dict[str, Any]]:
+    """MARKET에 따라 KIS 미체결 주문 조회."""
+    if is_us_market():
+        by_id = _fetch_overseas_open_orders(kis)
+        _db_dbg_log(
+            "reconciler.fetch_overseas_nccs.OK",
+            api="inquire-nccs",
+            raw_rows=len(by_id),
+            unique_order_ids=len(by_id),
+            sample_ids=list(by_id.keys())[:8],
+        )
+        return by_id
+    return _fetch_open_orders_inquire_orders(kis, start_ymd=start_ymd, end_ymd=end_ymd)
+
+
 def _fetch_daily_orders(
+    kis: KIS, *, start_ymd: str, end_ymd: Optional[str] = None,
+    since_dt: Optional[datetime] = None, until_dt: Optional[datetime] = None,
+) -> Dict[str, Dict[str, Any]]:
+    """MARKET에 따라 KIS 일자별 주문 조회."""
+    end = end_ymd or start_ymd
+    if is_us_market():
+        if since_dt is not None and until_dt is not None:
+            start_ymd, end = kst_window_to_us_order_dates(since_dt, until_dt)
+        return _fetch_overseas_daily_orders(kis, start_ymd=start_ymd, end_ymd=end)
+    return _fetch_daily_orders_domestic(kis, start_ymd=start_ymd, end_ymd=end)
+
+
+def _fetch_daily_orders_domestic(
     kis: KIS, *, start_ymd: str, end_ymd: Optional[str] = None
 ) -> Dict[str, Dict[str, Any]]:
     """
@@ -252,7 +376,7 @@ def backfill_orphan_order_ids(*, since_hours: int = 24, limit: int = 200) -> Dic
     orphans = recorder.get_orphan_trade_records(since_ts=since_ts, limit=limit)
     logger.info(f"orphan backfill 대상 {len(orphans)}건 (since={since_ts})")
 
-    daily_orders = _fetch_daily_orders(kis, start_ymd=start_ymd, end_ymd=end_ymd)
+    daily_orders = _fetch_daily_orders(kis, start_ymd=start_ymd, end_ymd=end_ymd, since_dt=since_dt, until_dt=now_kst)
     logger.info(f"KIS 일자별 주문(daily) backfill 조회: {len(daily_orders)}건 ({start_ymd}~{end_ymd})")
 
     updated = 0
@@ -324,6 +448,7 @@ def reconcile_open_orders(*, since_hours: int = 24, limit: int = 500) -> Dict[st
         kis_inqr_end_ymd=end_ymd,
         limit=limit,
         env=env,
+        kis_api_family="overseas" if is_us_market() else "domestic",
         kis_cano=_mask_account(getattr(kis, "cano", None)),
         kis_acnt_prdt_cd=str(getattr(kis, "acnt_prdt_cd", "") or ""),
         kis_url_base=str(getattr(kis, "url_base", "") or "")[:80],
@@ -353,9 +478,10 @@ def reconcile_open_orders(*, since_hours: int = 24, limit: int = 500) -> Dict[st
     logger.info(f"리컨실 대상(open) {len(open_rows)}건 (since={since_ts})")
 
     today = end_ymd
-    open_orders = _fetch_open_orders_inquire_orders(kis, start_ymd=start_ymd, end_ymd=end_ymd)
+    open_orders = _fetch_open_orders(kis, start_ymd=start_ymd, end_ymd=end_ymd)
+    open_api = "inquire_nccs" if is_us_market() else "inquire_orders"
     logger.info(
-        f"KIS 미체결/부분체결(inquire_orders) 조회: {len(open_orders)}건 "
+        f"KIS 미체결({open_api}) 조회: {len(open_orders)}건 "
         f"({start_ymd}~{end_ymd})"
     )
     daily_orders: Optional[Dict[str, Dict[str, Any]]] = None
@@ -387,9 +513,16 @@ def reconcile_open_orders(*, since_hours: int = 24, limit: int = 500) -> Dict[st
         # 2) 누락이면 daily를 1회만 로드해서 보완
         if not kis_o:
             if daily_orders is None:
-                daily_orders = _fetch_daily_orders(kis, start_ymd=start_ymd, end_ymd=end_ymd)
+                daily_orders = _fetch_daily_orders(
+                    kis,
+                    start_ymd=start_ymd,
+                    end_ymd=end_ymd,
+                    since_dt=since_dt,
+                    until_dt=now_kst,
+                )
+                daily_api = "inquire_ccnl" if is_us_market() else "inquire_daily_order"
                 logger.info(
-                    f"KIS 일자별 주문(daily) 보완 조회: {len(daily_orders)}건 "
+                    f"KIS 일자별 주문({daily_api}) 보완 조회: {len(daily_orders)}건 "
                     f"({start_ymd}~{end_ymd})"
                 )
             kis_o = (daily_orders or {}).get(order_id)
@@ -408,14 +541,14 @@ def reconcile_open_orders(*, since_hours: int = 24, limit: int = 500) -> Dict[st
                 still_missing_after_daily += 1
                 _db_dbg_skip(
                     "reconciler.loop.SKIP_KIS_MISS_AFTER_DAILY",
-                    reason="order_id not in inquire_orders nor inquire_daily_order",
+                    reason="order_id not in open_orders nor daily_orders",
                     order_id=order_id,
                     ticker=r.get("ticker"),
                     db_status=r.get("order_status"),
                 )
                 _db_dbg_log(
                     "reconciler.miss_after_daily.DIAG",
-                    hint="common causes: (1) wrong env(prod/vps) (2) different account/product (3) date boundary/KST vs server (4) order_id not saved correctly (5) KIS retention/filters",
+                    hint="common causes: (1) wrong env(prod/vps) (2) different account/product (3) US ET vs KST date boundary (4) order_id not saved correctly (5) domestic API used for overseas market",
                     env=env,
                     today=today,
                     kis_cano=_mask_account(getattr(kis, "cano", None)),
