@@ -80,6 +80,13 @@ def build_summary_comments(us_mode: bool = False) -> dict:
             "available_cash_krw": "주문 가능 현금 (원화 환산, 표시용)",
             "tot_evlu_amt_usd": "총 평가(USD, 가능 시)",
             "tot_evlu_amt_krw": "총 평가(원화 환산, 표시용)",
+            "usd_cash_total": "외화예수금 (USD, CTRP6504R output2)",
+            "usd_withdrawable": "외화 출금가능 (USD)",
+            "usd_sell_reuse": "매도재사용금 (USD)",
+            "usd_buy_margin": "매수증거금 (USD)",
+            "krw_cash": "원화예수금 (KRW)",
+            "bass_exrt": "적용환율 (원/USD)",
+            "ovrs_rlzt_pfls_amt": "해외 실현손익 (USD, TTTS3012R output2)",
         })
     return base
 

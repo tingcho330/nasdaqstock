@@ -416,21 +416,54 @@ def _fmt_krw_signed(amount: int) -> str:
     return "0원"
 
 
-def _kis_metrics_from_row(row: Dict) -> Dict[str, int]:
-    """US 일일 요약: summary KIS 필드 (원화 총평가 / USD 주문가능 / 평가손익 합계)."""
+def _kis_metrics_from_row(row: Dict) -> Dict:
+    """US 일일 요약: summary KIS 필드 (원화/USD/환율/예수금 세분화)."""
+    empty = {
+        "tot_evlu_amt_krw": 0,
+        "tot_evlu_amt_usd": 0.0,
+        "ord_psbl_frcr_amt": 0,
+        "usd_cash_total": 0.0,
+        "usd_withdrawable": 0.0,
+        "usd_sell_reuse": 0.0,
+        "usd_buy_margin": 0.0,
+        "krw_cash": 0,
+        "bass_exrt": 0.0,
+        "ovrs_rlzt_pfls_amt": 0.0,
+        "evlu_pfls_smtl_amt": 0,
+    }
     if not row:
-        return {
-            "tot_evlu_amt_krw": 0,
-            "ord_psbl_frcr_amt": 0,
-            "evlu_pfls_smtl_amt": 0,
-        }
+        return empty
+    orderable = (
+        _parse_amount(row.get("ord_psbl_frcr_amt"))
+        or _parse_amount(row.get("available_cash"))
+        or _parse_amount(row.get("prvs_rcdl_excc_amt"))
+    )
     return {
         "tot_evlu_amt_krw": _parse_amount(row.get("tot_evlu_amt_krw")),
-        "ord_psbl_frcr_amt": _parse_amount(row.get("ord_psbl_frcr_amt"))
-        or _parse_amount(row.get("available_cash"))
-        or _parse_amount(row.get("prvs_rcdl_excc_amt")),
+        "tot_evlu_amt_usd": _parse_float_amount(row.get("tot_evlu_amt_usd")),
+        "ord_psbl_frcr_amt": orderable,
+        "usd_cash_total": _parse_float_amount(row.get("usd_cash_total"))
+        or _parse_float_amount(row.get("dnca_tot_amt"))
+        or _parse_float_amount(row.get("frcr_buy_amt")),
+        "usd_withdrawable": _parse_float_amount(row.get("usd_withdrawable"))
+        or float(orderable),
+        "usd_sell_reuse": _parse_float_amount(row.get("usd_sell_reuse")),
+        "usd_buy_margin": _parse_float_amount(row.get("usd_buy_margin")),
+        "krw_cash": _parse_amount(row.get("krw_cash")),
+        "bass_exrt": _parse_float_amount(row.get("bass_exrt")),
+        "ovrs_rlzt_pfls_amt": _parse_float_amount(row.get("ovrs_rlzt_pfls_amt")),
         "evlu_pfls_smtl_amt": _parse_amount(row.get("evlu_pfls_smtl_amt")),
     }
+
+
+def _usd_portfolio_total(cash: float, holdings_value: float) -> float:
+    return round(float(cash) + float(holdings_value), 2)
+
+
+def _fmt_fx(rate: float) -> str:
+    if rate <= 0:
+        return "N/A"
+    return f"{rate:,.2f}원/USD"
 
 
 def _load_summary_row_from_path(path: Path) -> Dict:
@@ -449,7 +482,7 @@ def _summary_date_for_snapshot(snap: Dict) -> Optional[str]:
     return snap.get("date") or snap.get("file_date")
 
 
-def _kis_metrics_from_snapshot(snap: Dict) -> Dict[str, int]:
+def _kis_metrics_from_snapshot(snap: Dict) -> Dict:
     """balance 스냅샷에 embedded kis_summary 또는 summary_*.json 참조."""
     date_key = _summary_date_for_snapshot(snap)
     if date_key:
@@ -708,7 +741,7 @@ def load_balance_snapshot(date: str, snapshot_type: str) -> Optional[Dict]:
     return None
 
 def compare_balances(open_balance: Dict, close_balance: Dict) -> Dict:
-    """장시작/종료 잔액 비교 (US: summary KIS 필드 / KR: 스냅샷 총평가)."""
+    """장시작/종료 잔액 비교 (US: USD 수익률 Primary + KIS 환율 분해 / KR: 스냅샷 총평가)."""
     try:
         us_kis = is_us_market(MARKET)
         if us_kis:
@@ -716,57 +749,91 @@ def compare_balances(open_balance: Dict, close_balance: Dict) -> Dict:
             cm = _kis_metrics_from_snapshot(close_balance)
             open_total = om["tot_evlu_amt_krw"]
             close_total = cm["tot_evlu_amt_krw"]
-            open_cash = om["ord_psbl_frcr_amt"]
-            close_cash = cm["ord_psbl_frcr_amt"]
+            open_cash = float(om["ord_psbl_frcr_amt"])
+            close_cash = float(cm["ord_psbl_frcr_amt"])
             _, _, open_hv = _portfolio_totals_from_snapshot(open_balance)
             _, _, close_hv = _portfolio_totals_from_snapshot(close_balance)
+
+            open_usd_total = _usd_portfolio_total(open_cash, open_hv)
+            close_usd_total = _usd_portfolio_total(close_cash, close_hv)
+            usd_change = round(close_usd_total - open_usd_total, 2)
+            daily_return_usd_pct = (
+                (usd_change / open_usd_total) * 100 if open_usd_total > 0 else 0.0
+            )
+            daily_return_pct = daily_return_usd_pct
+
+            open_fx = om.get("bass_exrt") or 0.0
+            close_fx = cm.get("bass_exrt") or 0.0
+            open_krw_cash = om.get("krw_cash") or 0
+            close_krw_cash = cm.get("krw_cash") or 0
+
+            trading_pnl_krw = 0
+            fx_impact_krw = 0
+            if open_fx > 0:
+                trading_pnl_krw = int(round(
+                    usd_change * open_fx + (close_krw_cash - open_krw_cash)
+                ))
+                close_at_open_fx = int(round(close_usd_total * open_fx + close_krw_cash))
+                fx_impact_krw = close_total - close_at_open_fx
         else:
             open_total, open_cash, open_hv = _portfolio_totals_from_snapshot(open_balance)
             close_total, close_cash, close_hv = _portfolio_totals_from_snapshot(close_balance)
+            open_usd_total = close_usd_total = usd_change = 0.0
+            daily_return_usd_pct = 0.0
+            open_fx = close_fx = 0.0
+            trading_pnl_krw = fx_impact_krw = 0
+            open_krw_cash = close_krw_cash = 0
 
         total_change = close_total - open_total
         cash_change = close_cash - open_cash
         holdings_change = close_hv - open_hv
 
-        daily_return_pct = (total_change / open_total) * 100 if open_total > 0 else 0
+        if not us_kis:
+            daily_return_pct = (total_change / open_total) * 100 if open_total > 0 else 0
         
         # 보유종목 변화 분석
         open_tickers = {h["ticker"] for h in open_balance["holdings_detail"]}
         close_tickers = {h["ticker"] for h in close_balance["holdings_detail"]}
         
-        # 매도된 종목 (장시작에만 있던 종목)
         sold_tickers = open_tickers - close_tickers
-        
-        # 새로 매수된 종목 (장종료에만 있는 종목)
         bought_tickers = close_tickers - open_tickers
-        
-        # 계속 보유된 종목
         held_tickers = open_tickers & close_tickers
         
-        # 실현 손익 추정 (매도된 종목의 가치 변화)
-        realized_pnl = 0
-        for ticker in sold_tickers:
-            open_holding = next((h for h in open_balance["holdings_detail"] if h["ticker"] == ticker), None)
-            if open_holding:
-                realized_pnl += open_holding["value"]
+        # 실현 손익: KIS ovrs_rlzt_pfls_amt delta (US) / 매도 종목 open 평가 (KR 폴백)
+        realized_pnl = 0.0
+        if us_kis:
+            open_rlzt = om.get("ovrs_rlzt_pfls_amt") or 0.0
+            close_rlzt = cm.get("ovrs_rlzt_pfls_amt") or 0.0
+            if close_rlzt > 0 or open_rlzt > 0:
+                realized_pnl = round(close_rlzt - open_rlzt, 2)
+            else:
+                realized_pnl = 0.0
+        else:
+            for ticker in sold_tickers:
+                open_holding = next(
+                    (h for h in open_balance["holdings_detail"] if h["ticker"] == ticker),
+                    None,
+                )
+                if open_holding:
+                    realized_pnl += open_holding["value"]
         
-        # 미실현 손익 (계속 보유된 종목의 가치 변화)
-        unrealized_pnl = 0
+        unrealized_pnl = 0.0
         for ticker in held_tickers:
             open_holding = next((h for h in open_balance["holdings_detail"] if h["ticker"] == ticker), None)
             close_holding = next((h for h in close_balance["holdings_detail"] if h["ticker"] == ticker), None)
             if open_holding and close_holding:
                 unrealized_pnl += close_holding["value"] - open_holding["value"]
         
-        # 수수료 추정 (총 변화량에서 실현/미실현 손익 차감)
         estimated_fees = total_change - realized_pnl - unrealized_pnl
         
-        return {
+        result = {
             "date": close_balance["date"],
             "total_change": total_change,
             "cash_change": cash_change,
             "holdings_change": holdings_change,
             "daily_return_pct": round(daily_return_pct, 2),
+            "daily_return_usd_pct": round(daily_return_usd_pct, 2),
+            "usd_change": usd_change,
             "realized_pnl": realized_pnl,
             "unrealized_pnl": unrealized_pnl,
             "estimated_fees": estimated_fees,
@@ -780,13 +847,52 @@ def compare_balances(open_balance: Dict, close_balance: Dict) -> Dict:
             "close_cash": close_cash,
             "open_holdings_value": open_hv,
             "close_holdings_value": close_hv,
+            "open_usd_total": open_usd_total,
+            "close_usd_total": close_usd_total,
             "us_kis_summary": us_kis,
         }
+        if us_kis:
+            result.update({
+                "open_fx": open_fx,
+                "close_fx": close_fx,
+                "trading_pnl_krw": trading_pnl_krw,
+                "fx_impact_krw": fx_impact_krw,
+                "open_krw_cash": open_krw_cash,
+                "close_krw_cash": close_krw_cash,
+                "open_cash_detail": om,
+                "close_cash_detail": cm,
+            })
+        return result
         
     except Exception as e:
         logger.error(f"잔액 비교 분석 실패: {type(e).__name__}: {str(e)}")
         logger.debug("잔액 비교 분석 상세 오류:", exc_info=True)
         return {}
+
+def _fmt_usd_cash_detail(metrics: Dict, prefix: str = "") -> str:
+    """KIS 예수금 세분화 (close 스냅샷 기준 1줄 요약)."""
+    if not metrics:
+        return ""
+    parts: List[str] = []
+    total = metrics.get("usd_cash_total") or 0.0
+    wdr = metrics.get("usd_withdrawable") or metrics.get("ord_psbl_frcr_amt") or 0.0
+    reuse = metrics.get("usd_sell_reuse") or 0.0
+    margin = metrics.get("usd_buy_margin") or 0.0
+    krw = metrics.get("krw_cash") or 0
+    if total > 0:
+        parts.append(f"외화예수 ${total:,.2f}")
+    if wdr > 0:
+        parts.append(f"출금가능 ${float(wdr):,.2f}")
+    if reuse > 0:
+        parts.append(f"매도재사용 ${reuse:,.2f}")
+    if margin > 0:
+        parts.append(f"매수증거금 ${margin:,.2f}")
+    line = " | ".join(parts) if parts else ""
+    if krw > 0:
+        krw_line = f"원화예수 {_fmt_krw(krw)}"
+        line = f"{line}\n{krw_line}" if line else krw_line
+    return f"{prefix}{line}" if line else ""
+
 
 def send_daily_trading_summary():
     """장종료시 당일 매매 내역을 디스코드로 전송"""
@@ -827,13 +933,19 @@ def send_daily_trading_summary():
         # 디스코드 임베드 생성
         total_change = comparison["total_change"]
         daily_return = comparison["daily_return_pct"]
+        daily_return_usd = comparison.get("daily_return_usd_pct", daily_return)
         realized_pnl = comparison["realized_pnl"]
         unrealized_pnl = comparison["unrealized_pnl"]
         estimated_fees = comparison["estimated_fees"]
         
-        # 변화량 이모지
-        change_emoji = "📈" if total_change > 0 else "📉" if total_change < 0 else "➡️"
         mkt = os.getenv("MARKET", "SP500")
+        us_kis = comparison.get("us_kis_summary", is_us_market(mkt))
+
+        # Primary 수익률: US는 USD, KR은 원화/통화
+        primary_return = daily_return_usd if us_kis else daily_return
+        primary_change = comparison.get("usd_change", total_change) if us_kis else total_change
+        change_emoji = "📈" if primary_change > 0 else "📉" if primary_change < 0 else "➡️"
+        krw_ref_emoji = "📈" if total_change > 0 else "📉" if total_change < 0 else "➡️"
 
         open_total = comparison["open_balance"]
         close_total = comparison["close_balance"]
@@ -841,24 +953,81 @@ def send_daily_trading_summary():
         close_hv = comparison.get("close_holdings_value", 0)
         open_cash = comparison.get("open_cash", open_balance.get("cash", 0))
         close_cash = comparison.get("close_cash", close_balance.get("cash", 0))
-        us_kis = comparison.get("us_kis_summary", is_us_market(mkt))
+        open_usd_total = comparison.get("open_usd_total", 0)
+        close_usd_total = comparison.get("close_usd_total", 0)
 
         if us_kis:
-            total_line = (
-                f"**{_fmt_krw(open_total)}** → **{_fmt_krw(close_total)}** "
-                f"({_fmt_krw_signed(total_change)})"
-            )
-            cash_line = (
-                f"{fmt_money(open_cash, mkt)} → {fmt_money(close_cash, mkt)} "
-                f"({fmt_money_signed(comparison['cash_change'], mkt)})"
+            usd_total_line = (
+                f"**{fmt_money(open_usd_total, mkt)}** → **{fmt_money(close_usd_total, mkt)}** "
+                f"({fmt_money_signed(comparison.get('usd_change', 0), mkt)})"
             )
             hv_line = (
                 f"{fmt_money(open_hv, mkt)} → {fmt_money(close_hv, mkt)} "
                 f"({fmt_money_signed(comparison['holdings_change'], mkt)})"
             )
-            total_title = f"{change_emoji} 총평가 변화 (원화환산)"
-            cash_title = "💵 예수금 (주문가능 USD)"
-            hv_title = "📈 보유평가"
+            cash_line = (
+                f"{fmt_money(open_cash, mkt)} → {fmt_money(close_cash, mkt)} "
+                f"({fmt_money_signed(comparison['cash_change'], mkt)})"
+            )
+            close_detail = _fmt_usd_cash_detail(comparison.get("close_cash_detail") or {})
+            if close_detail:
+                cash_line = f"{cash_line}\n{close_detail}"
+
+            total_line = (
+                f"**{_fmt_krw(open_total)}** → **{_fmt_krw(close_total)}** "
+                f"({_fmt_krw_signed(total_change)})"
+            )
+
+            fields = [
+                {
+                    "name": f"{change_emoji} 일일 수익률 (USD)",
+                    "value": (
+                        f"**{daily_return_usd:+.2f}%** "
+                        f"({fmt_money_signed(comparison.get('usd_change', 0), mkt)})"
+                    ),
+                    "inline": False,
+                },
+                {
+                    "name": "💼 USD 총자산 (예수금+보유)",
+                    "value": usd_total_line,
+                    "inline": False,
+                },
+                {
+                    "name": "📈 보유평가 (USD, 시장가)",
+                    "value": hv_line,
+                    "inline": True,
+                },
+                {
+                    "name": "💵 예수금 (USD, 주문가능)",
+                    "value": cash_line,
+                    "inline": True,
+                },
+                {
+                    "name": f"{krw_ref_emoji} 총평가 (원화환산, 참고)",
+                    "value": total_line,
+                    "inline": False,
+                },
+            ]
+
+            open_fx = comparison.get("open_fx") or 0.0
+            close_fx = comparison.get("close_fx") or 0.0
+            if open_fx > 0 and close_fx > 0:
+                fx_delta = close_fx - open_fx
+                fx_lines = [
+                    f"**{_fmt_fx(open_fx)}** → **{_fmt_fx(close_fx)}** "
+                    f"({fx_delta:+,.2f}원/USD)",
+                ]
+                trading_krw = comparison.get("trading_pnl_krw")
+                fx_impact = comparison.get("fx_impact_krw")
+                if trading_krw is not None:
+                    fx_lines.append(f"매매기여(원@open환율): {_fmt_krw_signed(trading_krw)}")
+                if fx_impact is not None:
+                    fx_lines.append(f"환율영향: {_fmt_krw_signed(fx_impact)}")
+                fields.append({
+                    "name": "💱 환율 · 원화 분해",
+                    "value": "\n".join(fx_lines),
+                    "inline": False,
+                })
         else:
             total_line = (
                 f"**{fmt_money(open_total, mkt)}** → "
@@ -877,45 +1046,48 @@ def send_daily_trading_summary():
             cash_title = "💵 예수금"
             hv_title = "📈 보유평가"
 
-        fields = [
-            {"name": total_title, "value": total_line, "inline": False},
-            {"name": cash_title, "value": cash_line, "inline": True},
-            {"name": hv_title, "value": hv_line, "inline": True},
-        ]
+            fields = [
+                {"name": total_title, "value": total_line, "inline": False},
+                {"name": cash_title, "value": cash_line, "inline": True},
+                {"name": hv_title, "value": hv_line, "inline": True},
+            ]
 
         if (
-            abs(daily_return) > 0.01
-            or abs(total_change) > 0
+            abs(primary_return) > 0.01
+            or abs(primary_change) > 0
             or open_hv > 0
             or close_hv > 0
         ):
+            if not us_kis:
+                fields.extend([
+                    {
+                        "name": "📊 일일 수익률",
+                        "value": f"**{daily_return:+.2f}%**",
+                        "inline": True,
+                    },
+                ])
             fields.extend([
                 {
-                    "name": "📊 일일 수익률",
-                    "value": f"**{daily_return:+.2f}%**",
-                    "inline": True
-                },
-                {
-                    "name": "💰 실현 손익",
+                    "name": "💰 실현 손익 (KIS)" if us_kis else "💰 실현 손익",
                     "value": fmt_money_signed(realized_pnl, mkt),
-                    "inline": True
+                    "inline": True,
                 },
                 {
-                    "name": "📈 미실현 손익",
+                    "name": "📈 미실현·보유변동" if us_kis else "📈 미실현 손익",
                     "value": (
                         fmt_money_signed(comparison["holdings_change"], mkt)
                         if us_kis
                         else fmt_money_signed(unrealized_pnl, mkt)
                     ),
-                    "inline": True
-                }
+                    "inline": True,
+                },
             ])
             
             if abs(estimated_fees) > 0 and not us_kis:
                 fields.append({
                     "name": "💸 추정 수수료",
                     "value": fmt_money_signed(estimated_fees, mkt),
-                    "inline": True
+                    "inline": True,
                 })
         
         # 매매 내역 추가 (변화가 있을 때만)
@@ -946,7 +1118,11 @@ def send_daily_trading_summary():
             "title": f"📊 {today} 당일 매매 성과 ({session_note})",
             "description": desc,
             "fields": fields,
-            "color": 0x00ff00 if total_change > 0 else 0xff0000 if total_change < 0 else 0x808080,
+            "color": (
+                0x00ff00 if primary_change > 0
+                else 0xff0000 if primary_change < 0
+                else 0x808080
+            ),
             "footer": {
                 "text": (
                     f"보유종목: open {open_balance['holdings_count']}개 → "

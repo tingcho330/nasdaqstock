@@ -93,6 +93,23 @@ def _pick_positive(*sources: Dict[str, Any], keys: Tuple[str, ...]) -> float:
     return 0.0
 
 
+def _pick_bass_exrt(
+    df_present_out1: Optional[pd.DataFrame],
+    pres2: Dict[str, Any],
+    bal2: Dict[str, Any],
+) -> float:
+    """CTRP6504R/TTTS3012R 적용환율(bass_exrt) — 종목 output1 우선."""
+    for rec in _rows(df_present_out1):
+        v = _f(rec.get("bass_exrt"))
+        if v > 0:
+            return v
+    for src in (pres2, bal2):
+        v = _f(src.get("bass_exrt"))
+        if v > 0:
+            return v
+    return 0.0
+
+
 def normalize_overseas_holdings(df_hold: pd.DataFrame, market: str) -> pd.DataFrame:
     """해외 잔고 output1 → trader/recorder 호환 컬럼."""
     rows: List[Dict[str, Any]] = []
@@ -153,6 +170,8 @@ def build_overseas_summary(
     df_bal_out2: pd.DataFrame,
     df_present_out2: Optional[pd.DataFrame] = None,
     df_present_out3: Optional[pd.DataFrame] = None,
+    df_present_out1: Optional[pd.DataFrame] = None,
+    df_present_out3_krw: Optional[pd.DataFrame] = None,
 ) -> Dict[str, Any]:
     """
     해외 잔고/체결기준현재잔고 summary → extract_cash_from_summary 호환 dict.
@@ -161,6 +180,7 @@ def build_overseas_summary(
     bal2 = _first_row(df_bal_out2)
     pres2 = _present_usd_row(df_present_out2)
     pres3 = _first_row(df_present_out3) if df_present_out3 is not None else {}
+    pres3_krw = _first_row(df_present_out3_krw) if df_present_out3_krw is not None else {}
 
     # TTTS3012R output2 + CTRP6504R output2/3 (KIS 공식 필드명)
     #
@@ -216,6 +236,39 @@ def build_overseas_summary(
         pres3,
         keys=("frcr_evlu_pfls_amt2", "evlu_pfls_amt_smtl", "tot_evlu_pfls_amt"),
     )
+    rlzt_pfls = _pick_positive(
+        bal2,
+        keys=("ovrs_rlzt_pfls_amt", "ovrs_rlzt_pfls_amt2", "rlzt_pfls_amt"),
+    )
+    bass_exrt = _pick_bass_exrt(df_present_out1, pres2, bal2)
+    usd_withdrawable = _pick_positive(
+        pres2,
+        keys=("frcr_drwg_psbl_amt_1", "nxdy_frcr_drwg_psbl_amt"),
+    )
+    usd_sell_reuse = _pick_positive(
+        pres2,
+        pres3,
+        keys=(
+            "ruse_psbl_amt",
+            "thdt_sll_ccld_frcr_amt",
+            "thdt_sll_ccld_frcr_amt1",
+            "frcr_sll_ruse_amt",
+        ),
+    )
+    usd_buy_margin = _pick_positive(
+        pres2,
+        keys=("frcr_buy_mgn_amt", "buy_mgn_amt", "frcr_etc_mgna"),
+    )
+    krw_cash = _pick_positive(
+        pres3_krw,
+        pres3,
+        keys=(
+            "wcrc_dncl_amt",
+            "dncl_amt",
+            "krw_dncl_amt",
+            "tot_dncl_amt",
+        ),
+    )
 
     available_usd = int(round(usd_order_psbl if usd_order_psbl > 0 else usd_cash))
     available_krw = int(round(krw_order_psbl))
@@ -236,19 +289,27 @@ def build_overseas_summary(
         except Exception as e:
             logger.info("[KIS_TRACE] overseas_summary trace error: %s", e)
 
+    order_psbl_val = usd_order_psbl if usd_order_psbl > 0 else usd_cash
     return {
         "currency": "USD",
         # USD (외화)
         "dnca_tot_amt": str(_i(usd_cash)),
         "prvs_rcdl_excc_amt": str(available_usd),
         "nxdy_excc_amt": str(available_usd),
-        "ord_psbl_frcr_amt": str(_i(usd_order_psbl if usd_order_psbl > 0 else usd_cash)),
+        "ord_psbl_frcr_amt": str(_i(order_psbl_val)),
         "frcr_buy_amt": str(_i(usd_cash)),
         "tot_evlu_amt_usd": str(_i(usd_tot_evlu)),
         "available_cash": str(available_usd),
+        "usd_cash_total": str(round(usd_cash, 2)),
+        "usd_withdrawable": str(round(usd_withdrawable if usd_withdrawable > 0 else order_psbl_val, 2)),
+        "usd_sell_reuse": str(round(usd_sell_reuse, 2)),
+        "usd_buy_margin": str(round(usd_buy_margin, 2)),
+        "ovrs_rlzt_pfls_amt": str(round(rlzt_pfls, 2)),
+        "bass_exrt": str(round(bass_exrt, 4)),
         # KRW 환산(표시용)
         "available_cash_krw": str(_i(available_krw)),
         "tot_evlu_amt_krw": str(_i(krw_tot_evlu)),
+        "krw_cash": str(_i(krw_cash)),
         "pchs_amt_smtl_amt": str(_i(pchs_smtl)),
         "evlu_pfls_smtl_amt": str(_i(pfls_smtl)),
         "status": "ok",
@@ -278,10 +339,25 @@ def inquire_overseas_account(
             natn_cd="840",
             tr_mket_cd="00",
         )
+        df_pres3_krw = pd.DataFrame()
+        try:
+            _, _, df_pres3_krw = kis.inquire_overseas_present_balance(
+                wcrc_frcr_dvsn_cd="01",
+                natn_cd="840",
+                tr_mket_cd="00",
+            )
+        except Exception as krw_err:
+            logger.debug("CTRP6504R 원화(01) 조회 스킵: %s", krw_err)
         if df_hold is None:
             df_hold = pd.DataFrame()
         holdings = normalize_overseas_holdings(df_hold, market)
-        summary = build_overseas_summary(df_bal2, df_pres2, df_pres3)
+        summary = build_overseas_summary(
+            df_bal2,
+            df_pres2,
+            df_pres3,
+            df_present_out1=df_pres1,
+            df_present_out3_krw=df_pres3_krw,
+        )
         if not summary.get("available_cash") and summary.get("dnca_tot_amt") == "0":
             last_err = "해외 summary 금액 필드 비어있음(USD 예수금 0 또는 파싱 실패)"
             logger.warning(last_err)
