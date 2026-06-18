@@ -288,8 +288,9 @@ class Trader:
         )
         self.position_sizing_reserve_final = bool(_ps.get("reserve_final_cash", True))
 
-        # ⬇️ 신규 주입 파라미터
-        self.fee_buffer_pct = float(self.trading_params.get("fee_buffer_pct", 0.0))
+        # ⬇️ 신규 주입 파라미터 (fee_buffer_pct 미설정 시 commission_rate와 동일하게 매수 예산 반영)
+        _commission_rate = float(self.trading_params.get("commission_rate", 0.0025))
+        self.fee_buffer_pct = float(self.trading_params.get("fee_buffer_pct", _commission_rate))
         self.retry_on_reject = bool(self.trading_params.get("retry_on_reject", False))
         
         # 중복 주문 방지 시스템

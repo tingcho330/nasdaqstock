@@ -952,7 +952,7 @@ def get_market_aware_screening_params(market_state: MarketState, base: Optional[
 def calculate_transaction_costs(sell_amount: int, buy_amount: int, settings: Dict[str, Any]) -> Dict[str, Any]:
     """거래 비용 계산"""
     try:
-        commission_rate = settings.get("trading_params", {}).get("commission_rate", 0.00015)
+        commission_rate = settings.get("trading_params", {}).get("commission_rate", 0.0025)
         securities_tax_rate = settings.get("trading_params", {}).get("securities_tax_rate", 0.0015)
         agricultural_tax_rate = settings.get("trading_params", {}).get("agricultural_tax_rate", 0.0008)
         slippage_rate = settings.get("trading_params", {}).get("slippage_rate", 0.001)

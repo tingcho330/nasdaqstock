@@ -213,12 +213,12 @@
       "min_qty": 1,
       "min_cash_per_slice": 100
     },
-    "fee_buffer_pct": 0.003,
+    "fee_buffer_pct": 0.0025,         // 매수 예산·수량 상한: KIS 해외 매수 수수료 0.25%와 동일
     "retry_on_reject": true,
     "max_retries": 2,
     "retry_delay_ms": 400,
     "slippage_bps": 10,
-    "commission_rate": 0.001,        // US: 해외 수수료 근사
+    "commission_rate": 0.0025,        // KIS 해외 매수/매도 각 0.25% (회전·익절 비용 추정)
     "securities_tax_rate": 0,
     "agricultural_tax_rate": 0,
     "slippage_rate": 0.001,

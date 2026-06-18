@@ -61,7 +61,8 @@ def delta_score_min(settings: SettingsLike) -> float:
 
 def fee_buffer_pct(settings: SettingsLike) -> float:
     tp = _settings_dict(settings).get("trading_params") or {}
-    return float(tp.get("fee_buffer_pct", 0.005))
+    commission = float(tp.get("commission_rate", 0.0025))
+    return float(tp.get("fee_buffer_pct", commission))
 
 
 def sell_eligible_for_rotation(
