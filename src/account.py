@@ -17,7 +17,7 @@ import sys
 import logging
 from datetime import datetime
 from pathlib import Path
-from typing import Tuple, Dict, Any
+from typing import Tuple, Dict, Any, List
 
 import pandas as pd
 
@@ -152,6 +152,31 @@ def _load_status(filepath: Path) -> str:
             return (json.load(f) or {}).get("status", "")
     except Exception:
         return ""
+
+
+def get_saved_balance_summary(balance_path: Path) -> Tuple[int, List[str]]:
+    """
+    저장된 balance JSON에서 holding_count / tickers 추출 (동기화 검증용).
+    account.py 실행 결과와 trader KIS snapshot 비교에 사용.
+    """
+    if not balance_path or not balance_path.exists():
+        return 0, []
+    try:
+        with open(balance_path, "r", encoding="utf-8") as f:
+            payload = json.load(f) or {}
+        rows = payload.get("data") or []
+        tickers: List[str] = []
+        for row in rows:
+            if isinstance(row, dict):
+                qty = _to_int(row.get("hldg_qty", 0))
+                sym = str(row.get("pdno") or "").strip().upper()
+                if qty > 0 and sym:
+                    tickers.append(sym)
+        tickers = sorted(set(tickers))
+        return len(tickers), tickers
+    except Exception as e:
+        logger.warning("balance summary 파싱 실패: %s", e)
+        return 0, []
 
 # ───────── KIS 래핑 ─────────
 def inquire_balance_with_retry(kis: KIS, *, max_tries: int = 3) -> Tuple[pd.DataFrame | None, pd.DataFrame | None, bool, str]:

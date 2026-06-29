@@ -9,7 +9,15 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 
-from utils import us_ovrs_excg_cd, norm_ticker
+from datetime import datetime
+
+from account_snapshot import (
+    AccountSnapshot,
+    US_BALANCE_EXCHANGES,
+    build_sellable_qty_map,
+    compute_sellable_qty,
+)
+from utils import KST, norm_ticker, us_ovrs_excg_cd
 
 logger = logging.getLogger(__name__)
 
@@ -316,6 +324,254 @@ def build_overseas_summary(
     }
 
 
+def _kis_tr_id_balance(is_vps: bool) -> str:
+    return "VTTS3012R" if is_vps else "TTTS3012R"
+
+
+def _kis_tr_id_present(is_vps: bool) -> str:
+    return "VTRP6504R" if is_vps else "CTRP6504R"
+
+
+def _kis_tr_id_nccs(is_vps: bool) -> str:
+    return "VTTS3018R" if is_vps else "TTTS3018R"
+
+
+def _kis_tr_id_ccnl(is_vps: bool) -> str:
+    return "VTTS3035R" if is_vps else "TTTS3035R"
+
+
+def _norm_sym(val: Any, market: str) -> str:
+    return norm_ticker(val, market)
+
+
+def parse_nccs_sell_pending(df_nccs: pd.DataFrame, market: str) -> Dict[str, int]:
+    """inquire-nccs 미체결 매도수량 → ticker별 합계."""
+    pending: Dict[str, int] = {}
+    if df_nccs is None or df_nccs.empty:
+        return pending
+    for rec in _rows(df_nccs):
+        side = str(rec.get("sll_buy_dvsn_cd") or rec.get("sll_buy_dvsn") or "").strip()
+        if side not in ("01", "1", "sell", "S"):
+            continue
+        sym = _norm_sym(rec.get("pdno") or rec.get("ovrs_pdno") or "", market)
+        if not sym:
+            continue
+        qty = _i(rec.get("nccs_qty") or rec.get("ord_qty") or rec.get("ft_ord_qty"))
+        if qty <= 0:
+            continue
+        pending[sym] = pending.get(sym, 0) + qty
+    return pending
+
+
+def parse_nccs_open_orders(df_nccs: pd.DataFrame, market: str) -> List[Dict[str, Any]]:
+    """inquire-nccs → open_orders list."""
+    orders: List[Dict[str, Any]] = []
+    if df_nccs is None or df_nccs.empty:
+        return orders
+    for rec in _rows(df_nccs):
+        sym = _norm_sym(rec.get("pdno") or rec.get("ovrs_pdno") or "", market)
+        side_cd = str(rec.get("sll_buy_dvsn_cd") or rec.get("sll_buy_dvsn") or "")
+        side = "sell" if side_cd in ("01", "1") else "buy"
+        qty = _i(rec.get("nccs_qty") or rec.get("ord_qty") or rec.get("ft_ord_qty"))
+        orders.append(
+            {
+                "order_id": str(rec.get("odno") or ""),
+                "ticker": sym,
+                "side": side,
+                "quantity": qty,
+                "ovrs_excg_cd": str(rec.get("ovrs_excg_cd") or ""),
+            }
+        )
+    return orders
+
+
+def _merge_balance_holdings(frames: List[pd.DataFrame], market: str) -> pd.DataFrame:
+    """거래소별 balance output1 병합 (동일 ticker는 수량 합산)."""
+    by_sym: Dict[str, Dict[str, Any]] = {}
+    for df in frames:
+        if df is None or df.empty:
+            continue
+        for rec in _rows(df):
+            sym = _norm_sym(
+                rec.get("ovrs_pdno") or rec.get("pdno") or rec.get("symb") or "",
+                market,
+            )
+            if not sym:
+                continue
+            qty = _f(rec.get("ovrs_cblc_qty") or rec.get("hldg_qty") or rec.get("cblc_qty"))
+            if qty <= 0:
+                continue
+            if sym not in by_sym:
+                by_sym[sym] = dict(rec)
+            else:
+                prev_qty = _f(by_sym[sym].get("ovrs_cblc_qty") or by_sym[sym].get("hldg_qty"))
+                new_qty = prev_qty + qty
+                by_sym[sym]["ovrs_cblc_qty"] = str(new_qty)
+                by_sym[sym]["hldg_qty"] = str(int(new_qty))
+    if not by_sym:
+        return pd.DataFrame()
+    return pd.DataFrame(list(by_sym.values()))
+
+
+def load_kis_account_snapshot(
+    kis,
+    market: str = "SP500",
+    *,
+    trade_date: Optional[str] = None,
+    exchanges: Optional[tuple] = None,
+    include_ccnl: bool = False,
+    ccnl_start_ymd: Optional[str] = None,
+    ccnl_end_ymd: Optional[str] = None,
+) -> AccountSnapshot:
+    """
+    KIS 해외주식 balance/present/nccs(/ccnl) 엔드포인트로 AccountSnapshot 생성.
+    NASD/NYSE/AMEX 거래소를 순회해 보유종목을 병합한다.
+    """
+    is_vps = getattr(kis, "env", "prod") == "vps"
+    td = trade_date or datetime.now(KST).strftime("%Y%m%d")
+    exc_list = list(exchanges or US_BALANCE_EXCHANGES)
+    ts = datetime.now(KST).isoformat()
+
+    snap = AccountSnapshot(
+        trade_date=td,
+        source="kis_endpoint",
+        balance_endpoint=_kis_tr_id_balance(is_vps),
+        present_balance_endpoint=_kis_tr_id_present(is_vps),
+        nccs_endpoint=_kis_tr_id_nccs(is_vps),
+        ccnl_endpoint=_kis_tr_id_ccnl(is_vps) if include_ccnl else None,
+        snapshot_ts=ts,
+        exchange_codes=exc_list,
+    )
+
+    try:
+        hold_frames: List[pd.DataFrame] = []
+        bal2_frames: List[pd.DataFrame] = []
+        queried_exchanges: List[str] = []
+
+        for exc in exc_list:
+            try:
+                df_hold, df_bal2 = kis.inquire_overseas_balance(
+                    ovrs_excg_cd=exc,
+                    tr_crcy_cd="USD",
+                )
+                queried_exchanges.append(exc)
+                if df_hold is not None and not df_hold.empty:
+                    hold_frames.append(df_hold)
+                if df_bal2 is not None and not df_bal2.empty:
+                    bal2_frames.append(df_bal2)
+            except Exception as exc_err:
+                logger.warning("inquire_overseas_balance(%s) 실패: %s", exc, exc_err)
+
+        if not queried_exchanges:
+            snap.valid = False
+            snap.error = "KIS balance 조회 실패 (모든 거래소)"
+            return snap
+
+        merged_hold_raw = _merge_balance_holdings(hold_frames, market)
+        holdings_df = normalize_overseas_holdings(merged_hold_raw, market)
+
+        df_bal2 = pd.concat(bal2_frames, ignore_index=True) if bal2_frames else pd.DataFrame()
+
+        df_pres1, df_pres2, df_pres3 = kis.inquire_overseas_present_balance(
+            wcrc_frcr_dvsn_cd="02",
+            natn_cd="840",
+            tr_mket_cd="00",
+            inqr_dvsn_cd="00",
+        )
+        df_pres3_krw = pd.DataFrame()
+        try:
+            _, _, df_pres3_krw = kis.inquire_overseas_present_balance(
+                wcrc_frcr_dvsn_cd="01",
+                natn_cd="840",
+                tr_mket_cd="00",
+            )
+        except Exception as krw_err:
+            logger.debug("present_balance KRW(01) 스킵: %s", krw_err)
+
+        summary = build_overseas_summary(
+            df_bal2,
+            df_pres2,
+            df_pres3,
+            df_present_out1=df_pres1,
+            df_present_out3_krw=df_pres3_krw,
+        )
+        summary["currency"] = "USD"
+
+        nccs_frames: List[pd.DataFrame] = []
+        for exc in exc_list:
+            try:
+                df_n = kis.inquire_nccs(ovrs_excg_cd=exc)
+                if df_n is not None and not df_n.empty:
+                    nccs_frames.append(df_n)
+            except Exception as nccs_err:
+                logger.warning("inquire_nccs(%s) 실패: %s", exc, nccs_err)
+        if not nccs_frames and hasattr(kis, "inquire_nccs"):
+            try:
+                df_n = kis.inquire_nccs(ovrs_excg_cd="NASD")
+                if df_n is not None and not df_n.empty:
+                    nccs_frames.append(df_n)
+            except Exception:
+                pass
+
+        df_nccs = pd.concat(nccs_frames, ignore_index=True) if nccs_frames else pd.DataFrame()
+        sell_pending = parse_nccs_sell_pending(df_nccs, market)
+        open_orders = parse_nccs_open_orders(df_nccs, market)
+
+        holdings = holdings_df.to_dict("records") if not holdings_df.empty else []
+        holdings = [h for h in holdings if _i(h.get("hldg_qty")) > 0]
+        tickers = sorted({_norm_sym(h.get("pdno"), market) for h in holdings if h.get("pdno")})
+
+        def _nt(x):
+            return _norm_sym(x, market)
+
+        sellable = build_sellable_qty_map(holdings, sell_pending, norm_ticker_fn=_nt)
+
+        cash_map: Dict[str, Any] = {
+            "currency": "USD",
+            "available_cash": _i(summary.get("available_cash")),
+            "dnca_tot_amt": _i(summary.get("dnca_tot_amt")),
+            "ord_psbl_frcr_amt": _i(summary.get("ord_psbl_frcr_amt")),
+            "prvs_rcdl_excc_amt": _i(summary.get("prvs_rcdl_excc_amt")),
+            "tot_evlu_amt_usd": _i(summary.get("tot_evlu_amt_usd")),
+            "available_cash_krw": _i(summary.get("available_cash_krw")),
+            "tot_evlu_amt_krw": _i(summary.get("tot_evlu_amt_krw")),
+        }
+        tot_evlu = sum(_f(h.get("evlu_amt")) for h in holdings) + float(cash_map["available_cash"])
+        cash_map["tot_evlu_amt"] = int(round(tot_evlu))
+
+        snap.holdings = holdings
+        snap.cash_map = cash_map
+        snap.open_orders = open_orders
+        snap.sell_pending_qty_by_ticker = sell_pending
+        snap.sellable_qty_by_ticker = sellable
+        snap.holding_count = len(holdings)
+        snap.tickers = tickers
+        snap.exchange_codes = queried_exchanges
+
+        if include_ccnl and ccnl_start_ymd and ccnl_end_ymd and hasattr(kis, "inquire_ccnl"):
+            try:
+                kis.inquire_ccnl(
+                    ord_strt_dt=ccnl_start_ymd,
+                    ord_end_dt=ccnl_end_ymd,
+                    ovrs_excg_cd=exc_list[0],
+                )
+            except Exception as ccnl_err:
+                logger.debug("inquire_ccnl optional 조회: %s", ccnl_err)
+
+        if snap.holding_count > 0 and snap.total_value <= 0:
+            snap.valid = False
+            snap.invalid_reason = "ACCOUNT_SNAPSHOT_INVALID: holdings>0 total_value=0"
+
+        return snap
+
+    except Exception as e:
+        err = str(e)[:400]
+        logger.error("KIS endpoint snapshot 생성 실패: %s", err, exc_info=True)
+        snap.valid = False
+        snap.error = err
+        return snap
+
+
 def inquire_overseas_account(
     kis,
     market: str = "SP500",
@@ -324,16 +580,30 @@ def inquire_overseas_account(
 ) -> Tuple[pd.DataFrame, Dict[str, Any], bool, str]:
     """
     해외 잔고 + 체결기준현재잔고 조회 후 정규화.
+    NASD/NYSE/AMEX 거래소별 balance를 병합한다.
     반환: (holdings_df, summary_dict, degraded, error_msg)
     """
-    ovrs_excg = us_ovrs_excg_cd(market)
     last_err = ""
 
     try:
-        df_hold, df_bal2 = kis.inquire_overseas_balance(
-            ovrs_excg_cd=ovrs_excg,
-            tr_crcy_cd=tr_crcy_cd,
-        )
+        hold_frames: List[pd.DataFrame] = []
+        bal2_frames: List[pd.DataFrame] = []
+        for exc in US_BALANCE_EXCHANGES:
+            try:
+                df_hold, df_bal2 = kis.inquire_overseas_balance(
+                    ovrs_excg_cd=exc,
+                    tr_crcy_cd=tr_crcy_cd,
+                )
+                if df_hold is not None and not df_hold.empty:
+                    hold_frames.append(df_hold)
+                if df_bal2 is not None and not df_bal2.empty:
+                    bal2_frames.append(df_bal2)
+            except Exception as exc_err:
+                logger.debug("inquire_overseas_balance(%s) 스킵: %s", exc, exc_err)
+
+        merged_hold_raw = _merge_balance_holdings(hold_frames, market)
+        df_bal2 = pd.concat(bal2_frames, ignore_index=True) if bal2_frames else pd.DataFrame()
+
         df_pres1, df_pres2, df_pres3 = kis.inquire_overseas_present_balance(
             wcrc_frcr_dvsn_cd="02",
             natn_cd="840",
@@ -348,9 +618,7 @@ def inquire_overseas_account(
             )
         except Exception as krw_err:
             logger.debug("CTRP6504R 원화(01) 조회 스킵: %s", krw_err)
-        if df_hold is None:
-            df_hold = pd.DataFrame()
-        holdings = normalize_overseas_holdings(df_hold, market)
+        holdings = normalize_overseas_holdings(merged_hold_raw, market)
         summary = build_overseas_summary(
             df_bal2,
             df_pres2,

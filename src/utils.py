@@ -1094,23 +1094,42 @@ def load_account_files_with_retry(
     summary_pattern: str = "summary_*.json",
     balance_pattern: str = "balance_*.json",
     max_wait_sec: int = 5,
+    *,
+    exclude_degraded: bool = False,
+    exact_trade_date: Optional[str] = None,
 ) -> Tuple[Dict[str, str], List[Dict], Optional[Path], Optional[Path]]:
     """
     최신 summary/balance 파일을 읽고 (summary_dict, balance_list, summary_path, balance_path) 반환.
     파일 생성 직후일 수 있어 최대 max_wait_sec 동안 재시도.
+    exclude_degraded=True 이면 *_degraded.json 제외.
+    exact_trade_date 지정 시 summary_{date}.json / balance_{date}.json 우선.
     """
     logger = logging.getLogger(__name__)
+    td = (exact_trade_date or os.getenv("PIPELINE_TRADE_DATE", "")).strip()
+    if td:
+        summary_pattern = f"summary_{td}.json"
+        balance_pattern = f"balance_{td}.json"
+
     deadline = pytime.time() + max_wait_sec
     summary_path: Optional[Path] = None
     balance_path: Optional[Path] = None
     parsed_summary: Dict[str, str] = {}
     parsed_balance: List[Dict] = []
 
+    def _is_degraded(p: Optional[Path]) -> bool:
+        if not p or not exclude_degraded:
+            return False
+        return "_degraded" in p.name.lower()
+
     while pytime.time() < deadline:
         if summary_path is None:
             summary_path = find_latest_file(summary_pattern)
+            if _is_degraded(summary_path):
+                summary_path = None
         if balance_path is None:
             balance_path = find_latest_file(balance_pattern)
+            if _is_degraded(balance_path):
+                balance_path = None
 
         ok = True
         if summary_path and summary_path.exists():
@@ -1231,16 +1250,25 @@ def get_account_snapshot_cached(
     summary_pattern: str = "summary_*.json",
     balance_pattern: str = "balance_*.json",
     ttl_sec: Optional[int] = None,
+    *,
+    force_reload: bool = False,
+    exclude_degraded: bool = False,
+    exact_trade_date: Optional[str] = None,
 ) -> Tuple[Dict[str, int], List[Dict], Optional[Path], Optional[Path]]:
     """
-    요약/잔고 파일을 읽어 캐시로 제공.
-    - 캐시 TTL(기본 90초) 내에서는 메모리 캐시 반환
-    - 캐시가 있어도 파일 mtime 변경 시 즉시 재로딩
-    - 다른 프로세스가 동시에 갱신 중이면 lockfile 존재 시 잠깐 대기 후 캐시 재확인
+    요약/잔고 파일을 읽어 캐시로 제공 (기록/디버깅용 — 매매 판단 primary source 아님).
+    - force_reload=True: 메모리 캐시 무시
+    - exclude_degraded=True: *_degraded.json 제외
+    - exact_trade_date: summary_{date}.json / balance_{date}.json 사용
     반환: (summary_dict, balance_list, summary_path, balance_path)
     """
     logger = logging.getLogger(__name__)
     ttl = int(ttl_sec if ttl_sec is not None else _SNAPSHOT_TTL_SEC)
+
+    td = (exact_trade_date or os.getenv("PIPELINE_TRADE_DATE", "")).strip()
+    if td:
+        summary_pattern = f"summary_{td}.json"
+        balance_pattern = f"balance_{td}.json"
 
     # 1) 락 파일이 최신이라면 잠깐 대기(중복 IO 억제)
     wait_deadline = pytime.time() + _SNAPSHOT_WAIT_ON_LOCK_SEC
@@ -1249,18 +1277,20 @@ def get_account_snapshot_cached(
 
     with _SNAPSHOT_CACHE_LOCK:
         now = pytime.time()
+        cache_key_suffix = f"{summary_pattern}|{balance_pattern}|deg={exclude_degraded}"
         # 캐시가 유효하면 그대로 반환
-        if (now - _SNAPSHOT_CACHE["ts"]) <= ttl:
-            # 파일 변경 없는지 확인
+        if not force_reload and (now - _SNAPSHOT_CACHE["ts"]) <= ttl:
             sp = _SNAPSHOT_CACHE["summary_path"]
             bp = _SNAPSHOT_CACHE["balance_path"]
             if _files_unchanged(sp, bp, _SNAPSHOT_CACHE["summary_mtime"], _SNAPSHOT_CACHE["balance_mtime"]):
-                return (
-                    dict(_SNAPSHOT_CACHE["summary"]),
-                    list(_SNAPSHOT_CACHE["balance"]),
-                    sp,
-                    bp,
-                )
+                cached_key = _SNAPSHOT_CACHE.get("cache_key", "")
+                if cached_key == cache_key_suffix or not cached_key:
+                    return (
+                        dict(_SNAPSHOT_CACHE["summary"]),
+                        list(_SNAPSHOT_CACHE["balance"]),
+                        sp,
+                        bp,
+                    )
 
         # 2) 재로딩 (락 생성 후 로드)
         _touch_lockfile()
@@ -1268,6 +1298,8 @@ def get_account_snapshot_cached(
             summary_pattern=summary_pattern,
             balance_pattern=balance_pattern,
             max_wait_sec=5,
+            exclude_degraded=exclude_degraded,
+            exact_trade_date=td or None,
         )
 
         # 3) 캐시에 저장
@@ -1285,6 +1317,7 @@ def get_account_snapshot_cached(
             "balance_mtime": bl_mtime,
             "summary": summary_dict,
             "balance": balance_list,
+            "cache_key": cache_key_suffix,
         })
 
         # 4) 반환

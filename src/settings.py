@@ -121,6 +121,7 @@ class Settings:
 
         # ── 트레이딩 가드 확장 ───────────────────────────────────────
         self.trading_guards.setdefault("cooldown_only_on_confirmed_failure", True)
+        self.trading_guards.setdefault("allow_file_snapshot_fallback", False)
 
         # ── 리포팅 ───────────────────────────────────────────────────
         rp = self.reporting

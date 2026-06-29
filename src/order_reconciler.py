@@ -19,6 +19,14 @@ from settings import settings
 import os
 
 from utils import setup_logging, KST, norm_ticker, is_us_market, kst_window_to_us_order_dates
+
+try:
+    from account_snapshot import compute_sellable_qty, is_sell_order_success
+    from kis_overseas_account import US_BALANCE_EXCHANGES
+except ImportError:
+    compute_sellable_qty = None
+    is_sell_order_success = None
+    US_BALANCE_EXCHANGES = ("NASD", "NYSE", "AMEX")
 from api.kis_auth import KIS
 from recorder import get_recorder
 
@@ -140,18 +148,21 @@ def _normalize_order_row(row: Any, *, overseas: bool = False) -> Optional[Dict[s
 def _fetch_overseas_open_orders(
     kis: KIS, *, ovrs_excg_cd: str = "NASD"
 ) -> Dict[str, Dict[str, Any]]:
-    """KIS inquire_nccs(해외 미체결) → order_id dict."""
+    """KIS inquire_nccs(해외 미체결) → order_id dict. NASD/NYSE/AMEX 순회."""
     orders: List[Dict[str, Any]] = []
-    try:
-        if hasattr(kis, "inquire_nccs"):
-            df = kis.inquire_nccs(ovrs_excg_cd=ovrs_excg_cd)
-            if df is not None and not df.empty:
-                for _, row in df.iterrows():
-                    o = _normalize_order_row(row, overseas=True)
-                    if o:
-                        orders.append(o)
-    except Exception as e:
-        logger.debug(f"inquire_nccs() 조회 실패: {e}")
+    exchanges = list(US_BALANCE_EXCHANGES) if is_us_market() else [ovrs_excg_cd]
+    for exc in exchanges:
+        try:
+            if hasattr(kis, "inquire_nccs"):
+                df = kis.inquire_nccs(ovrs_excg_cd=exc)
+                if df is not None and not df.empty:
+                    for _, row in df.iterrows():
+                        o = _normalize_order_row(row, overseas=True)
+                        if o:
+                            o["ovrs_excg_cd"] = exc
+                            orders.append(o)
+        except Exception as e:
+            logger.debug(f"inquire_nccs({exc}) 조회 실패: {e}")
 
     by_id: Dict[str, Dict[str, Any]] = {}
     for o in orders:
@@ -159,25 +170,73 @@ def _fetch_overseas_open_orders(
     return by_id
 
 
+def _classify_kis_order_status(
+    kis_o: Dict[str, Any],
+    *,
+    in_open_orders: bool,
+) -> str:
+    """inquire-nccs / inquire-ccnl 기준 pending/submitted/filled/failed/canceled."""
+    executed_qty = _safe_int(kis_o.get("executed_qty", 0))
+    qty = _safe_int(kis_o.get("quantity", 0))
+    cancelled = bool(kis_o.get("cancelled"))
+
+    if cancelled and executed_qty <= 0:
+        return "canceled"
+    if executed_qty <= 0 and in_open_orders:
+        return "pending"
+    if executed_qty <= 0:
+        return "submitted"
+    if qty > 0 and executed_qty < qty:
+        return "partial"
+    if executed_qty > 0:
+        return "filled"
+    return "failed"
+
+
+def log_failed_sell_diagnostic(
+    *,
+    ticker: str,
+    requested_qty: int,
+    sellable_qty: int = 0,
+    pending_sell_qty: int = 0,
+    msg_cd: Optional[str] = None,
+    msg1: Optional[str] = None,
+) -> None:
+    """failed SELL 진단 (order_id 없는 failed SELL은 DB INSERT하지 않는 정책과 별도 로그)."""
+    logger.error(
+        "[SELL_REJECT_DIAG] reconciler ticker=%s requested_qty=%s sellable_qty=%s "
+        "pending_sell_qty=%s msg_cd=%s msg1=%s",
+        ticker,
+        requested_qty,
+        sellable_qty,
+        pending_sell_qty,
+        msg_cd,
+        msg1,
+    )
+
+
 def _fetch_overseas_daily_orders(
     kis: KIS, *, start_ymd: str, end_ymd: str, ovrs_excg_cd: str = "NASD"
 ) -> Dict[str, Dict[str, Any]]:
-    """KIS inquire_ccnl(해외 주문체결내역) → order_id dict."""
+    """KIS inquire_ccnl(해외 주문체결내역) → order_id dict. NASD/NYSE/AMEX 순회."""
     orders: List[Dict[str, Any]] = []
-    try:
-        if hasattr(kis, "inquire_ccnl"):
-            df = kis.inquire_ccnl(
-                ord_strt_dt=start_ymd,
-                ord_end_dt=end_ymd,
-                ovrs_excg_cd=ovrs_excg_cd,
-            )
-            if df is not None and not df.empty:
-                for _, row in df.iterrows():
-                    o = _normalize_order_row(row, overseas=True)
-                    if o:
-                        orders.append(o)
-    except Exception as e:
-        logger.warning(f"inquire_ccnl() 조회 실패: {e}")
+    exchanges = list(US_BALANCE_EXCHANGES) if is_us_market() else [ovrs_excg_cd]
+    for exc in exchanges:
+        try:
+            if hasattr(kis, "inquire_ccnl"):
+                df = kis.inquire_ccnl(
+                    ord_strt_dt=start_ymd,
+                    ord_end_dt=end_ymd,
+                    ovrs_excg_cd=exc,
+                )
+                if df is not None and not df.empty:
+                    for _, row in df.iterrows():
+                        o = _normalize_order_row(row, overseas=True)
+                        if o:
+                            o["ovrs_excg_cd"] = exc
+                            orders.append(o)
+        except Exception as e:
+            logger.warning(f"inquire_ccnl({exc}) 조회 실패: {e}")
 
     by_id: Dict[str, Dict[str, Any]] = {}
     for o in orders:
@@ -583,6 +642,32 @@ def reconcile_open_orders(*, since_hours: int = 24, limit: int = 500) -> Dict[st
             new_status = "partial"
         else:
             new_status = "executed"
+
+        kis_class = _classify_kis_order_status(
+            kis_o,
+            in_open_orders=order_id in open_orders,
+        )
+        if kis_class == "canceled":
+            new_status = "cancelled"
+        elif kis_class == "filled":
+            new_status = "executed"
+        elif kis_class == "partial":
+            new_status = "partial"
+        elif kis_class in ("pending", "submitted"):
+            new_status = "pending"
+
+        db_side = _db_action_to_kis_side(r.get("action") or r.get("side"))
+        if (
+            db_side == "sell"
+            and new_status in ("pending", "cancelled", "executed")
+            and kis_exe <= 0
+            and str(r.get("order_status") or "").lower() == "failed"
+        ):
+            log_failed_sell_diagnostic(
+                ticker=str(r.get("ticker") or ""),
+                requested_qty=requested_qty,
+                msg1="reconciler: failed sell with zero fill",
+            )
 
         _db_dbg_log(
             "reconciler.loop.MATCH",

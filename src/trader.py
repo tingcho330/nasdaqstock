@@ -52,6 +52,15 @@ from utils import (
     resolve_us_buy_order_params,
     resolve_us_ovrs_excg,
 )
+from account_snapshot import (
+    AccountSnapshot,
+    compute_sellable_qty,
+    is_sell_order_success,
+    is_sell_qty_exceeded_error,
+    log_account_snapshot_kis,
+    validate_snapshot_for_trading,
+)
+from kis_overseas_account import load_kis_account_snapshot
 from api.kis_auth import KIS
 from risk_manager import RiskManager
 from partial_sell_state import (
@@ -377,6 +386,14 @@ class Trader:
             raise ConnectionError("KIS API 초기화에 실패했습니다.") from e
 
         self.risk_manager = RiskManager(settings_obj)
+
+        # KIS endpoint 계좌 스냅샷 (매매 판단 primary source)
+        self._account_snapshot: Optional[AccountSnapshot] = None
+        self._account_sync_mismatch = False
+        self._buy_blocked_snapshot = False
+        self.allow_file_snapshot_fallback = bool(
+            self.trading_guards.get("allow_file_snapshot_fallback", False)
+        )
 
         # 스크리너 전체 데이터(랭킹/후보)
         self.all_stock_data = self._load_all_stock_data()
@@ -802,11 +819,124 @@ class Trader:
         self._update_account_info(force=True)
 
     # ── 스냅샷 로더/헬퍼 ──────────────────────────────────────────────
+    def load_account_snapshot_from_kis(self, force: bool = True) -> AccountSnapshot:
+        """KIS balance/present/nccs 엔드포인트로 매매 판단용 스냅샷 생성."""
+        if not force and self._account_snapshot is not None:
+            return self._account_snapshot
+
+        if not is_us_market(self.market):
+            snap = AccountSnapshot(
+                trade_date=datetime.now(KST).strftime("%Y%m%d"),
+                source="domestic_file",
+                valid=False,
+                error="domestic market uses file snapshot path",
+            )
+            self._account_snapshot = snap
+            return snap
+
+        try:
+            start_ymd, end_ymd = kst_window_to_us_order_dates(
+                datetime.now(KST).strftime("%Y%m%d"),
+                datetime.now(KST).strftime("%Y%m%d"),
+            )
+        except Exception:
+            start_ymd = end_ymd = datetime.now(KST).strftime("%Y%m%d")
+
+        snap = load_kis_account_snapshot(
+            self.kis,
+            self.market,
+            trade_date=os.getenv("PIPELINE_TRADE_DATE", "") or datetime.now(KST).strftime("%Y%m%d"),
+            include_ccnl=False,
+            ccnl_start_ymd=start_ymd,
+            ccnl_end_ymd=end_ymd,
+        )
+        if not snap.valid or snap.error:
+            msg = snap.error or snap.invalid_reason or "KIS endpoint snapshot failed"
+            logger.error("ACCOUNT_ENDPOINT_FAILED: %s", msg)
+            _notify_text(
+                f"⚠️ KIS endpoint snapshot 실패: {msg[:300]}",
+                key=f"phase:kis_snapshot_fail:{self.run_id}",
+                cooldown=120,
+            )
+            if self.allow_file_snapshot_fallback:
+                return self._fallback_file_snapshot(snap, reason=msg)
+            self._account_snapshot = snap
+            self._buy_blocked_snapshot = True
+            return snap
+
+        invalid = validate_snapshot_for_trading(snap)
+        if invalid:
+            logger.error("ACCOUNT_SNAPSHOT_INVALID: %s", invalid)
+            snap.valid = False
+            snap.invalid_reason = invalid
+            self._buy_blocked_snapshot = True
+
+        self._account_snapshot = snap
+        log_account_snapshot_kis(snap)
+        return snap
+
+    def _fallback_file_snapshot(
+        self, failed_snap: AccountSnapshot, *, reason: str
+    ) -> AccountSnapshot:
+        """allow_file_snapshot_fallback=true 일 때만 파일 캐시 사용."""
+        cash, holdings, cash_map, balance_path = self._load_file_snapshot()
+        mtime = 0.0
+        try:
+            if balance_path and balance_path.exists():
+                mtime = balance_path.stat().st_mtime
+        except Exception:
+            pass
+        logger.warning(
+            "[ACCOUNT_FILE_FALLBACK_USED] reason=%s file=%s mtime=%s holding_count=%s",
+            reason[:200],
+            balance_path.name if balance_path else "N/A",
+            mtime,
+            len(holdings),
+        )
+        failed_snap.source = "file_fallback"
+        failed_snap.holdings = holdings
+        failed_snap.cash_map = cash_map
+        failed_snap.holding_count = len(holdings)
+        failed_snap.tickers = sorted(
+            {self._t(h.get("pdno", "")) for h in holdings if self._t(h.get("pdno", ""))}
+        )
+        self._account_snapshot = failed_snap
+        return failed_snap
+
+    def _load_file_snapshot(self) -> Tuple[int, List[Dict], Dict[str, Any], Optional[Path]]:
+        """기록/동기화 검증용 balance/summary 파일 로드 (매매 primary 아님)."""
+        summary_dict, balance_list, _, balance_path = get_account_snapshot_cached(
+            force_reload=True,
+            exclude_degraded=True,
+            exact_trade_date=os.getenv("PIPELINE_TRADE_DATE", "") or None,
+        )
+        cash_map = extract_cash_from_summary(summary_dict, market=self.market)
+        if cash_map.get("currency") is None and is_us_market(self.market):
+            cash_map["currency"] = "USD"
+        available_cash = cash_map.get("available_cash", 0)
+        holdings: List[Dict] = []
+        if balance_list:
+            holdings = [h for h in balance_list if _to_int(h.get("hldg_qty", 0)) > 0]
+        return available_cash, holdings, cash_map, balance_path
+
     def _load_snapshot(self) -> Tuple[int, List[Dict], Dict[str, int]]:
+        """매매 판단용 — KIS endpoint snapshot 우선."""
+        if is_us_market(self.market):
+            snap = self.load_account_snapshot_from_kis(force=True)
+            if snap.valid and snap.holdings is not None:
+                cash_map = dict(snap.cash_map or {})
+                if cash_map.get("currency") is None:
+                    cash_map["currency"] = "USD"
+                return snap.available_cash, list(snap.holdings), cash_map
+            if self.allow_file_snapshot_fallback:
+                cash, holdings, cash_map, _ = self._load_file_snapshot()
+                return cash, holdings, cash_map
+            return 0, [], snap.cash_map or {"currency": "USD", "available_cash": 0}
+
         summary_dict, balance_list, *_ = get_account_snapshot_cached(
-            summary_pattern="summary_*.json",
-            balance_pattern="balance_*.json",
-            ttl_sec=None,
+            force_reload=True,
+            exclude_degraded=True,
+            exact_trade_date=os.getenv("PIPELINE_TRADE_DATE", "") or None,
         )
         cash_map = extract_cash_from_summary(summary_dict, market=self.market)
         available_cash = cash_map.get("available_cash", 0)
@@ -815,13 +945,145 @@ class Trader:
             holdings = [h for h in balance_list if _to_int(h.get("hldg_qty", 0)) > 0]
         return available_cash, holdings, cash_map
 
+    def _validate_account_sync(self) -> bool:
+        """account.py balance 파일 vs KIS endpoint snapshot 동기화 검증."""
+        if not is_us_market(self.market):
+            return True
+
+        snap = self.load_account_snapshot_from_kis(force=True)
+        _, file_holdings, file_cash_map, balance_path = self._load_file_snapshot()
+
+        file_tickers = sorted(
+            {self._t(h.get("pdno", "")) for h in file_holdings if self._t(h.get("pdno", ""))}
+        )
+        kis_tickers = sorted(snap.tickers or [])
+        file_count = len(file_tickers)
+        kis_count = snap.holding_count
+
+        if file_count == kis_count and file_tickers == kis_tickers:
+            return True
+
+        self._account_sync_mismatch = True
+        self._buy_blocked_snapshot = True
+        detail = (
+            f"[ACCOUNT_SYNC_MISMATCH] "
+            f"account.py balance file={balance_path.name if balance_path else 'N/A'} "
+            f"trader snapshot source={snap.source} "
+            f"balance TR_ID={snap.balance_endpoint} "
+            f"present TR_ID={snap.present_balance_endpoint} "
+            f"nccs TR_ID={snap.nccs_endpoint} "
+            f"holding_count_account_file={file_count} holding_count_kis={kis_count} "
+            f"tickers_account_file={file_tickers} tickers_kis={kis_tickers} "
+            f"cash_map={snap.cash_map} selected_exchanges={snap.exchange_codes}"
+        )
+        logger.error(detail)
+        _notify_text(
+            f"⚠️ {detail[:1800]}",
+            key=f"phase:account_sync:{self.run_id}",
+            cooldown=120,
+        )
+        return False
+
+    def _get_sellable_qty(self, ticker: str) -> Tuple[int, int, int]:
+        """(holding_qty, pending_sell_qty, sellable_qty) — KIS 기준."""
+        sym = self._t(ticker)
+        snap = self._account_snapshot or self.load_account_snapshot_from_kis(force=True)
+        holding_qty = 0
+        for h in snap.holdings or []:
+            if self._t(h.get("pdno", "")) == sym:
+                holding_qty = _to_int(h.get("hldg_qty", 0))
+                break
+        pending = int((snap.sell_pending_qty_by_ticker or {}).get(sym, 0))
+        sellable = int((snap.sellable_qty_by_ticker or {}).get(sym, compute_sellable_qty(holding_qty, pending)))
+        return holding_qty, pending, sellable
+
+    def _clamp_sell_qty(self, ticker: str, requested_qty: int) -> Tuple[int, bool, str]:
+        """
+        매도 주문 수량을 KIS sellable_qty 기준으로 보정.
+        반환: (final_qty, should_skip, reason)
+        """
+        holding_qty, pending_qty, sellable_qty = self._get_sellable_qty(ticker)
+        logger.info(
+            "[SELLABLE_QTY_CHECK] ticker=%s holding_qty=%s pending_sell_qty=%s "
+            "sellable_qty=%s requested_qty=%s",
+            ticker,
+            holding_qty,
+            pending_qty,
+            sellable_qty,
+            requested_qty,
+        )
+        if sellable_qty <= 0:
+            return 0, True, "SELL_SKIP_NO_SELLABLE_QTY"
+        if requested_qty > sellable_qty:
+            logger.warning(
+                "[SELL_QTY_CLAMPED] ticker=%s requested=%s sellable=%s",
+                ticker,
+                requested_qty,
+                sellable_qty,
+            )
+            return sellable_qty, False, "SELL_QTY_CLAMPED"
+        return requested_qty, False, "OK"
+
+    def _log_sell_reject_diag(
+        self,
+        ticker: str,
+        requested_qty: int,
+        result: Dict[str, Any],
+    ) -> None:
+        holding_qty, pending_qty, sellable_qty = self._get_sellable_qty(ticker)
+        logger.error(
+            "[SELL_REJECT_DIAG] ticker=%s requested_qty=%s sellable_qty=%s "
+            "msg_cd=%s msg1=%s balance_qty=%s pending_sell_qty=%s",
+            ticker,
+            requested_qty,
+            sellable_qty,
+            result.get("msg_cd"),
+            result.get("msg1"),
+            holding_qty,
+            pending_qty,
+        )
+        if is_sell_qty_exceeded_error(result):
+            try:
+                self.load_account_snapshot_from_kis(force=True)
+                holding_qty, pending_qty, sellable_qty = self._get_sellable_qty(ticker)
+                logger.error(
+                    "[SELL_REJECT_DIAG] after_requery ticker=%s balance_qty=%s "
+                    "pending_sell_qty=%s sellable_qty=%s",
+                    ticker,
+                    holding_qty,
+                    pending_qty,
+                    sellable_qty,
+                )
+            except Exception as e:
+                logger.debug("SELL_REJECT_DIAG requery failed: %s", e)
+
+    def _sell_execution_succeeded(
+        self,
+        result: Dict[str, Any],
+        execution_result: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[bool, int]:
+        """실제 주문 성공 또는 체결 발생 여부."""
+        exec_qty = 0
+        if execution_result:
+            exec_qty = _to_int(execution_result.get("executed_qty", 0))
+            if execution_result.get("executed"):
+                return True, exec_qty
+        if is_sell_order_success(result, executed_qty=exec_qty):
+            return True, exec_qty
+        return False, exec_qty
+
     def _get_holdings_snapshot(self) -> List[Dict]:
         """현재 보유 종목 스냅샷 반환 (지연 체결 확인용)"""
         try:
+            if is_us_market(self.market):
+                snap = self.load_account_snapshot_from_kis(force=False)
+                if snap and snap.holdings:
+                    return list(snap.holdings)
             _, balance_list, *_ = get_account_snapshot_cached(
-                summary_pattern="summary_*.json",
-                balance_pattern="balance_*.json",
-                ttl_sec=5,  # 5초 캐시
+                force_reload=True,
+                exclude_degraded=True,
+                exact_trade_date=os.getenv("PIPELINE_TRADE_DATE", "") or None,
+                ttl_sec=5,
             )
             holdings: List[Dict] = []
             if balance_list:
@@ -889,6 +1151,9 @@ class Trader:
 
     # ── 계좌 파일에서 가용 현금/보유 종목 로드 ─────────────────────────
     def get_account_info_from_files(self) -> Tuple[int, List[Dict], Dict[str, int]]:
+        """매매 판단용 계좌 정보 — KIS endpoint snapshot 기준."""
+        if is_us_market(self.market):
+            self._validate_account_sync()
         available_cash, holdings, cash_map = self._load_snapshot()
 
         # 동적 현금 관리 적용
@@ -2643,21 +2908,27 @@ class Trader:
             logger.info("매도할 보유 종목이 없습니다.")
             return False
 
+        snap = self.load_account_snapshot_from_kis(force=True)
+        if snap.is_invalid_for_trading():
+            logger.error(
+                "ACCOUNT_SNAPSHOT_INVALID — 매도 로직 제한 실행 (sellable_qty 기준만 허용)"
+            )
+
         #  포트폴리오 비중 초과 시 자동 리밸런싱 (최우선 실행)
         if holdings:
             logger.info("포트폴리오 비중 리밸런싱 체크 시작...")
             rebalanced_holdings = self._check_and_rebalance_portfolio(holdings)
             if rebalanced_holdings is not None:
-                # 리밸런싱이 발생한 경우 계좌 정보 갱신
-                self._update_account_info(force=True)
-                cash_after_rebalance, holdings_after_rebalance, _ = self._load_snapshot()
-                holdings = holdings_after_rebalance  # 갱신된 보유 종목으로 교체
+                self.load_account_snapshot_from_kis(force=True)
+                _, holdings_after_rebalance, _ = self._load_snapshot()
+                holdings = holdings_after_rebalance
                 logger.info(f"리밸런싱 완료. 현재 보유 종목: {len(holdings)}개")
-                executed_sell = True
+                if getattr(self, "_rebalance_sell_succeeded", False):
+                    executed_sell = True
 
         # 통합된 시간대 체크
         if not self._check_trading_hours("sell"):
-            return
+            return executed_sell
 
         holding_tickers = [self._t(h.get("pdno", "")) for h in holdings if _to_int(h.get("hldg_qty", 0)) > 0]
         last_buy_trades = fetch_trades_by_tickers(holding_tickers)
@@ -2783,7 +3054,6 @@ class Trader:
                 
                 if not self.is_real_trading:
                     logger.info(f"ℹ️ 부분 익절 조건 충족했으나 실거래 모드 아님: {name}({ticker}) {partial_qty}주 ({partial_ratio:.0%}) - 시뮬레이션 모드")
-                    # 부분익절 후 재매수(재진입/추가매수) 차단: 모의환경도 동일하게 처리
                     try:
                         self._mark_partial_sell(ticker)
                         self._add_to_cooldown_for_days(
@@ -2793,8 +3063,7 @@ class Trader:
                         )
                     except Exception as e:
                         logger.debug(f"[{ticker}] 부분익절 쿨다운 등록 실패(모의): {e}")
-                    self.stats["sell"] += 1
-                    executed_sell = True
+                    self.stats["hold"] += 1
                     continue
                 
                 logger.info(f"부분 익절 실행: {name}({ticker}) {partial_qty}주 ({partial_ratio:.0%})")
@@ -2805,6 +3074,15 @@ class Trader:
                     logger.warning(f"⚠️ [{ticker}] 부분 익절 스킵: 유효 현재가 없음")
                     self.stats["hold"] += 1
                     continue
+
+                partial_qty, skip_partial, clamp_reason = self._clamp_sell_qty(ticker, partial_qty)
+                if skip_partial:
+                    logger.warning(
+                        "[%s] 부분 익절 스킵: %s", ticker, clamp_reason
+                    )
+                    self.stats["hold"] += 1
+                    continue
+
                 order_type, order_price = self._determine_sell_order_type(current_price, structured_context)
                 logger.info(
                     "[%s] TTTT1006U 부분매도 ord_dvsn=%s unpr=%s (ref_px=%s source=%s)",
@@ -2818,11 +3096,12 @@ class Trader:
                     ord_dv="01", pdno=ticker, ord_dvsn=order_type, ord_qty=str(partial_qty), ord_unpr=str(order_price),
                     ovrs_excg_hint=ovrs_hint,
                 )
-                if result:
+                execution_result = self._enhanced_execution_check(ticker, result, self._get_qty(holdings, ticker))
+                ok, _ = self._sell_execution_succeeded(result, execution_result)
+                if ok:
                     self.stats["sell"] += 1
                     executed_sell = True
                     logger.info(f"✅ 부분 익절 주문 성공: {name}({ticker}) {partial_qty}주")
-                    # 부분익절 후 재매수(재진입/추가매수) 차단
                     try:
                         self._mark_partial_sell(ticker)
                         self._add_to_cooldown_for_days(
@@ -2833,6 +3112,7 @@ class Trader:
                     except Exception as e:
                         logger.debug(f"[{ticker}] 부분익절 쿨다운 등록 실패: {e}")
                 else:
+                    self._log_sell_reject_diag(ticker, partial_qty, result)
                     logger.warning(f"❌ 부분 익절 주문 실패: {name}({ticker})")
                 continue
             
@@ -2873,8 +3153,6 @@ class Trader:
                     )
             else:
                 logger.info(f"매도 결정: {name}({ticker}) {quantity}주. 사유: {reason} | code={reason_code}")
-            
-            executed_sell = True
 
             if self.is_real_trading:
                 pre_qty = self._get_qty(holdings, ticker)
@@ -2889,6 +3167,13 @@ class Trader:
                     )
                     self.stats["hold"] += 1
                     continue
+
+                sell_qty, skip_sell, clamp_reason = self._clamp_sell_qty(ticker, quantity)
+                if skip_sell:
+                    logger.warning("[%s] 매도 스킵: %s", ticker, clamp_reason)
+                    self.stats["hold"] += 1
+                    continue
+                quantity = sell_qty
 
                 # 매도 주문 타입 결정 (TTTT1006U: ORD_DVSN=00 + OVRS_ORD_UNPR>0)
                 order_type, order_price = self._determine_sell_order_type(current_price, structured_context)
@@ -2908,16 +3193,50 @@ class Trader:
 
                 # 향상된 매도 체결 확인 로직 적용
                 execution_result = self._enhanced_execution_check(ticker, result, pre_qty)
+                ok, filled_qty_from_check = self._sell_execution_succeeded(result, execution_result)
                 if execution_result.get('executed'):
                     filled_qty = execution_result.get('executed_qty', pre_qty)
                 elif execution_result.get('status') == 'partial':
                     filled_qty = execution_result.get('executed_qty', 0)
                 else:
-                    # 타임아웃 시 수동 확인
-                    self._update_account_info(force=True)
+                    self.load_account_snapshot_from_kis(force=True)
                     _, holdings_after, _ = self._load_snapshot()
                     post_qty = self._get_qty(holdings_after, ticker)
                     filled_qty = max(0, pre_qty - post_qty)
+                    ok, filled_qty_from_check = self._sell_execution_succeeded(
+                        result, {"executed_qty": filled_qty, "executed": filled_qty > 0}
+                    )
+
+                if not ok:
+                    self._log_sell_reject_diag(ticker, quantity, result)
+                    err = result.get('msg1', 'Unknown error')
+                    record_trade({
+                        "side": "sell", "ticker": ticker, "name": name,
+                        "qty": quantity, "price": current_price,
+                        "trade_status": "failed",
+                        "order_id": result.get("ODNO") or result.get("odno") or result.get("order_id"),
+                        "requested_qty": quantity,
+                        "executed_qty": 0,
+                        "reason_code": reason_code,
+                        "structured_context": structured_context or {},
+                        "strategy_details": {
+                            "error": err,
+                            "rt_cd": result.get('rt_cd'),
+                            "msg_cd": result.get('msg_cd'),
+                            "reason": reason,
+                            "reason_code": reason_code
+                        },
+                        "sell_reason": reason
+                    })
+                    _notify_embed(create_trade_embed({
+                        "side": "SELL", "name": name, "ticker": ticker,
+                        "qty": quantity, "price": current_price, "trade_status": "failed",
+                        "strategy_details": {"error": err, "reason_code": reason_code}
+                    }), key=f"phase:sell_fail:{ticker}:{self.run_id}", cooldown=30)
+                    self._maybe_add_cooldown(ticker, "매도 주문 실패", increment_fail=True)
+                    continue
+
+                executed_sell = True
 
                 record_px, record_src = self._resolve_execution_price(
                     holding, ticker=ticker, stock_info=stock_info
@@ -3327,6 +3646,7 @@ class Trader:
         Returns: 리밸런싱이 발생한 경우 갱신된 holdings, 없으면 None
         """
         try:
+            self._rebalance_sell_succeeded = False
             # 현재 계좌 정보 로드
             cash, _, _ = self._load_snapshot()
             total_value = sum(_to_int(h.get("evlu_amt", 0)) for h in holdings if _to_int(h.get("hldg_qty", 0)) > 0)
@@ -3368,7 +3688,9 @@ class Trader:
                 logger.info(f"포트폴리오 리밸런싱 완료: {rebalanced_count}개 종목 조정")
                 _notify_text(f" 포트폴리오 리밸런싱: {rebalanced_count}개 종목 비중 조정", 
                            key=f"rebalance:{self.run_id}", cooldown=300)
-                return []  # 리밸런싱 발생 신호
+                if getattr(self, "_rebalance_sell_succeeded", False):
+                    return []
+                return []  # attempted but no confirmed sell — no account refresh trigger
             else:
                 logger.warning("포트폴리오 리밸런싱 시도했으나 성공한 종목이 없습니다.")
                 return None
@@ -3448,6 +3770,11 @@ class Trader:
                 )
 
                 ord_dvsn, ord_unpr = self._sell_order_params(px)
+                sell_qty, skip_sell, _ = self._clamp_sell_qty(ticker, sell_qty)
+                if skip_sell or sell_qty <= 0:
+                    logger.warning("종목 %s 비중 조정 매도 스킵: sellable_qty=0", ticker)
+                    return False
+
                 result = self._order_cash_retry(
                     ord_dv="01",
                     pdno=ticker,
@@ -3457,20 +3784,22 @@ class Trader:
                     ovrs_excg_hint=self._holding_ovrs_hint(holding),
                 )
                 
-                # 향상된 체결 확인 로직 적용
                 execution_result = self._enhanced_execution_check(ticker, result, sell_qty)
+                ok, _ = self._sell_execution_succeeded(result, execution_result)
                 
-                if execution_result.get('executed'):
+                if ok:
+                    self._rebalance_sell_succeeded = True
                     logger.info(f"✅ {ticker} 비중 조정 매도 성공: {sell_qty}주 (확인방식: {execution_result.get('status', 'unknown')})")
                     _notify_text(f" {ticker} 비중 조정 매도: {sell_qty}주", 
                                key=f"rebalance_sell:{ticker}:{self.run_id}", cooldown=300)
                     return True
                 else:
+                    self._log_sell_reject_diag(ticker, sell_qty, result)
                     logger.error(f"❌ {ticker} 비중 조정 매도 실패: {result}")
                     return False
             else:
                 logger.info(f"[SIMULATION] {ticker} 비중 조정 매도 시뮬레이션: {sell_qty}주")
-                return True
+                return False
                 
         except Exception as e:
             logger.error(f"종목 {ticker} 비중 조정 중 오류: {e}", exc_info=True)
@@ -4608,6 +4937,24 @@ class Trader:
             logger.info("매수 로직이 비활성화되어 있습니다 (trading_params.buy_enabled=false)")
             _notify_text("ℹ️ 매수 로직 비활성화됨", key=f"buy_disabled:{self.run_id}", cooldown=600)
             return
+
+        if self._buy_blocked_snapshot:
+            reason = "KIS snapshot invalid/unavailable or ACCOUNT_SYNC_MISMATCH"
+            logger.error("매수 로직 중단: %s", reason)
+            _notify_text(
+                f"⚠️ 매수 중단: {reason}",
+                key=f"phase:buy_blocked_snapshot:{self.run_id}",
+                cooldown=120,
+            )
+            return
+
+        snap = self._account_snapshot
+        if is_us_market(self.market):
+            snap = snap or self.load_account_snapshot_from_kis(force=True)
+            invalid = validate_snapshot_for_trading(snap) if snap else "no snapshot"
+            if invalid:
+                logger.error("ACCOUNT_SNAPSHOT_INVALID — 매수 중단: %s", invalid)
+                return
         
         logger.info(f"--------- 신규/추가 매수 로직 실행 (가용 예산: {self._money(available_cash)}) ---------")
 
@@ -6065,7 +6412,7 @@ if __name__ == "__main__":
         # 새로운 실행 시작 시 처리된 주문 목록 초기화
         trader._clear_processed_orders()
 
-        # 최신 계좌 스냅샷 생성(파일 갱신) 후 파일에서 로드
+        # account.py로 JSON 기록(디버깅) 후 KIS endpoint snapshot으로 매매 판단
         trader._update_account_info(force=True)
         cash0, holdings0, _ = trader.get_account_info_from_files()
 
