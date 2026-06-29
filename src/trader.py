@@ -388,7 +388,7 @@ class Trader:
         self.risk_manager = RiskManager(settings_obj)
 
         # KIS endpoint 계좌 스냅샷 (매매 판단 primary source)
-        self._account_snapshot: Optional[AccountSnapshot] = None
+        self._latest_account_snapshot: Optional[AccountSnapshot] = None
         self._account_sync_mismatch = False
         self._buy_blocked_snapshot = False
         self.allow_file_snapshot_fallback = bool(
@@ -821,8 +821,8 @@ class Trader:
     # ── 스냅샷 로더/헬퍼 ──────────────────────────────────────────────
     def load_account_snapshot_from_kis(self, force: bool = True) -> AccountSnapshot:
         """KIS balance/present/nccs 엔드포인트로 매매 판단용 스냅샷 생성."""
-        if not force and self._account_snapshot is not None:
-            return self._account_snapshot
+        if not force and self._latest_account_snapshot is not None:
+            return self._latest_account_snapshot
 
         if not is_us_market(self.market):
             snap = AccountSnapshot(
@@ -831,7 +831,7 @@ class Trader:
                 valid=False,
                 error="domestic market uses file snapshot path",
             )
-            self._account_snapshot = snap
+            self._latest_account_snapshot = snap
             return snap
 
         try:
@@ -860,7 +860,7 @@ class Trader:
             )
             if self.allow_file_snapshot_fallback:
                 return self._fallback_file_snapshot(snap, reason=msg)
-            self._account_snapshot = snap
+            self._latest_account_snapshot = snap
             self._buy_blocked_snapshot = True
             return snap
 
@@ -870,8 +870,13 @@ class Trader:
             snap.valid = False
             snap.invalid_reason = invalid
             self._buy_blocked_snapshot = True
+            _notify_text(
+                f"⚠️ ACCOUNT_SNAPSHOT_INVALID: {invalid[:400]}",
+                key=f"phase:snapshot_invalid:{self.run_id}",
+                cooldown=120,
+            )
 
-        self._account_snapshot = snap
+        self._latest_account_snapshot = snap
         log_account_snapshot_kis(snap)
         return snap
 
@@ -900,7 +905,7 @@ class Trader:
         failed_snap.tickers = sorted(
             {self._t(h.get("pdno", "")) for h in holdings if self._t(h.get("pdno", ""))}
         )
-        self._account_snapshot = failed_snap
+        self._latest_account_snapshot = failed_snap
         return failed_snap
 
     def _load_file_snapshot(self) -> Tuple[int, List[Dict], Dict[str, Any], Optional[Path]]:
@@ -987,7 +992,7 @@ class Trader:
     def _get_sellable_qty(self, ticker: str) -> Tuple[int, int, int]:
         """(holding_qty, pending_sell_qty, sellable_qty) — KIS 기준."""
         sym = self._t(ticker)
-        snap = self._account_snapshot or self.load_account_snapshot_from_kis(force=True)
+        snap = self._latest_account_snapshot or self.load_account_snapshot_from_kis(force=True)
         holding_qty = 0
         for h in snap.holdings or []:
             if self._t(h.get("pdno", "")) == sym:
@@ -1013,6 +1018,7 @@ class Trader:
             requested_qty,
         )
         if sellable_qty <= 0:
+            logger.warning("[SELL_SKIP_NO_SELLABLE_QTY] ticker=%s requested_qty=%s", ticker, requested_qty)
             return 0, True, "SELL_SKIP_NO_SELLABLE_QTY"
         if requested_qty > sellable_qty:
             logger.warning(
@@ -1062,23 +1068,21 @@ class Trader:
         result: Dict[str, Any],
         execution_result: Optional[Dict[str, Any]] = None,
     ) -> Tuple[bool, int]:
-        """실제 주문 성공 또는 체결 발생 여부."""
+        """실제 주문 성공(rt_cd=0+ODNO) 또는 executed_qty>0 만 True."""
         exec_qty = 0
         if execution_result:
             exec_qty = _to_int(execution_result.get("executed_qty", 0))
-            if execution_result.get("executed"):
-                return True, exec_qty
-        if is_sell_order_success(result, executed_qty=exec_qty):
-            return True, exec_qty
-        return False, exec_qty
+        ok = is_sell_order_success(result, executed_qty=exec_qty)
+        return ok, exec_qty
 
     def _get_holdings_snapshot(self) -> List[Dict]:
         """현재 보유 종목 스냅샷 반환 (지연 체결 확인용)"""
         try:
             if is_us_market(self.market):
-                snap = self.load_account_snapshot_from_kis(force=False)
-                if snap and snap.holdings:
-                    return list(snap.holdings)
+                snap = self._latest_account_snapshot
+                if snap is None or not snap.holdings:
+                    snap = self.load_account_snapshot_from_kis(force=True)
+                return list(snap.holdings or [])
             _, balance_list, *_ = get_account_snapshot_cached(
                 force_reload=True,
                 exclude_degraded=True,
@@ -4879,9 +4883,13 @@ class Trader:
                 t.profit_loss for t in today_trades if is_countable_loss_sell(t)
             )
             
-            # 계좌 총액 조회 (퍼센트 계산용)
-            summary, balance, _, _ = get_account_snapshot_cached()
-            total_value = _to_int(summary.get("dnca_tot_amt", 0))
+            # 계좌 총액 조회 (퍼센트 계산용) — KIS snapshot 우선
+            available_cash, holdings, cash_map = self._load_snapshot()
+            total_value = _to_int(cash_map.get("available_cash", 0)) + sum(
+                _to_int(h.get("evlu_amt", 0)) for h in holdings if _to_int(h.get("hldg_qty", 0)) > 0
+            )
+            if total_value <= 0:
+                total_value = _to_int(cash_map.get("dnca_tot_amt", 0))
             
             # 손실 제한 체크
             if max_daily_loss_amount > 0 and abs(total_loss) >= max_daily_loss_amount:
@@ -4948,7 +4956,7 @@ class Trader:
             )
             return
 
-        snap = self._account_snapshot
+        snap = self._latest_account_snapshot
         if is_us_market(self.market):
             snap = snap or self.load_account_snapshot_from_kis(force=True)
             invalid = validate_snapshot_for_trading(snap) if snap else "no snapshot"

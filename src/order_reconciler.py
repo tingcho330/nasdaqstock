@@ -151,6 +151,7 @@ def _fetch_overseas_open_orders(
     """KIS inquire_nccs(해외 미체결) → order_id dict. NASD/NYSE/AMEX 순회."""
     orders: List[Dict[str, Any]] = []
     exchanges = list(US_BALANCE_EXCHANGES) if is_us_market() else [ovrs_excg_cd]
+    failures: List[str] = []
     for exc in exchanges:
         try:
             if hasattr(kis, "inquire_nccs"):
@@ -162,7 +163,15 @@ def _fetch_overseas_open_orders(
                             o["ovrs_excg_cd"] = exc
                             orders.append(o)
         except Exception as e:
-            logger.debug(f"inquire_nccs({exc}) 조회 실패: {e}")
+            msg = f"{exc}: {e}"
+            failures.append(msg)
+            logger.warning("inquire_nccs(%s) 조회 실패: %s", exc, e)
+
+    if failures and not orders:
+        logger.error(
+            "KIS_ENDPOINT_UNAVAILABLE: inquire_nccs all exchanges failed (%s)",
+            "; ".join(failures)[:400],
+        )
 
     by_id: Dict[str, Dict[str, Any]] = {}
     for o in orders:
@@ -221,6 +230,7 @@ def _fetch_overseas_daily_orders(
     """KIS inquire_ccnl(해외 주문체결내역) → order_id dict. NASD/NYSE/AMEX 순회."""
     orders: List[Dict[str, Any]] = []
     exchanges = list(US_BALANCE_EXCHANGES) if is_us_market() else [ovrs_excg_cd]
+    failures: List[str] = []
     for exc in exchanges:
         try:
             if hasattr(kis, "inquire_ccnl"):
@@ -236,7 +246,17 @@ def _fetch_overseas_daily_orders(
                             o["ovrs_excg_cd"] = exc
                             orders.append(o)
         except Exception as e:
-            logger.warning(f"inquire_ccnl({exc}) 조회 실패: {e}")
+            msg = f"{exc}: {e}"
+            failures.append(msg)
+            logger.warning("inquire_ccnl(%s) 조회 실패: %s", exc, e)
+
+    if failures and not orders:
+        logger.error(
+            "KIS_ENDPOINT_UNAVAILABLE: inquire_ccnl all exchanges failed (%s~%s) %s",
+            start_ymd,
+            end_ymd,
+            "; ".join(failures)[:400],
+        )
 
     by_id: Dict[str, Dict[str, Any]] = {}
     for o in orders:
