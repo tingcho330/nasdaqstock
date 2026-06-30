@@ -1275,4 +1275,12 @@ def run_review() -> Dict[str, Any]:
 
 
 if __name__ == "__main__":
-    run_review()
+    # performance_review.py wrapper — KIS API 직접 호출 없음
+    import sys
+    from performance_review import main as perf_main
+
+    # 기존 인자 없이 실행 시: MARKET env 또는 SP500, period monthly
+    if len(sys.argv) <= 1:
+        market = os.getenv("MARKET", "SP500")
+        sys.argv.extend(["--market", market, "--period", "monthly", "--no-discord"])
+    raise SystemExit(perf_main(sys.argv[1:]))

@@ -323,5 +323,23 @@
     "enabled": true,
     "reconcile_time": "06:10",
     "minutes_after_batch": 5
+  },
+
+  "performance_review": {
+    "enabled": true,
+    "daily_enabled": false,
+    "weekly_enabled": true,
+    "monthly_enabled": true,
+    "strict_kis_endpoints": true,
+    "send_discord": true,
+    "lookback_trading_days": 20,
+    "output_dir": "performance_reviews",
+    "max_findings": 20,
+    "critical_on_account_sync_mismatch": true,
+    "critical_on_snapshot_invalid": true,
+    "critical_on_sell_sent_with_zero_sellable_qty": true,
+    "critical_on_failed_marked_as_executed": true,
+    "warn_on_missing_kis_endpoint_evidence": true,
+    "warn_on_partial_exchange_coverage": true
   }
 }

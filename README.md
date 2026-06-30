@@ -39,7 +39,7 @@
 | 분석 | OpenAI GPT(US 프롬프트·USD 표기) 또는 휴리스틱 (`OPENAI_API_KEY` 없을 때) |
 | 매매 | KIS Open API — `MARKET=SP500` 시 **해외 잔고·주문** (`TTTS3012R`, `TTTT1002U` 등) |
 | 리스크 | 장중 별도 프로세스에서 손절·익절·전략 매도 |
-| 사후 처리 | SQLite 기록, 주문 정합성, 월간 성과 리뷰·산출물 정리 |
+| 사후 처리 | SQLite 기록, 주문 정합성, **KIS 엔드포인트 기반 performance review**, 산출물 정리 |
 
 - **기본 시장:** `MARKET=SP500` (`integrated_manager`, `screener`, `gpt_analyzer` 기본값)
 - **실행 환경:** Docker Compose (`integrated_manager` + `background_risk_manager`)
@@ -73,6 +73,8 @@
 - **영속 손절/목표(positions)** — `recorder.py`의 `positions` 테이블에 `stop_price/target_price`를 저장하고, `trader.run_sell_logic()`에서 **positions 레벨을 우선 적용**
 - **회전 정책 모듈화** — `rotation_policy.py`에서 최소 보유일·Δscore·예산/경제성·페어 상한(`max_pairs_per_run`)을 공통 정책으로 적용
 - **비밀값 분리** — API 키·계좌·웹훅은 `config/.env`만 사용
+- **KIS 엔드포인트 performance review** — `performance_review.py`가 **KIS API를 직접 호출하지 않고** `trading_data.db`·`balance_*/summary_*`·`account_snapshot_*`·`order_reconcile_*`·로그만 사후 분석. balance/present/nccs/ccnl/order 5개 TR evidence·표준 finding·Markdown/JSON 보고서 생성
+- **reviewer.py** — `performance_review.py` wrapper (기본: `--period monthly`). 레거시 GPT config 튜닝(`run_review()`) 함수는 모듈 내 유지
 
 ---
 
@@ -129,7 +131,8 @@
 > 서머타임(DST) 적용 시 미국 장 개장·마감이 KST에서 약 1시간 밀리므로 `schedule_times`·`buy_time_windows`를 수동 조정하세요.
 
 - 휴장일: 스크리너·파이프라인 스킵 (`is_market_open_day` — US: NYSE/XNYS, KR: 주말만)
-- **월간 유지보수:** `monthly_maintenance.day`(기본 1일) 1회 — `reviewer.py` → `cleanup_output.py`
+- **월간 유지보수:** `monthly_maintenance.day`(기본 1일) 1회 — `performance_review.py --period monthly` → `cleanup_output.py` (매매 파이프라인과 **분리**된 사후 분석)
+- **주간 performance review (선택):** `performance_review.weekly_enabled=true` 시 월요일 09:00 KST — `performance_review.py --period weekly`
 
 ### 3.2.1 일일 요약 · 잔액 비교 (US / KR)
 
@@ -234,9 +237,13 @@ screener.py --market SP500              health_check.py (AAPL @ NAS)
 | `balance_*`, `summary_*` | `account.py` (US: `currency: "USD"`) |
 | `daily_balances/balance_{open\|close}_*.json` | `integrated_manager` 일일 요약 — `kis_summary`(US)·`total_balance`·`cash`·`holdings_value`·`holdings_detail[]`·`summary_file` |
 | `trading_data.db` | `recorder.py` (`trade_records`, `positions`) |
+| `account_snapshot_*.json` | `trader` KIS 스냅샷 (balance/nccs 등 메타, 있으면 performance review primary) |
+| `order_reconcile_*.json` | `order_reconciler` 결과 (ccnl/nccs, 있으면 performance review) |
+| `performance_reviews/performance_review_{market}_{period}_{date}.{json,md}` | `performance_review.py` — KIS endpoint review 보고서 |
+| `performance_reviews/latest_{market}_{period}.{json,md}` | 최신 performance review symlink 대체 |
 | `cache/` (`kis_token.json`, `*.mst`, `*.pkl`) | KIS·스크리너 |
 
-Git에는 `output/.gitkeep`만 추적합니다.
+Git에는 `output/.gitkeep`만 추적합니다. `cleanup_output.py`는 `performance_reviews/`·`account_snapshot_*`·`order_reconcile_*`·`logs/` 최근 N일(기본 14일)을 **삭제하지 않습니다**.
 
 ### 3.6 DB 기록 · 주문 정합성
 
@@ -355,8 +362,41 @@ api/kis_auth.KIS (DomesticStock + OverseasStock)
 |------|------|
 | `utils.py` | `resolve_pipeline_context`, `load_us_ticker_exchange_maps`, `resolve_us_excd`/`resolve_us_ovrs_excg`, `resolve_us_buy_order_params`, `resolve_us_sell_order_params`, `risk_session_windows`, `find_latest_file`(세션·거래일 필터) |
 | `order_reconciler.py` | `pending`/`partial` ↔ KIS 체결 리컨실·orphan `order_id` backfill |
+| `account_snapshot.py` | KIS endpoint 기반 `AccountSnapshot`·`compute_sellable_qty`·매매 유효성 검증 |
+| `performance_review.py` | **사후** KIS 5 TR evidence 리뷰·finding·보고서 (API 호출 **금지**) |
+| `reviewer.py` | `performance_review` CLI wrapper + 레거시 `run_review()` (GPT config 튜닝) |
+| `cleanup_output.py` | 오래된 산출물 정리 (`performance_reviews/` 등 보호) |
 | `api/overseas_stock/overseas_stock_functions.py` | 해외 시세·잔고·주문 TR 래퍼 |
 | `settings.py` / `env_loader.py` | 설정·`.env` 로드 |
+
+### 3.8 KIS 엔드포인트 performance review
+
+`performance_review.py`는 **저장된 artifact만** 읽습니다. 매매·주문·계좌 조회 API는 실행하지 않습니다.
+
+| KIS TR | endpoint | 리뷰 목적 |
+|--------|----------|-----------|
+| `TTTS3012R` | inquire-balance | 보유수량·평균단가·거래소 coverage(NASD/NYSE/AMEX) |
+| `CTRP6504R` | inquire-present-balance | USD 현금·총자산·통화 일관성 |
+| `TTTS3018R` | inquire-nccs | 미체결·pending sell·`sellable_qty` |
+| `TTTS3035R` | inquire-ccnl | ODNO 체결·DB vs KIS 상태 |
+| `TTTT1002U`/`TTTT1006U` | order | rt_cd/ODNO 품질·거절·가능수량/주문가능금액 초과 |
+
+```bash
+# Docker (사후 분석 — 파이프라인과 독립)
+docker compose exec integrated_manager python -m performance_review \
+  --market SP500 --date 20260630 --no-discord
+
+docker compose exec integrated_manager python -m performance_review \
+  --market SP500 --date 20260630 --strict-kis-endpoints --no-discord
+
+# 로컬
+PYTHONPATH=src OUTPUT_DIR=./output CONFIG_PATH=config/config.json \
+  python -m performance_review --market SP500 --period monthly --no-discord
+```
+
+`config.json` → `performance_review`: `strict_kis_endpoints`, `weekly_enabled`, `monthly_enabled`, `max_findings` 등.
+
+표준 finding 예: `KIS_BALANCE_PARTIAL_EXCHANGE_COVERAGE`, `KIS_SELL_SENT_WITH_ZERO_SELLABLE_QTY`, `KIS_DB_CCNL_STATUS_MISMATCH`, `ACCOUNT_SNAPSHOT_INVALID`.
 
 ---
 
@@ -652,6 +692,7 @@ python3 trader.py --date ${DATE}
 | `HEALTH_CHECK_TICKER_NAS` / `_NYS` | US 헬스체크 (기본 `AAPL`, `JPM`) |
 | `KIS_TRACE` | `1` 시 해외 잔고·시세 파싱 디버그 로그 |
 | `DB_RECORD_DEBUG` | `1` 시 DB·리컨실 단계별 `[DB_DEBUG]` 로그 |
+| `PERF_REVIEW_PERIOD` | `integrated_manager` 월간/주간 유지보수 시 `monthly` / `weekly` |
 
 ---
 
@@ -678,15 +719,21 @@ trading_bot_260530_NASDAQ/
 │   ├── kis_overseas_account.py  # 해외 잔고 → balance/summary JSON (USD)
 │   ├── trader.py / risk_manager.py / account.py
 │   ├── kis_market_data.py       # KIS 일봉 OHLCV (RSI·손절/목표·ATR)
+│   ├── account_snapshot.py      # KIS AccountSnapshot (매매 primary)
 │   ├── order_reconciler.py
+│   ├── performance_review.py    # KIS endpoint 사후 리뷰 (API 호출 금지)
+│   ├── reviewer.py              # performance_review wrapper
+│   ├── cleanup_output.py
 │   ├── rotation_policy.py / rotation_manager.py
 │   ├── integrated_manager.py
 │   ├── db_debug.py              # DB_RECORD_DEBUG 헬퍼
 │   └── utils.py                 # pipeline session, norm_ticker, fmt_money, …
+├── tests/
+│   └── test_performance_review_kis_endpoints.py
 ├── run_integrated_manager.py
 ├── run_background_risk_manager.py
 ├── docker-compose.yml
-├── Dockerfile
+├── Dockerfile                   # PYTHONPATH=/app/src (python -m performance_review)
 ├── requirements.txt
 └── README.md
 ```
@@ -735,6 +782,8 @@ trading_bot_260530_NASDAQ/
 | `Marcap` (US) | 마스터 미제공 → 0, 시총 필터 스킵 |
 | `investor_flow` (US) | 0 (국내 수급 API 경로) |
 | `dynamic_cash_management` | ⚠️ 보유 0·현금 100% 시 가용금 축소 가능 → 설정 확인 |
+| KIS endpoint performance review | ✅ artifact/DB/log 기반 · API 직접 호출 없음 · `--strict-kis-endpoints` |
+| `tests/test_performance_review_kis_endpoints.py` | ✅ 17 케이스 (coverage·sellable·ODNO·ccnl mismatch 등) |
 
 실전 미국 매매 전: **`vps` → health_check → account → 스크리너 → 뉴스 → GPT → (선택) trader** 순으로 검증하세요.  
 `trading_params.buy_enabled=false`로 매도·리스크만 먼저 검증하는 것을 권장합니다.

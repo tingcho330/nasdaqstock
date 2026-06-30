@@ -45,6 +45,9 @@ PATTERNS_TO_CLEAN = {
     "completed_trades_analysis.csv": 1,            # 최신만 유지
 }
 
+# 보존 회차(최 recent N일 logs)
+LOG_RETAIN_DAYS = int(os.getenv("LOG_RETAIN_DAYS", "14"))
+
 # 절대 보존(삭제 금지) 파일/경로
 PROTECT_FILES = {
     "trading_log.db",
@@ -52,7 +55,12 @@ PROTECT_FILES = {
 }
 PROTECT_DIRS = {
     "cache",  # /output/cache
+    "performance_reviews",  # performance review reports
 }
+PROTECT_GLOBS = (
+    "account_snapshot_*.json",
+    "order_reconcile_*.json",
+)
 
 # 드라이런(미삭제) 모드: 1이면 목록/로그만 남기고 실제 삭제 안함
 DRY_RUN = os.getenv("CLEANUP_DRY_RUN", "0") == "1"
@@ -93,8 +101,20 @@ def _mtime_kst(p: Path) -> float:
 def _is_protected(p: Path) -> bool:
     if p.name in PROTECT_FILES:
         return True
+    for pat in PROTECT_GLOBS:
+        if p.match(pat):
+            return True
     for d in PROTECT_DIRS:
-        if (OUTPUT_DIR / d) in p.parents:
+        if d in p.parts or (OUTPUT_DIR / d) in p.parents:
+            return True
+    # output/logs/ 최근 N일 보호
+    logs_dir = OUTPUT_DIR / "logs"
+    if logs_dir in p.parents or p.parent == logs_dir:
+        try:
+            age_days = (datetime.now(timezone.utc).timestamp() - p.stat().st_mtime) / 86400
+            if age_days <= LOG_RETAIN_DAYS:
+                return True
+        except Exception:
             return True
     return False
 

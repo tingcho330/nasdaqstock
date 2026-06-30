@@ -214,9 +214,9 @@ STEP_DEPENDENCIES = {
     "trader.py": ["gpt_analyzer.py"],
 }
 
-# 월 1회 유지보수 스크립트(성과 리뷰 → 설정 튜닝, 산출물 정리)
+# 월 1회 유지보수 스크립트(성과 리뷰 → 산출물 정리)
 MONTHLY_SCRIPTS = [
-    "reviewer.py",
+    "performance_review.py",
     "cleanup_output.py",
 ]
 # 매월 실행일(일자)과 시각(KST). 환경변수/ config 로 오버라이드 가능.
@@ -1207,6 +1207,13 @@ def run_script(script_name: str, run_id: str, pipeline_ctx: Optional[Dict[str, s
                 run_id,
                 format_pipeline_artifact("screener_candidates", trade_date, MARKET, session),
             )
+    elif script_name == "performance_review.py":
+        cfg = getattr(settings, "_config", None) or {}
+        pr_cfg = cfg.get("performance_review") or {}
+        period = os.environ.get("PERF_REVIEW_PERIOD") or "monthly"
+        args = ["--market", MARKET, "--period", period, "--no-discord"]
+        if pr_cfg.get("strict_kis_endpoints", True):
+            args.append("--strict-kis-endpoints")
 
     command = ["python", f"/app/src/{script_name}"] + args
     cmd_str = " ".join(command)
@@ -1411,13 +1418,14 @@ def _mark_monthly_ran(year_month: str, results: Dict[str, str]) -> None:
 
 
 def run_monthly_maintenance(force: bool = False):
-    """월 1회 유지보수: 성과 리뷰(reviewer) → 산출물 정리(cleanup)."""
+    """월 1회 유지보수: performance_review → cleanup."""
     try:
         run_id = datetime.now(KST).strftime("%Y%m%d-%H%M%S")
         os.environ["RUN_ID"] = run_id
         os.environ["RUN_STARTED_AT"] = str(time.time())
+        os.environ["PERF_REVIEW_PERIOD"] = "monthly"
 
-        start_msg = "🗓️ 월간 유지보수 시작 (성과 리뷰 → 산출물 정리)"
+        start_msg = "🗓️ 월간 유지보수 시작 (performance_review → cleanup)"
         logger.info(f"[{run_id}] {start_msg}")
         _notify(start_msg, key=f"{run_id}:monthly_start", cooldown_sec=30)
 
@@ -1435,6 +1443,37 @@ def run_monthly_maintenance(force: bool = False):
     except Exception as e:
         logger.error(f"월간 유지보수 실행 중 오류: {e}")
         return {}
+
+
+def run_weekly_performance_review_if_due():
+    """주 1회 performance review (config performance_review.weekly_enabled)."""
+    try:
+        cfg = getattr(settings, "_config", None) or {}
+        pr_cfg = cfg.get("performance_review") or {}
+        if not pr_cfg.get("weekly_enabled", False):
+            return
+        now = datetime.now(KST)
+        if now.weekday() != 0:  # Monday
+            return
+        week_key = now.strftime("%Y-W%W")
+        state_path = OUTPUT_DIR / "weekly_performance_review_state.json"
+        if state_path.exists():
+            try:
+                prev = json.loads(state_path.read_text(encoding="utf-8"))
+                if prev.get("week") == week_key:
+                    return
+            except Exception:
+                pass
+        os.environ["PERF_REVIEW_PERIOD"] = "weekly"
+        run_id = now.strftime("%Y%m%d-%H%M%S")
+        ok, _, dur = run_script("performance_review.py", run_id)
+        state_path.write_text(
+            json.dumps({"week": week_key, "ok": ok, "duration": dur}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        logger.info("[weekly] performance_review ok=%s dur=%.1fs", ok, dur)
+    except Exception as e:
+        logger.error("주간 performance review 실패: %s", e)
 
 
 def run_monthly_maintenance_if_due():
@@ -1664,6 +1703,7 @@ def register_jobs():
 
     # 월 1회 유지보수: 매일 점검하여 실행일에만 1회 실행(주말/휴일 포함)
     schedule.every().day.at(MONTHLY_MAINTENANCE_TIME).do(run_monthly_maintenance_if_due)
+    schedule.every().monday.at("09:00").do(run_weekly_performance_review_if_due)
     batch_t, recon_t, batch_on, recon_on = _resolve_batch_reconcile_times(
         getattr(settings, "_config", None) or {}
     )
@@ -1677,7 +1717,7 @@ def register_jobs():
     )
     logger.info(
         f"[SCHEDULE] 월간 유지보수 등록: 매월 {MONTHLY_MAINTENANCE_DAY}일 {MONTHLY_MAINTENANCE_TIME} "
-        f"(reviewer.py → cleanup_output.py)"
+        f"(performance_review.py → cleanup_output.py)"
     )
 
 def list_jobs():
