@@ -197,7 +197,7 @@ SCREENER_TIMEOUT_SEC = int(os.getenv("SCREENER_TIMEOUT_SEC", "1200"))
 SLOW_STEP_SEC = int(os.getenv("SLOW_STEP_SEC", "90"))
 
 # 파이프라인 스크립트(매 거래일 실행)
-# 주의: reviewer.py, cleanup_output.py 는 일일 파이프라인에서 제외하고
+# 주의: performance_review.py, cleanup_output.py 는 일일 파이프라인에서 제외하고
 #       월 1회 유지보수 작업(run_monthly_maintenance)으로 별도 실행한다.
 PIPELINE_SCRIPTS = [
     "health_check.py",

@@ -13,7 +13,7 @@ import re
 import numpy as np
 import requests
 from datetime import datetime, timedelta, timezone
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, List, Tuple, Sequence
 from dataclasses import dataclass
 from enum import Enum
 
@@ -1274,13 +1274,18 @@ def run_review() -> Dict[str, Any]:
     return result
 
 
-if __name__ == "__main__":
-    # performance_review.py wrapper — KIS API 직접 호출 없음
+def run_performance_review_cli(argv: Optional[Sequence[str]] = None) -> int:
+    """reviewer.py 기본 진입점 → performance_review.main()"""
     import sys
     from performance_review import main as perf_main
 
-    # 기존 인자 없이 실행 시: MARKET env 또는 SP500, period monthly
-    if len(sys.argv) <= 1:
+    if argv is None:
+        argv = sys.argv[1:]
+    if not argv:
         market = os.getenv("MARKET", "SP500")
-        sys.argv.extend(["--market", market, "--period", "monthly", "--no-discord"])
-    raise SystemExit(perf_main(sys.argv[1:]))
+        argv = ["--market", market, "--period", "monthly", "--no-discord"]
+    return perf_main(argv)
+
+
+if __name__ == "__main__":
+    raise SystemExit(run_performance_review_cli())

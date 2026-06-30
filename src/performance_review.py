@@ -24,6 +24,13 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from utils import KST, OUTPUT_DIR, load_config, norm_ticker, setup_logging
 
+try:
+    from notifier import send_discord_message, WEBHOOK_URL, is_valid_webhook
+except ImportError:
+    send_discord_message = None  # type: ignore
+    WEBHOOK_URL = ""
+    is_valid_webhook = lambda _url: False  # type: ignore
+
 logger = logging.getLogger("performance_review")
 
 US_EXCHANGES = ("NASD", "NYSE", "AMEX")
@@ -467,6 +474,8 @@ def collect_artifacts(
     end_date: str,
     session: Optional[str],
     output_dir: Path,
+    *,
+    include_logs: bool = False,
 ) -> ReviewArtifacts:
     db_path = output_dir / "trading_data.db"
     balance_path = _glob_for_date("balance", end_date, output_dir) or _glob_latest("balance_*.json", output_dir)
@@ -478,20 +487,20 @@ def collect_artifacts(
     pipeline_state_path = output_dir / "pipeline_state.json"
 
     log_paths: List[Path] = []
-    log_paths.extend(sorted(output_dir.glob("*.log")))
-    logs_dir = output_dir / "logs"
-    if logs_dir.is_dir():
-        log_paths.extend(sorted(logs_dir.glob("*.log")))
-
     logs_text = ""
-    if log_paths:
-        chunks = []
-        for lp in log_paths[:20]:
-            try:
-                chunks.append(lp.read_text(encoding="utf-8", errors="ignore")[-50000:])
-            except Exception:
-                pass
-        logs_text = "\n".join(chunks)
+    if include_logs:
+        log_paths.extend(sorted(output_dir.glob("*.log")))
+        logs_dir = output_dir / "logs"
+        if logs_dir.is_dir():
+            log_paths.extend(sorted(logs_dir.glob("*.log")))
+        if log_paths:
+            chunks = []
+            for lp in log_paths[:20]:
+                try:
+                    chunks.append(lp.read_text(encoding="utf-8", errors="ignore")[-50000:])
+                except Exception:
+                    pass
+            logs_text = "\n".join(chunks)
 
     trade_rows = load_trade_rows(db_path, start_date, end_date)
 
@@ -1093,7 +1102,13 @@ def _compute_health_score(findings: List[ReviewFinding]) -> float:
     return max(0.0, min(100.0, score))
 
 
-def build_kis_endpoint_review(artifacts: ReviewArtifacts, strict: bool, cfg: Dict[str, Any]) -> KisEndpointReview:
+def build_kis_endpoint_review(
+    artifacts: ReviewArtifacts,
+    strict: bool,
+    cfg: Dict[str, Any],
+    *,
+    include_logs: bool = False,
+) -> KisEndpointReview:
     ker = KisEndpointReview()
     ker.balance_review = review_balance(artifacts, strict)
     ker.present_balance_review = review_present_balance(artifacts, ker.balance_review, strict)
@@ -1111,7 +1126,7 @@ def build_kis_endpoint_review(artifacts: ReviewArtifacts, strict: bool, cfg: Dic
     ):
         all_findings.extend(getattr(part, "findings", []))
 
-    if not artifacts.log_paths:
+    if include_logs and not artifacts.log_paths:
         all_findings.append(ReviewFinding(
             "LOG_UNAVAILABLE", "INFO", "",
             "output logs 없음", "로그 기반 교차검증 제한", "pipeline 로그 저장 확인",
@@ -1177,14 +1192,37 @@ def run_performance_review(
     review_out = out_base / cfg.get("output_dir", "performance_reviews")
     review_out.mkdir(parents=True, exist_ok=True)
 
-    artifacts = collect_artifacts(market, start_date, end_date, session, out_base)
-    artifacts.period = period
+    review_error: Optional[str] = None
+    artifacts: Optional[ReviewArtifacts] = None
+    kis_review = KisEndpointReview()
+    trade_perf: Dict[str, Any] = {"trade_count": 0, "sell_count": 0, "win_rate": 0.0, "net_pnl": 0.0}
+    all_findings: List[ReviewFinding] = []
 
-    kis_review = build_kis_endpoint_review(artifacts, strict_kis, cfg)
-    max_findings = int(cfg.get("max_findings", 20))
-    all_findings = kis_review.endpoint_findings[:max_findings]
+    try:
+        artifacts = collect_artifacts(
+            market, start_date, end_date, session, out_base, include_logs=include_logs,
+        )
+        artifacts.period = period
+        kis_review = build_kis_endpoint_review(
+            artifacts, strict_kis, cfg, include_logs=include_logs,
+        )
+        max_findings = int(cfg.get("max_findings", 20))
+        all_findings = kis_review.endpoint_findings[:max_findings]
+        trade_perf = _summarize_trades(artifacts.trade_rows)
+    except Exception as e:
+        review_error = str(e)
+        logger.exception("Performance review analysis failed: %s", e)
+        all_findings.append(ReviewFinding(
+            "ACCOUNT_SNAPSHOT_INVALID",
+            "ERROR",
+            "",
+            f"review pipeline error: {review_error[:200]}",
+            "리뷰 분석 중단",
+            "artifact/DB 상태 확인 후 재실행",
+        ))
+        kis_review.endpoint_findings = all_findings
+        kis_review.endpoint_health_score = _compute_health_score(all_findings)
 
-    trade_perf = _summarize_trades(artifacts.trade_rows)
     result = PerformanceReviewResult(
         context={
             "market": market,
@@ -1193,15 +1231,17 @@ def run_performance_review(
             "end_date": end_date,
             "session": session,
             "strict_kis_endpoints": strict_kis,
+            "include_logs": include_logs,
             "generated_at": datetime.now(KST).isoformat(),
+            "review_error": review_error,
         },
         artifact_group={
-            "balance_file": str(artifacts.balance_path) if artifacts.balance_path else None,
-            "summary_file": str(artifacts.summary_path) if artifacts.summary_path else None,
-            "account_snapshots": [str(p) for p in artifacts.account_snapshot_paths],
-            "order_reconciles": [str(p) for p in artifacts.order_reconcile_paths],
-            "log_count": len(artifacts.log_paths),
-            "db_path": str(artifacts.db_path),
+            "balance_file": str(artifacts.balance_path) if artifacts and artifacts.balance_path else None,
+            "summary_file": str(artifacts.summary_path) if artifacts and artifacts.summary_path else None,
+            "account_snapshots": [str(p) for p in artifacts.account_snapshot_paths] if artifacts else [],
+            "order_reconciles": [str(p) for p in artifacts.order_reconcile_paths] if artifacts else [],
+            "log_count": len(artifacts.log_paths) if artifacts else 0,
+            "db_path": str(artifacts.db_path) if artifacts else str(out_base / "trading_data.db"),
             "include_logs": include_logs,
         },
         trade_performance=trade_perf,
@@ -1217,11 +1257,16 @@ def run_performance_review(
         f"KIS endpoint health={kis_review.endpoint_health_score:.0f}/100; "
         f"findings={len(all_findings)} (CRITICAL={len(critical)}, ERROR={len(errors)})"
     )
+    if review_error:
+        result.summary_text += f"; error={review_error[:120]}"
     result.action_items = [f"[{f.severity}] {f.title}: {f.recommendation}" for f in critical + errors][:10]
 
-    write_reports(result, review_out, market, period, end_date, json_only=json_only)
-    if send_discord and cfg.get("send_discord", True):
-        _send_discord_summary(result, cfg)
+    try:
+        write_reports(result, review_out, market, period, end_date, json_only=json_only)
+    except Exception as e:
+        logger.exception("Performance review report write failed: %s", e)
+
+    _send_discord_summary(result, cfg, send_discord=send_discord)
     return result
 
 
@@ -1387,16 +1432,45 @@ def write_reports(
     return json_path, md_path if not json_only else None
 
 
-def _send_discord_summary(result: PerformanceReviewResult, cfg: Dict[str, Any]) -> None:
+def _send_discord_summary(
+    result: PerformanceReviewResult,
+    cfg: Dict[str, Any],
+    *,
+    send_discord: bool = True,
+) -> None:
+    """CRITICAL/ERROR finding이 있을 때만 10줄 이내 요약 전송 (Markdown 전문 금지)."""
+    if not send_discord or not cfg.get("send_discord", True):
+        return
+    if send_discord_message is None:
+        return
     try:
-        from notifier import send_discord_message, WEBHOOK_URL, is_valid_webhook
         if not (WEBHOOK_URL and is_valid_webhook(WEBHOOK_URL)):
             return
+        urgent = [
+            f for f in result.findings
+            if f.severity in ("CRITICAL", "ERROR")
+        ]
+        if not urgent:
+            return
+        lines = [
+            f"Performance Review {result.context.get('market')} "
+            f"({result.context.get('start_date')}–{result.context.get('end_date')})",
+            result.summary_text,
+        ]
+        for f in urgent:
+            if len(lines) >= 10:
+                break
+            lines.append(
+                f"[{f.severity}] {normalize_finding_title(f.title)} @ {f.endpoint or 'kis'}: "
+                f"{f.evidence[:80]}"
+            )
+        description = "\n".join(lines[:10])
+        color = 0xE74C3C if any(f.severity == "CRITICAL" for f in urgent) else 0xE67E22
         embed = {
             "type": "rich",
-            "title": f"📊 Performance Review — {result.context.get('market')}",
-            "description": result.summary_text,
-            "color": 0x2ECC71 if result.kis_endpoint_review.endpoint_health_score >= 80 else 0xE67E22,
+            "title": f"⚠️ KIS Performance Review — {result.context.get('market')}",
+            "description": description[:1900],
+            "color": color,
             "timestamp": datetime.now(KST).isoformat(),
         }
         send_discord_message(embeds=[embed])
@@ -1406,44 +1480,87 @@ def _send_discord_summary(result: PerformanceReviewResult, cfg: Dict[str, Any]) 
 
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="KIS endpoint 기반 performance review (사후 분석)")
-    p.add_argument("--market", default=os.getenv("MARKET", "SP500"))
-    p.add_argument("--date", dest="date", help="YYYYMMDD")
-    p.add_argument("--session", choices=("am", "pm"))
-    p.add_argument("--from", dest="date_from", help="YYYYMMDD range start")
-    p.add_argument("--to", dest="date_to", help="YYYYMMDD range end")
-    p.add_argument("--period", choices=("daily", "weekly", "monthly"))
-    p.add_argument("--no-discord", action="store_true")
-    p.add_argument("--json-only", action="store_true")
-    p.add_argument("--include-logs", action="store_true")
-    p.add_argument("--strict-kis-endpoints", action="store_true")
+    p.add_argument("--market", default=os.getenv("MARKET", "SP500"), help="Market code (default: MARKET env or SP500)")
+    p.add_argument("--date", dest="date", metavar="YYYYMMDD", help="Single review date")
+    p.add_argument(
+        "--from", "--date-from",
+        dest="date_from",
+        metavar="YYYYMMDD",
+        help="Date range start",
+    )
+    p.add_argument(
+        "--to", "--date-to",
+        dest="date_to",
+        metavar="YYYYMMDD",
+        help="Date range end",
+    )
+    p.add_argument(
+        "--period",
+        choices=("daily", "weekly", "monthly"),
+        help="Review period bucket (default: daily or inferred from --date)",
+    )
+    p.add_argument("--session", choices=("am", "pm"), help="Pipeline session filter (optional)")
+    p.add_argument(
+        "--strict-kis-endpoints",
+        dest="strict_kis_endpoints",
+        action="store_true",
+        help="WARN/ERROR when KIS endpoint evidence missing or incomplete",
+    )
+    p.add_argument("--no-discord", action="store_true", help="Skip Discord notification")
+    p.add_argument("--json-only", action="store_true", help="Write JSON only (skip Markdown)")
+    p.add_argument(
+        "--include-logs",
+        action="store_true",
+        help="Include output/logs/*.log and output/*.log in review",
+    )
     return p
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    args = build_arg_parser().parse_args(argv)
-    period, start, end = resolve_review_dates(args)
-    if args.period:
-        period = args.period
+    """CLI entrypoint: python -m performance_review …"""
+    exit_code = 0
+    try:
+        args = build_arg_parser().parse_args(argv)
+        period, start, end = resolve_review_dates(args)
+        if args.period:
+            period = args.period
 
-    cfg_root = load_config()
-    cfg = _default_review_config(cfg_root)
-    if args.strict_kis_endpoints:
-        cfg["strict_kis_endpoints"] = True
-    strict = bool(cfg.get("strict_kis_endpoints", False))
+        cfg_root = load_config()
+        cfg = _default_review_config(cfg_root)
+        if args.strict_kis_endpoints:
+            cfg["strict_kis_endpoints"] = True
+        strict = bool(cfg.get("strict_kis_endpoints", False))
 
-    run_performance_review(
-        market=args.market,
-        start_date=start,
-        end_date=end,
-        period=period,
-        session=args.session,
-        strict_kis=strict,
-        include_logs=args.include_logs,
-        send_discord=not args.no_discord,
-        json_only=args.json_only,
-        review_cfg=cfg,
-    )
-    return 0
+        run_performance_review(
+            market=args.market,
+            start_date=start,
+            end_date=end,
+            period=period,
+            session=args.session,
+            strict_kis=strict,
+            include_logs=args.include_logs,
+            send_discord=not args.no_discord,
+            json_only=args.json_only,
+            review_cfg=cfg,
+        )
+    except Exception as e:
+        logger.exception("performance_review main failed: %s", e)
+        exit_code = 1
+        try:
+            market = os.getenv("MARKET", "SP500")
+            today = datetime.now(KST).strftime("%Y%m%d")
+            run_performance_review(
+                market=market,
+                start_date=today,
+                end_date=today,
+                period="daily",
+                send_discord=False,
+                json_only=False,
+                strict_kis=False,
+            )
+        except Exception as fallback_err:
+            logger.error("Fallback report generation failed: %s", fallback_err)
+    return exit_code
 
 
 if __name__ == "__main__":
