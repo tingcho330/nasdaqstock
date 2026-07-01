@@ -442,6 +442,15 @@ def load_kis_account_snapshot(
         snapshot_ts=ts,
         exchange_codes=exc_list,
     )
+    tr_balance = _kis_tr_id_balance(is_vps)
+    tr_present = _kis_tr_id_present(is_vps)
+    tr_nccs = _kis_tr_id_nccs(is_vps)
+    balance_status: Dict[str, str] = {}
+    balance_row_count: Dict[str, int] = {}
+    nccs_status: Dict[str, str] = {}
+    nccs_row_count: Dict[str, int] = {}
+    present_call_count = 0
+    present_failed = False
 
     try:
         hold_frames: List[pd.DataFrame] = []
@@ -455,16 +464,34 @@ def load_kis_account_snapshot(
                     tr_crcy_cd="USD",
                 )
                 queried_exchanges.append(exc)
+                rows = len(df_hold) if df_hold is not None and not df_hold.empty else 0
+                balance_row_count[exc] = rows
+                if rows > 0 or (df_bal2 is not None and not df_bal2.empty):
+                    balance_status[exc] = "OK"
+                else:
+                    balance_status[exc] = "EMPTY"
                 if df_hold is not None and not df_hold.empty:
                     hold_frames.append(df_hold)
                 if df_bal2 is not None and not df_bal2.empty:
                     bal2_frames.append(df_bal2)
             except Exception as exc_err:
+                balance_status[exc] = "FAILED"
+                balance_row_count[exc] = 0
                 logger.warning("inquire_overseas_balance(%s) 실패: %s", exc, exc_err)
 
         if not queried_exchanges:
             snap.valid = False
             snap.error = "KIS balance 조회 실패 (모든 거래소)"
+            snap.endpoint_evidence = {
+                "balance": {
+                    "endpoint": "/uapi/overseas-stock/v1/trading/inquire-balance",
+                    "expected_tr_ids": ["TTTS3012R", "VTTS3012R"],
+                    "observed_tr_ids": [tr_balance],
+                    "exchange_coverage": [],
+                    "status_by_exchange": balance_status,
+                    "row_count_by_exchange": balance_row_count,
+                }
+            }
             return snap
 
         merged_hold_raw = _merge_balance_holdings(hold_frames, market)
@@ -478,6 +505,7 @@ def load_kis_account_snapshot(
             tr_mket_cd="00",
             inqr_dvsn_cd="00",
         )
+        present_call_count += 1
         df_pres3_krw = pd.DataFrame()
         try:
             _, _, df_pres3_krw = kis.inquire_overseas_present_balance(
@@ -503,7 +531,14 @@ def load_kis_account_snapshot(
                 df_n = kis.inquire_nccs(ovrs_excg_cd=exc)
                 if df_n is not None and not df_n.empty:
                     nccs_frames.append(df_n)
+                    nccs_status[exc] = "OK"
+                    nccs_row_count[exc] = len(df_n)
+                else:
+                    nccs_status[exc] = "EMPTY"
+                    nccs_row_count[exc] = 0
             except Exception as nccs_err:
+                nccs_status[exc] = "FAILED"
+                nccs_row_count[exc] = 0
                 logger.warning("inquire_nccs(%s) 실패: %s", exc, nccs_err)
         if not nccs_frames and hasattr(kis, "inquire_nccs"):
             try:
@@ -562,6 +597,40 @@ def load_kis_account_snapshot(
             snap.valid = False
             snap.invalid_reason = "ACCOUNT_SNAPSHOT_INVALID: holdings>0 total_value=0"
 
+        present_status = "OK"
+        if present_failed:
+            present_status = "FAILED"
+        elif present_call_count <= 0:
+            present_status = "FAILED"
+        elif not summary:
+            present_status = "EMPTY"
+
+        snap.endpoint_evidence = {
+            "balance": {
+                "endpoint": "/uapi/overseas-stock/v1/trading/inquire-balance",
+                "expected_tr_ids": ["TTTS3012R", "VTTS3012R"],
+                "observed_tr_ids": [tr_balance],
+                "exchange_coverage": list(queried_exchanges),
+                "status_by_exchange": balance_status,
+                "row_count_by_exchange": balance_row_count,
+            },
+            "present_balance": {
+                "endpoint": "/uapi/overseas-stock/v1/trading/inquire-present-balance",
+                "expected_tr_ids": ["CTRP6504R", "VTRP6504R"],
+                "observed_tr_ids": [tr_present],
+                "call_count": present_call_count,
+                "status": present_status,
+            },
+            "nccs": {
+                "endpoint": "/uapi/overseas-stock/v1/trading/inquire-nccs",
+                "expected_tr_ids": ["TTTS3018R", "VTTS3018R"],
+                "observed_tr_ids": [tr_nccs],
+                "exchange_coverage": [e for e, s in nccs_status.items() if s in ("OK", "EMPTY")],
+                "status_by_exchange": nccs_status,
+                "open_orders_count": len(open_orders),
+            },
+        }
+
         return snap
 
     except Exception as e:
@@ -569,6 +638,16 @@ def load_kis_account_snapshot(
         logger.error("KIS endpoint snapshot 생성 실패: %s", err, exc_info=True)
         snap.valid = False
         snap.error = err
+        snap.endpoint_evidence = {
+            "balance": {
+                "endpoint": "/uapi/overseas-stock/v1/trading/inquire-balance",
+                "expected_tr_ids": ["TTTS3012R", "VTTS3012R"],
+                "observed_tr_ids": [tr_balance],
+                "exchange_coverage": [],
+                "status_by_exchange": balance_status,
+                "row_count_by_exchange": balance_row_count,
+            }
+        }
         return snap
 
 

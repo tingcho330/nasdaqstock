@@ -58,6 +58,7 @@ from account_snapshot import (
     is_sell_order_success,
     is_sell_qty_exceeded_error,
     log_account_snapshot_kis,
+    save_account_snapshot_evidence,
     validate_snapshot_for_trading,
 )
 from kis_overseas_account import load_kis_account_snapshot
@@ -850,6 +851,12 @@ class Trader:
             ccnl_start_ymd=start_ymd,
             ccnl_end_ymd=end_ymd,
         )
+        session = os.getenv("PIPELINE_SESSION", "") or None
+        save_account_snapshot_evidence(
+            snap,
+            market=self.market,
+            session=session if session in ("am", "pm") else None,
+        )
         if not snap.valid or snap.error:
             msg = snap.error or snap.invalid_reason or "KIS endpoint snapshot failed"
             logger.error("ACCOUNT_ENDPOINT_FAILED: %s", msg)
@@ -1002,10 +1009,10 @@ class Trader:
         sellable = int((snap.sellable_qty_by_ticker or {}).get(sym, compute_sellable_qty(holding_qty, pending)))
         return holding_qty, pending, sellable
 
-    def _clamp_sell_qty(self, ticker: str, requested_qty: int) -> Tuple[int, bool, str]:
+    def _clamp_sell_qty(self, ticker: str, requested_qty: int) -> Tuple[int, bool, str, Dict[str, Any]]:
         """
         매도 주문 수량을 KIS sellable_qty 기준으로 보정.
-        반환: (final_qty, should_skip, reason)
+        반환: (final_qty, should_skip, reason, sellable_evidence)
         """
         holding_qty, pending_qty, sellable_qty = self._get_sellable_qty(ticker)
         logger.info(
@@ -1018,17 +1025,52 @@ class Trader:
             requested_qty,
         )
         if sellable_qty <= 0:
+            clamp_action = "skipped_zero_sellable"
             logger.warning("[SELL_SKIP_NO_SELLABLE_QTY] ticker=%s requested_qty=%s", ticker, requested_qty)
-            return 0, True, "SELL_SKIP_NO_SELLABLE_QTY"
+            meta = {
+                "sellable_qty_checked": True,
+                "requested_qty": requested_qty,
+                "holding_qty": holding_qty,
+                "pending_sell_qty": pending_qty,
+                "sellable_qty": sellable_qty,
+                "clamp_action": clamp_action,
+            }
+            return 0, True, "SELL_SKIP_NO_SELLABLE_QTY", meta
         if requested_qty > sellable_qty:
+            clamp_action = "clamped"
             logger.warning(
                 "[SELL_QTY_CLAMPED] ticker=%s requested=%s sellable=%s",
                 ticker,
                 requested_qty,
                 sellable_qty,
             )
-            return sellable_qty, False, "SELL_QTY_CLAMPED"
-        return requested_qty, False, "OK"
+            meta = {
+                "sellable_qty_checked": True,
+                "requested_qty": requested_qty,
+                "holding_qty": holding_qty,
+                "pending_sell_qty": pending_qty,
+                "sellable_qty": sellable_qty,
+                "clamp_action": clamp_action,
+            }
+            return sellable_qty, False, "SELL_QTY_CLAMPED", meta
+        meta = {
+            "sellable_qty_checked": True,
+            "requested_qty": requested_qty,
+            "holding_qty": holding_qty,
+            "pending_sell_qty": pending_qty,
+            "sellable_qty": sellable_qty,
+            "clamp_action": "none",
+        }
+        return requested_qty, False, "OK", meta
+
+    def _merge_sellable_evidence(
+        self,
+        structured_context: Optional[Dict[str, Any]],
+        sellable_meta: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        ctx = dict(structured_context or {})
+        ctx.update(sellable_meta)
+        return ctx
 
     def _log_sell_reject_diag(
         self,
@@ -3079,13 +3121,14 @@ class Trader:
                     self.stats["hold"] += 1
                     continue
 
-                partial_qty, skip_partial, clamp_reason = self._clamp_sell_qty(ticker, partial_qty)
+                partial_qty, skip_partial, clamp_reason, sellable_meta = self._clamp_sell_qty(ticker, partial_qty)
                 if skip_partial:
                     logger.warning(
                         "[%s] 부분 익절 스킵: %s", ticker, clamp_reason
                     )
                     self.stats["hold"] += 1
                     continue
+                structured_context = self._merge_sellable_evidence(structured_context, sellable_meta)
 
                 order_type, order_price = self._determine_sell_order_type(current_price, structured_context)
                 logger.info(
@@ -3172,12 +3215,13 @@ class Trader:
                     self.stats["hold"] += 1
                     continue
 
-                sell_qty, skip_sell, clamp_reason = self._clamp_sell_qty(ticker, quantity)
+                sell_qty, skip_sell, clamp_reason, sellable_meta = self._clamp_sell_qty(ticker, quantity)
                 if skip_sell:
                     logger.warning("[%s] 매도 스킵: %s", ticker, clamp_reason)
                     self.stats["hold"] += 1
                     continue
                 quantity = sell_qty
+                structured_context = self._merge_sellable_evidence(structured_context, sellable_meta)
 
                 # 매도 주문 타입 결정 (TTTT1006U: ORD_DVSN=00 + OVRS_ORD_UNPR>0)
                 order_type, order_price = self._determine_sell_order_type(current_price, structured_context)
@@ -3774,10 +3818,11 @@ class Trader:
                 )
 
                 ord_dvsn, ord_unpr = self._sell_order_params(px)
-                sell_qty, skip_sell, _ = self._clamp_sell_qty(ticker, sell_qty)
+                sell_qty, skip_sell, _, sellable_meta = self._clamp_sell_qty(ticker, sell_qty)
                 if skip_sell or sell_qty <= 0:
                     logger.warning("종목 %s 비중 조정 매도 스킵: sellable_qty=0", ticker)
                     return False
+                _ = sellable_meta
 
                 result = self._order_cash_retry(
                     ord_dv="01",

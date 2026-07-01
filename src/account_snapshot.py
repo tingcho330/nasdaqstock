@@ -3,13 +3,27 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import os
+import re
 from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+from utils import KST, OUTPUT_DIR, norm_ticker
 
 logger = logging.getLogger(__name__)
 
 US_BALANCE_EXCHANGES: tuple = ("NASD", "NYSE", "AMEX")
+
+SENSITIVE_EVIDENCE_KEYS = re.compile(
+    r"(appkey|app_secret|secret|authorization|access_token|token|cano|acnt|account_no|account_number|계좌)",
+    re.I,
+)
+
+KIS_EVIDENCE_SCHEMA_VERSION = "1.0"
 
 
 @dataclass
@@ -34,6 +48,7 @@ class AccountSnapshot:
     valid: bool = True
     invalid_reason: str = ""
     error: str = ""
+    endpoint_evidence: Dict[str, Any] = field(default_factory=dict)
 
     @property
     def available_cash(self) -> int:
@@ -166,3 +181,118 @@ def is_sell_qty_exceeded_error(result: Dict[str, Any]) -> bool:
         or "sellable" in combined
         or msg_cd.upper() in ("APBK", "APBK0999")
     )
+
+
+def _sanitize_evidence_value(val: Any) -> Any:
+    if isinstance(val, dict):
+        return {k: _sanitize_evidence_value(v) for k, v in val.items() if not SENSITIVE_EVIDENCE_KEYS.search(str(k))}
+    if isinstance(val, list):
+        return [_sanitize_evidence_value(x) for x in val]
+    if isinstance(val, str) and SENSITIVE_EVIDENCE_KEYS.search(val):
+        return "***"
+    return val
+
+
+def _holdings_summary(holdings: List[Dict[str, Any]], market: str) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for h in holdings or []:
+        sym = norm_ticker(h.get("pdno", ""), market)
+        qty = _safe_int(h.get("hldg_qty"))
+        if not sym or qty <= 0:
+            continue
+        avg = _safe_float(h.get("pchs_avg_pric") or h.get("avg_unpr3") or h.get("avg_price"))
+        val = _safe_float(h.get("evlu_amt"))
+        if val <= 0 and avg > 0:
+            val = avg * qty
+        out.append({
+            "ticker": sym,
+            "qty": qty,
+            "avg_price": round(avg, 4) if avg else 0.0,
+            "valuation_usd": round(val, 2),
+        })
+    return out
+
+
+def build_account_snapshot_evidence_payload(
+    snapshot: AccountSnapshot,
+    *,
+    market: str,
+    session: Optional[str] = None,
+) -> Dict[str, Any]:
+    """KIS endpoint 요약 evidence (raw 응답·민감정보 제외)."""
+    ep = snapshot.endpoint_evidence or {}
+    cash = snapshot.cash_map or {}
+    available = _safe_float(cash.get("available_cash") or cash.get("ord_psbl_frcr_amt"))
+    total_asset = _safe_float(cash.get("tot_evlu_amt_usd") or cash.get("tot_evlu_amt"))
+    holdings_val = sum(_safe_float(h.get("evlu_amt")) for h in snapshot.holdings or [] if _safe_int(h.get("hldg_qty")) > 0)
+    open_sell = snapshot.open_sell_order_count()
+    open_buy = max(0, len(snapshot.open_orders or []) - open_sell)
+    return _sanitize_evidence_value({
+        "schema_version": KIS_EVIDENCE_SCHEMA_VERSION,
+        "source": "kis_endpoint",
+        "market": market,
+        "trade_date": snapshot.trade_date,
+        "session": session,
+        "snapshot_ts_kst": snapshot.snapshot_ts or datetime.now(KST).isoformat(),
+        "valid": snapshot.valid,
+        "error": snapshot.error or snapshot.invalid_reason or None,
+        "endpoints": ep,
+        "holdings_count": snapshot.holding_count,
+        "tickers": list(snapshot.tickers or []),
+        "holdings_summary": _holdings_summary(snapshot.holdings, market),
+        "holdings_value_usd": round(holdings_val, 2),
+        "available_cash_usd": round(available, 2),
+        "total_asset_usd": round(total_asset, 2),
+        "cash_map": {
+            "USD": {
+                "available_cash": round(available, 2),
+                "currency": "USD",
+            }
+        },
+        "sell_pending_qty_by_ticker": dict(snapshot.sell_pending_qty_by_ticker or {}),
+        "sellable_qty_by_ticker": dict(snapshot.sellable_qty_by_ticker or {}),
+        "open_orders_summary": {
+            "count": len(snapshot.open_orders or []),
+            "sell_count": open_sell,
+            "buy_count": open_buy,
+        },
+    })
+
+
+def account_snapshot_evidence_paths(
+    market: str,
+    trade_date: str,
+    session: Optional[str] = None,
+    output_dir: Optional[Path] = None,
+) -> tuple[Path, Path]:
+    base = output_dir or OUTPUT_DIR
+    base.mkdir(parents=True, exist_ok=True)
+    if session:
+        dated = base / f"account_snapshot_{market}_{trade_date}_{session}.json"
+    else:
+        dated = base / f"account_snapshot_{market}_{trade_date}.json"
+    latest = base / f"account_snapshot_latest_{market}.json"
+    return dated, latest
+
+
+def save_account_snapshot_evidence(
+    snapshot: AccountSnapshot,
+    *,
+    market: str,
+    session: Optional[str] = None,
+    output_dir: Optional[Path] = None,
+) -> Optional[Path]:
+    """AccountSnapshot KIS endpoint evidence JSON 저장."""
+    try:
+        payload = build_account_snapshot_evidence_payload(snapshot, market=market, session=session)
+        dated_path, latest_path = account_snapshot_evidence_paths(
+            market, snapshot.trade_date, session, output_dir,
+        )
+        for path in (dated_path, latest_path):
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+        logger.info("[ACCOUNT_SNAPSHOT_SAVED] path=%s", dated_path)
+        return dated_path
+    except Exception as e:
+        logger.error("[ACCOUNT_SNAPSHOT_SAVE_FAILED] reason=%s", str(e)[:300])
+        return None

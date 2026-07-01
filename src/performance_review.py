@@ -66,6 +66,7 @@ STANDARD_FINDINGS = {
     "KIS_PRESENT_BALANCE_MISSING",
     "KIS_PRESENT_BALANCE_CURRENCY_MIXED",
     "KIS_PRESENT_BALANCE_DUPLICATED_BY_EXCHANGE_LOOP",
+    "KIS_PRESENT_BALANCE_EVIDENCE_MISSING",
     "KIS_NCCS_MISSING",
     "KIS_NCCS_ALL_EXCHANGES_FAILED",
     "KIS_NCCS_STALE_PENDING_ORDER",
@@ -78,6 +79,7 @@ STANDARD_FINDINGS = {
     "KIS_SELL_QTY_EXCEEDED",
     "KIS_CASH_EXCEEDED",
     "KIS_EXECUTED_WITHOUT_FILL",
+    "KIS_EXECUTED_FILL_UNVERIFIED",
     "KIS_FAILED_MARKED_AS_EXECUTED",
     "KIS_SELL_WITHOUT_SELLABLE_CHECK",
     "KIS_SELL_SENT_WITH_ZERO_SELLABLE_QTY",
@@ -111,6 +113,56 @@ def normalize_finding_title(title: str) -> str:
     if title == "KIS_CCLN_MISSING":
         return "KIS_CCNL_MISSING"
     return title
+
+
+def normalize_finding_category(title: str, category: Optional[str] = None) -> str:
+    if category:
+        return category
+    t = normalize_finding_title(title)
+    if t.startswith("KIS_BALANCE_") or t.startswith("KIS_PRESENT_BALANCE_") or t == "LOG_UNAVAILABLE":
+        return "DATA_QUALITY"
+    if t.startswith("KIS_NCCS_") or t.startswith("KIS_CCNL_") or t.startswith("KIS_ORDER_"):
+        return "OPERATIONS"
+    if t.startswith("KIS_EXECUTED_") or t == "KIS_FAILED_MARKED_AS_EXECUTED":
+        return "TRADE_EXECUTION"
+    if t.startswith("KIS_SELL_") or t == "KIS_CASH_EXCEEDED":
+        return "RISK"
+    if t.startswith("ACCOUNT_SNAPSHOT_") or t == "ACCOUNT_SYNC_MISMATCH":
+        return "OPERATIONS"
+    return "OPERATIONS"
+
+
+def make_finding(
+    title: str,
+    severity: str,
+    endpoint: str = "",
+    evidence: str = "",
+    impact: str = "",
+    recommendation: str = "",
+    category: Optional[str] = None,
+    evidence_source_file: str = "",
+) -> "ReviewFinding":
+    return ReviewFinding(
+        title=title,
+        severity=severity,
+        endpoint=endpoint,
+        evidence=evidence,
+        impact=impact,
+        recommendation=recommendation,
+        category=normalize_finding_category(title, category),
+        evidence_source_file=evidence_source_file,
+    )
+
+
+def finalize_findings(findings: List["ReviewFinding"]) -> List["ReviewFinding"]:
+    for f in findings:
+        if not f.category:
+            f.category = normalize_finding_category(f.title)
+    return findings
+
+
+def _missing_evidence_severity(strict: bool, *, normal: str = "INFO") -> str:
+    return "WARN" if strict else normal
 
 
 def _first_present(record: Dict[str, Any], keys: Sequence[str]) -> Any:
@@ -230,15 +282,20 @@ class ReviewFinding:
     evidence: str = ""
     impact: str = ""
     recommendation: str = ""
+    category: str = ""
+    evidence_source_file: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
+        cat = self.category or normalize_finding_category(self.title)
         return {
             "title": normalize_finding_title(self.title),
             "severity": self.severity,
+            "category": cat,
             "endpoint": self.endpoint,
             "evidence": self.evidence,
             "impact": self.impact,
             "recommendation": self.recommendation,
+            "evidence_source_file": self.evidence_source_file or None,
         }
 
 
@@ -468,6 +525,120 @@ def _load_json(path: Optional[Path]) -> Optional[Dict[str, Any]]:
         return None
 
 
+def _pick_evidence_file(
+    paths: List[Path],
+    *,
+    exact_name: str,
+    latest_name: str,
+    prefix: str,
+    market: str,
+    trade_date: str,
+) -> Optional[Path]:
+    for p in paths:
+        if p.name == exact_name:
+            return p
+    for p in paths:
+        if p.name == latest_name:
+            return p
+    dated_matches = [
+        p for p in paths
+        if p.name.startswith(f"{prefix}_{market}_") and trade_date in p.name
+    ]
+    if dated_matches:
+        return sorted(dated_matches, key=lambda x: x.stat().st_mtime, reverse=True)[0]
+    return None
+
+
+def load_order_reconcile_evidence(
+    artifacts: ReviewArtifacts,
+) -> Tuple[Optional[Dict[str, Any]], Optional[Path]]:
+    market = artifacts.market
+    td = artifacts.review_date
+    path = _pick_evidence_file(
+        artifacts.order_reconcile_paths,
+        exact_name=f"order_reconcile_{market}_{td}.json",
+        latest_name=f"order_reconcile_latest_{market}.json",
+        prefix="order_reconcile",
+        market=market,
+        trade_date=td,
+    )
+    return _load_json(path), path
+
+
+def load_account_snapshot_evidence(
+    artifacts: ReviewArtifacts,
+    session: Optional[str] = None,
+) -> Tuple[Optional[Dict[str, Any]], Optional[Path]]:
+    market = artifacts.market
+    td = artifacts.review_date
+    exact = f"account_snapshot_{market}_{td}_{session}.json" if session else f"account_snapshot_{market}_{td}.json"
+    path = _pick_evidence_file(
+        artifacts.account_snapshot_paths,
+        exact_name=exact,
+        latest_name=f"account_snapshot_latest_{market}.json",
+        prefix="account_snapshot",
+        market=market,
+        trade_date=td,
+    )
+    if not path:
+        path = _pick_evidence_file(
+            artifacts.account_snapshot_paths,
+            exact_name=f"account_snapshot_{market}_{td}.json",
+            latest_name=f"account_snapshot_latest_{market}.json",
+            prefix="account_snapshot",
+            market=market,
+            trade_date=td,
+        )
+    return _load_json(path), path
+
+
+def _endpoint_block_has_evidence(block: Optional[Dict[str, Any]]) -> bool:
+    if not isinstance(block, dict) or not block:
+        return False
+    status = str(block.get("status") or "").upper()
+    if status in ("OK", "EMPTY", "PARTIAL"):
+        return True
+    if block.get("status_by_exchange"):
+        return True
+    if block.get("call_count") is not None:
+        return True
+    return False
+
+
+def _ccnl_evidence_available(
+    reconcile: Optional[Dict[str, Any]],
+    reconcile_path: Optional[Path],
+    artifacts: ReviewArtifacts,
+) -> Tuple[bool, Optional[Dict[str, Any]], Optional[Path]]:
+    if reconcile and _endpoint_block_has_evidence(reconcile.get("ccnl")):
+        ccnl = reconcile.get("ccnl") or {}
+        if not ccnl.get("all_exchanges_failed"):
+            return True, ccnl, reconcile_path
+    if "ccnl" in artifacts.logs_text.lower() and "inquire_ccnl" in artifacts.logs_text.lower():
+        return True, None, None
+    return False, None, reconcile_path
+
+
+def _nccs_evidence_available(
+    reconcile: Optional[Dict[str, Any]],
+    reconcile_path: Optional[Path],
+    snap: Optional[Dict[str, Any]],
+    snap_path: Optional[Path],
+    artifacts: ReviewArtifacts,
+) -> Tuple[bool, Optional[Dict[str, Any]], Optional[Path]]:
+    if reconcile and _endpoint_block_has_evidence(reconcile.get("nccs")):
+        nccs = reconcile.get("nccs") or {}
+        if not nccs.get("all_exchanges_failed"):
+            return True, nccs, reconcile_path
+    if snap:
+        ep = (snap.get("endpoints") or {}).get("nccs") or snap.get("nccs")
+        if _endpoint_block_has_evidence(ep):
+            return True, ep, snap_path
+    if "[ACCOUNT_SNAPSHOT_KIS]" in artifacts.logs_text or "inquire_nccs" in artifacts.logs_text.lower():
+        return True, None, None
+    return False, None, reconcile_path or snap_path
+
+
 def collect_artifacts(
     market: str,
     start_date: str,
@@ -596,22 +767,28 @@ def review_balance(artifacts: ReviewArtifacts, strict: bool) -> KisBalanceReview
     review = KisBalanceReview()
     market = artifacts.market
     payload = _load_json(artifacts.balance_path)
-    snap_payload = None
-    for p in reversed(artifacts.account_snapshot_paths):
-        snap_payload = _load_json(p)
-        if snap_payload:
-            break
+    snap_payload, snap_path = load_account_snapshot_evidence(artifacts, session=artifacts.session)
 
     records = _records_from_payload(payload or {})
     if snap_payload:
         records = records or _records_from_payload(snap_payload)
+        if snap_payload.get("holdings_summary"):
+            for h in snap_payload["holdings_summary"]:
+                records.append({
+                    "pdno": h.get("ticker"),
+                    "hldg_qty": h.get("qty"),
+                    "evlu_amt": h.get("valuation_usd"),
+                    "pchs_avg_pric": h.get("avg_price"),
+                })
 
     review.balance_source_status = _build_evidence(
         "inquire-balance",
         {**(payload or {}), **(snap_payload or {})},
-        source_file=str(artifacts.balance_path or ""),
+        source_file=str(snap_path or artifacts.balance_path or ""),
         records=records,
     )
+    if snap_path:
+        review.balance_source_status.source_file = str(snap_path)
 
     by_ticker_exc: Dict[str, Dict[str, int]] = {}
     qty_by_ticker: Dict[str, int] = {}
@@ -656,7 +833,7 @@ def review_balance(artifacts: ReviewArtifacts, strict: bool) -> KisBalanceReview
             if ticker not in review.duplicate_tickers:
                 review.duplicate_tickers.append(ticker)
                 review.balance_source_status.notes += f"; {ticker} multi-exchange (ADR possible)"
-            review.findings.append(ReviewFinding(
+            review.findings.append(make_finding(
                 "KIS_BALANCE_DUPLICATE_TICKER", "WARN", "inquire-balance",
                 f"{ticker} on exchanges {list(active.keys())}",
                 "다른 거래소 중복 보유", "ADR/특수케이스 또는 병합 로직 확인",
@@ -665,33 +842,36 @@ def review_balance(artifacts: ReviewArtifacts, strict: bool) -> KisBalanceReview
             if q > 0 and sum(1 for e2, q2 in active.items() if e2 == exc) > 1:
                 if ticker not in review.duplicate_tickers:
                     review.duplicate_tickers.append(ticker)
-                review.findings.append(ReviewFinding(
+                review.findings.append(make_finding(
                     "KIS_BALANCE_DUPLICATE_TICKER", "ERROR", "inquire-balance",
                     f"{ticker} duplicated on {exc}",
                     "동일 거래소 중복", "balance merge dedup 확인",
                 ))
 
     if not payload and not snap_payload:
-        review.findings.append(ReviewFinding(
+        review.findings.append(make_finding(
             "KIS_BALANCE_MISSING", "ERROR" if strict else "WARN", "inquire-balance",
             "balance/account_snapshot artifact 없음",
             "보유수량 검증 불가", "account.py 또는 trader snapshot 저장 확인",
         ))
     elif review.missing_exchange_codes and review.exchange_coverage:
-        review.findings.append(ReviewFinding(
+        review.findings.append(make_finding(
             "KIS_BALANCE_PARTIAL_EXCHANGE_COVERAGE", "WARN", "inquire-balance",
             f"coverage={review.exchange_coverage}, missing={review.missing_exchange_codes}",
             "일부 거래소 잔고 미반영 가능", "NASD/NYSE/AMEX 전체 조회 로그 확인",
+            evidence_source_file=str(snap_path or ""),
         ))
     if review.holdings_count > 0 and review.holdings_value_usd == 0:
-        review.findings.append(ReviewFinding(
+        review.findings.append(make_finding(
             "ACCOUNT_SNAPSHOT_INVALID", "ERROR", "inquire-balance",
             f"holdings_count={review.holdings_count}, holdings_value_usd=0",
             "평가금액 검증 실패", "balance JSON evlu 필드 및 KIS 응답 확인",
         ))
-    if not snap_payload and strict:
-        review.findings.append(ReviewFinding(
-            "ACCOUNT_SNAPSHOT_KIS_MISSING", "WARN", "account_snapshot",
+    if not snap_payload:
+        review.findings.append(make_finding(
+            "ACCOUNT_SNAPSHOT_KIS_MISSING",
+            _missing_evidence_severity(strict, normal="INFO"),
+            "account_snapshot",
             "account_snapshot_*.json 없음", "KIS primary source 추적 제한", "trader snapshot 저장 활성화",
         ))
     return review
@@ -700,12 +880,7 @@ def review_balance(artifacts: ReviewArtifacts, strict: bool) -> KisBalanceReview
 def review_present_balance(artifacts: ReviewArtifacts, balance: KisBalanceReview, strict: bool) -> KisPresentBalanceReview:
     review = KisPresentBalanceReview()
     payload = _load_json(artifacts.summary_path)
-    snap_payload = None
-    for p in reversed(artifacts.account_snapshot_paths):
-        sp = _load_json(p)
-        if sp and (sp.get("cash_map") or sp.get("available_cash")):
-            snap_payload = sp
-            break
+    snap_payload, snap_path = load_account_snapshot_evidence(artifacts, session=artifacts.session)
 
     cash_map: Dict[str, Any] = {}
     if payload:
@@ -715,22 +890,37 @@ def review_present_balance(artifacts: ReviewArtifacts, balance: KisBalanceReview
         cash_map.update({k: v for k, v in payload.items() if k not in ("data", "comments")})
     if snap_payload:
         if isinstance(snap_payload.get("cash_map"), dict):
-            cash_map.update(snap_payload["cash_map"])
+            cm = snap_payload["cash_map"]
+            if isinstance(cm.get("USD"), dict):
+                cash_map.update(cm["USD"])
+            cash_map.update(cm)
+        if snap_payload.get("available_cash_usd") is not None:
+            cash_map.setdefault("available_cash", snap_payload["available_cash_usd"])
+        if snap_payload.get("total_asset_usd") is not None:
+            cash_map.setdefault("tot_evlu_amt_usd", snap_payload["total_asset_usd"])
+        if snap_payload.get("holdings_value_usd") is not None:
+            cash_map.setdefault("holdings_value_usd", snap_payload["holdings_value_usd"])
 
     review.cash_map = {k: cash_map[k] for k in cash_map if not any(p.search(str(k)) for p in SENSITIVE_PATTERNS)}
     review.available_cash_usd = _safe_float(
         cash_map.get("available_cash") or cash_map.get("ord_psbl_frcr_amt") or cash_map.get("prvs_rcdl_excc_amt")
+        or (snap_payload or {}).get("available_cash_usd")
     )
     review.total_asset_usd = _safe_float(
         cash_map.get("tot_evlu_amt_usd") or cash_map.get("tot_evlu_amt")
+        or (snap_payload or {}).get("total_asset_usd")
     )
-    review.holdings_value_usd = balance.holdings_value_usd or _safe_float(cash_map.get("holdings_value_usd"))
+    review.holdings_value_usd = balance.holdings_value_usd or _safe_float(
+        cash_map.get("holdings_value_usd") or (snap_payload or {}).get("holdings_value_usd")
+    )
 
     review.present_balance_source_status = _build_evidence(
         "inquire-present-balance",
         {**(payload or {}), **(snap_payload or {})},
-        source_file=str(artifacts.summary_path or ""),
+        source_file=str(snap_path or artifacts.summary_path or ""),
     )
+    if snap_path:
+        review.present_balance_source_status.source_file = str(snap_path)
 
     has_krw = any(k.endswith("_krw") or "krw" in k.lower() for k in cash_map)
     has_usd = review.available_cash_usd > 0 or "USD" in str(cash_map.get("currency", ""))
@@ -739,7 +929,7 @@ def review_present_balance(artifacts: ReviewArtifacts, balance: KisBalanceReview
         krw_total = _safe_float(cash_map.get("tot_evlu_amt_krw"))
         if usd_total > 0 and krw_total > 0 and abs(usd_total - krw_total) < 1:
             review.currency_consistency_status = "mixed_suspicious"
-            review.findings.append(ReviewFinding(
+            review.findings.append(make_finding(
                 "KIS_PRESENT_BALANCE_CURRENCY_MIXED", "WARN", "inquire-present-balance",
                 f"USD total={usd_total}, KRW total={krw_total}",
                 "통화 혼합 의심", "USD/KRW 필드 분리 저장 확인",
@@ -752,57 +942,115 @@ def review_present_balance(artifacts: ReviewArtifacts, balance: KisBalanceReview
         review.currency_consistency_status = "unknown"
 
     if not payload and not snap_payload:
-        review.findings.append(ReviewFinding(
+        review.findings.append(make_finding(
             "KIS_PRESENT_BALANCE_MISSING", "ERROR" if strict else "WARN", "inquire-present-balance",
             "summary/account_snapshot 없음", "현금/총자산 검증 불가", "summary_YYYYMMDD.json 확인",
         ))
 
-    bal_val = balance.holdings_value_usd
-    if review.total_asset_usd > 0 and bal_val > 0:
-        ratio = review.total_asset_usd / bal_val
+    present_ep = {}
+    call_count = None
+    if snap_payload:
+        present_ep = (snap_payload.get("endpoints") or {}).get("present_balance") or {}
+        call_count = present_ep.get("call_count")
+
+    bal_val = review.holdings_value_usd or balance.holdings_value_usd
+    total = review.total_asset_usd
+    ratio = (total / bal_val) if bal_val > 0 and total > 0 else 0.0
+    src = str(snap_path or "")
+
+    if call_count == 1:
+        pass
+    elif call_count is not None and call_count >= 2 and ratio >= 2.0:
+        sev = "CRITICAL" if ratio >= 2.5 else "ERROR"
+        review.findings.append(make_finding(
+            "KIS_PRESENT_BALANCE_DUPLICATED_BY_EXCHANGE_LOOP", sev, "inquire-present-balance",
+            f"call_count={call_count}, total_asset_usd={total}, balance_holdings_value={bal_val}, ratio={ratio:.2f}",
+            "거래소 루프 중복 합산 의심", "present_balance 단일 조회 vs 거래소별 합산 확인",
+            evidence_source_file=src,
+        ))
+    elif not present_ep and call_count is None:
         if ratio >= 2.5:
-            review.findings.append(ReviewFinding(
+            review.findings.append(make_finding(
                 "KIS_PRESENT_BALANCE_DUPLICATED_BY_EXCHANGE_LOOP", "CRITICAL", "inquire-present-balance",
-                f"total_asset_usd={review.total_asset_usd}, balance_holdings_value={bal_val}, ratio={ratio:.2f}",
-                "거래소 루프 중복 합산 의심", "present_balance 단일 조회 vs 거래소별 합산 확인",
+                f"total_asset_usd={total}, balance_holdings_value={bal_val}, ratio={ratio:.2f}",
+                "총자산 과대 (evidence 부족)", "CTRP6504R call_count evidence 저장 확인",
+                evidence_source_file=src,
             ))
         elif ratio >= 2.0:
-            review.findings.append(ReviewFinding(
-                "KIS_PRESENT_BALANCE_DUPLICATED_BY_EXCHANGE_LOOP", "WARN", "inquire-present-balance",
-                f"total/balance ratio={ratio:.2f}", "총자산 과대 가능", "CTRP6504R 단일 호출 결과 사용 확인",
+            review.findings.append(make_finding(
+                "KIS_PRESENT_BALANCE_DUPLICATED_BY_EXCHANGE_LOOP", "ERROR", "inquire-present-balance",
+                f"total/balance ratio={ratio:.2f}", "총자산 과대 가능", "present_balance evidence 확인",
+                evidence_source_file=src,
             ))
+        else:
+            review.findings.append(make_finding(
+                "KIS_PRESENT_BALANCE_EVIDENCE_MISSING",
+                _missing_evidence_severity(strict),
+                "inquire-present-balance",
+                "present_balance endpoint evidence 없음",
+                "중복 합산 판정 제한", "account_snapshot evidence 저장 확인",
+                evidence_source_file=src,
+            ))
+    elif ratio >= 2.5:
+        review.findings.append(make_finding(
+            "KIS_PRESENT_BALANCE_DUPLICATED_BY_EXCHANGE_LOOP", "CRITICAL", "inquire-present-balance",
+            f"total_asset_usd={total}, balance_holdings_value={bal_val}, ratio={ratio:.2f}",
+            "총자산 과대", "present_balance 조회 로직 확인",
+            evidence_source_file=src,
+        ))
+    elif ratio >= 2.0:
+        review.findings.append(make_finding(
+            "KIS_PRESENT_BALANCE_DUPLICATED_BY_EXCHANGE_LOOP", "WARN", "inquire-present-balance",
+            f"total/balance ratio={ratio:.2f}", "총자산 과대 가능", "CTRP6504R 단일 호출 결과 사용 확인",
+            evidence_source_file=src,
+        ))
 
     return review
 
 
-def _parse_nccs_from_sources(artifacts: ReviewArtifacts, market: str) -> Tuple[List[Dict], Dict[str, int], KisEndpointEvidence]:
+def _parse_nccs_from_sources(artifacts: ReviewArtifacts, market: str) -> Tuple[List[Dict], Dict[str, int], KisEndpointEvidence, bool]:
     orders: List[Dict[str, Any]] = []
     pending_sell: Dict[str, int] = {}
     evidence = KisEndpointEvidence(endpoint_name="inquire-nccs", endpoint_path=KIS_ENDPOINT_META["inquire-nccs"]["path"])
+    has_evidence = False
+
+    reconcile, reconcile_path = load_order_reconcile_evidence(artifacts)
+    snap_payload, snap_path = load_account_snapshot_evidence(artifacts, session=artifacts.session)
+    nccs_ok, nccs_block, ev_path = _nccs_evidence_available(
+        reconcile, reconcile_path, snap_payload, snap_path, artifacts,
+    )
+    has_evidence = nccs_ok
+
+    if reconcile and isinstance(reconcile.get("nccs"), dict):
+        nb = reconcile["nccs"]
+        evidence = _build_evidence("inquire-nccs", reconcile, source_file=str(reconcile_path or ""))
+        evidence.observed_tr_id = ",".join(nb.get("observed_tr_ids") or [])
+        evidence.observed_exchange_codes = list(nb.get("exchange_coverage") or [])
+        evidence.status = str(nb.get("status") or evidence.status).upper()
+        if nb.get("all_exchanges_failed"):
+            evidence.status = "FAILED"
+        pending_map = nb.get("pending_sell_qty_by_ticker") or {}
+        if isinstance(pending_map, dict):
+            for k, v in pending_map.items():
+                pending_sell[str(k)] = pending_sell.get(str(k), 0) + _safe_int(v)
 
     for p in artifacts.account_snapshot_paths:
         payload = _load_json(p)
         if not payload:
             continue
         oo = payload.get("open_orders") or []
-        if isinstance(oo, list):
+        if isinstance(oo, list) and oo:
             orders.extend(oo)
         pmap = payload.get("sell_pending_qty_by_ticker") or {}
         if isinstance(pmap, dict):
             for k, v in pmap.items():
                 pending_sell[str(k)] = pending_sell.get(str(k), 0) + _safe_int(v)
-        evidence = _build_evidence("inquire-nccs", payload, source_file=str(p), records=oo)
-        break
-
-    for p in artifacts.order_reconcile_paths:
-        payload = _load_json(p)
-        if not payload:
-            continue
-        nccs_rows = payload.get("nccs") or payload.get("open_orders") or payload.get("nccs_orders") or []
-        if isinstance(nccs_rows, list):
-            orders.extend(nccs_rows)
         if not evidence.observed_tr_id:
-            evidence = _build_evidence("inquire-nccs", payload, source_file=str(p), records=nccs_rows)
+            ep = (payload.get("endpoints") or {}).get("nccs") or {}
+            evidence = _build_evidence("inquire-nccs", payload, source_file=str(p), records=oo)
+            if ep.get("observed_tr_ids"):
+                evidence.observed_tr_id = ",".join(ep.get("observed_tr_ids") or [])
+        break
 
     if not orders and not pending_sell:
         for rec in artifacts.trade_rows:
@@ -819,42 +1067,67 @@ def _parse_nccs_from_sources(artifacts: ReviewArtifacts, market: str) -> Tuple[L
                 q = _safe_int(_first_present(o, NCCS_QTY_FIELDS))
                 pending_sell[t] = pending_sell.get(t, 0) + q
 
-    return orders, pending_sell, evidence
+    if nccs_block and nccs_block.get("open_orders_count") is not None:
+        review_count = _safe_int(nccs_block.get("open_orders_count"))
+        if review_count >= 0 and not orders:
+            pass  # evidence says 0 open orders — valid empty state
+
+    if ev_path and not evidence.source_file:
+        evidence.source_file = str(ev_path)
+
+    return orders, pending_sell, evidence, has_evidence
 
 
 def review_nccs(artifacts: ReviewArtifacts, balance: KisBalanceReview, strict: bool) -> KisNccsReview:
     review = KisNccsReview()
     market = artifacts.market
-    orders, pending_sell, evidence = _parse_nccs_from_sources(artifacts, market)
+    reconcile, reconcile_path = load_order_reconcile_evidence(artifacts)
+    orders, pending_sell, evidence, has_evidence = _parse_nccs_from_sources(artifacts, market)
     review.nccs_source_status = evidence
     review.pending_sell_qty_by_ticker = pending_sell
     review.open_orders_count = len(orders)
-    review.open_sell_orders_count = sum(1 for o in orders if _norm_side(o) == "sell")
+    if reconcile and isinstance(reconcile.get("nccs"), dict):
+        nb = reconcile["nccs"]
+        if nb.get("open_orders_count") is not None:
+            review.open_orders_count = _safe_int(nb.get("open_orders_count"))
+        review.open_sell_orders_count = _safe_int(nb.get("open_sell_orders_count"))
+        review.exchange_coverage = list(nb.get("exchange_coverage") or [])
+    else:
+        review.open_sell_orders_count = sum(1 for o in orders if _norm_side(o) == "sell")
+        exchanges: Set[str] = set()
+        for o in orders:
+            exc = _first_present(o, EXCHANGE_FIELDS)
+            if exc:
+                exchanges.add(str(exc).upper())
+        review.exchange_coverage = sorted(exchanges)
 
-    exchanges: Set[str] = set()
-    for o in orders:
-        exc = _first_present(o, EXCHANGE_FIELDS)
-        if exc:
-            exchanges.add(str(exc).upper())
-    review.exchange_coverage = sorted(exchanges)
-
-    if "모든 거래소" in artifacts.logs_text and "nccs" in artifacts.logs_text.lower():
-        review.findings.append(ReviewFinding(
+    nccs_block = (reconcile or {}).get("nccs") or {}
+    if nccs_block.get("all_exchanges_failed"):
+        review.findings.append(make_finding(
+            "KIS_NCCS_ALL_EXCHANGES_FAILED", "ERROR", "inquire-nccs",
+            "nccs all_exchanges_failed=true", "미체결 조회 실패", "TTTS3018R 거래소별 조회 확인",
+            evidence_source_file=str(reconcile_path or evidence.source_file or ""),
+        ))
+    elif "모든 거래소" in artifacts.logs_text and "nccs" in artifacts.logs_text.lower():
+        review.findings.append(make_finding(
             "KIS_NCCS_ALL_EXCHANGES_FAILED", "ERROR", "inquire-nccs",
             "로그에 nccs 전 거래소 실패 흔적", "미체결 조회 불가", "TTTS3018R 거래소별 조회 확인",
         ))
 
-    if not orders and not pending_sell and evidence.status == "MISSING":
-        review.findings.append(ReviewFinding(
-            "KIS_NCCS_MISSING", "WARN" if strict else "INFO", "inquire-nccs",
-            "nccs evidence 없음", "pending 검증 제한", "account_snapshot 또는 order_reconcile 저장",
+    nccs_status = str(nccs_block.get("status") or "").upper()
+    if not has_evidence:
+        review.findings.append(make_finding(
+            "KIS_NCCS_MISSING",
+            _missing_evidence_severity(strict),
+            "inquire-nccs",
+            "nccs evidence 없음", "pending 검증 제한", "order_reconcile 또는 account_snapshot 저장",
+            evidence_source_file=str(reconcile_path or evidence.source_file or ""),
         ))
 
     for ticker, hold_qty in balance.total_holding_qty_by_ticker.items():
         pending = pending_sell.get(ticker, 0)
-        sellable = max(0, hold_qty - pending)
         if hold_qty - pending < 0:
-            review.findings.append(ReviewFinding(
+            review.findings.append(make_finding(
                 "KIS_SELLABLE_QTY_NEGATIVE", "ERROR", "inquire-nccs",
                 f"{ticker}: holding={hold_qty}, pending_sell={pending}",
                 "매도 가능수량 음수", "nccs/balance 동기화 확인",
@@ -867,7 +1140,7 @@ def review_nccs(artifacts: ReviewArtifacts, balance: KisBalanceReview, strict: b
         ts = str(o.get("order_time") or o.get("timestamp") or "")
         if ts and ts[:8] < artifacts.review_date:
             review.stale_pending_orders.append({"order_id": od, "ticker": _norm_ticker(o, market), "ts": ts})
-            review.findings.append(ReviewFinding(
+            review.findings.append(make_finding(
                 "KIS_NCCS_STALE_PENDING_ORDER", "WARN", "inquire-nccs",
                 f"order_id={od}, ts={ts}", "장기 pending", "order_reconciler 재실행",
             ))
@@ -875,116 +1148,198 @@ def review_nccs(artifacts: ReviewArtifacts, balance: KisBalanceReview, strict: b
     return review
 
 
-def _parse_ccnl_from_sources(artifacts: ReviewArtifacts) -> Tuple[List[Dict[str, Any]], KisEndpointEvidence]:
+def _parse_ccnl_from_sources(
+    artifacts: ReviewArtifacts,
+) -> Tuple[List[Dict[str, Any]], KisEndpointEvidence, bool, Optional[Path]]:
     rows: List[Dict[str, Any]] = []
     evidence = KisEndpointEvidence(endpoint_name="inquire-ccnl", endpoint_path=KIS_ENDPOINT_META["inquire-ccnl"]["path"])
+    reconcile, reconcile_path = load_order_reconcile_evidence(artifacts)
+    has_evidence, ccnl_block, ev_path = _ccnl_evidence_available(reconcile, reconcile_path, artifacts)
+
+    if reconcile and isinstance(reconcile.get("ccnl"), dict):
+        cb = reconcile["ccnl"]
+        evidence = _build_evidence("inquire-ccnl", reconcile, source_file=str(reconcile_path or ""))
+        evidence.observed_tr_id = ",".join(cb.get("observed_tr_ids") or [])
+        evidence.observed_exchange_codes = list(cb.get("exchange_coverage") or [])
+        evidence.status = str(cb.get("status") or evidence.status).upper()
+        if cb.get("all_exchanges_failed"):
+            evidence.status = "FAILED"
+        evidence.row_count = _safe_int(cb.get("order_count"))
+
     for p in artifacts.order_reconcile_paths:
         payload = _load_json(p)
         if not payload:
             continue
-        part = payload.get("ccnl") or payload.get("ccnl_orders") or payload.get("fills") or []
+        part = payload.get("ccnl_orders") or payload.get("fills") or []
         if isinstance(part, list):
             rows.extend(part)
-        evidence = _build_evidence("inquire-ccnl", payload, source_file=str(p), records=part)
+        if not evidence.observed_tr_id and isinstance(payload.get("ccnl"), dict):
+            cb = payload["ccnl"]
+            evidence.observed_tr_id = ",".join(cb.get("observed_tr_ids") or [])
+            evidence.source_file = str(p)
+        break
+
     if "ccnl" in artifacts.logs_text.lower() and "모든 거래소" in artifacts.logs_text:
         evidence.status = "FAILED"
         evidence.notes = "all exchanges failed (log)"
-    return rows, evidence
+    if ev_path and not evidence.source_file:
+        evidence.source_file = str(ev_path)
+    return rows, evidence, has_evidence, reconcile_path
 
 
 def review_ccnl(artifacts: ReviewArtifacts, strict: bool) -> KisCcnlReview:
     review = KisCcnlReview()
-    ccnl_rows, evidence = _parse_ccnl_from_sources(artifacts)
+    reconcile, reconcile_path = load_order_reconcile_evidence(artifacts)
+    ccnl_rows, evidence, has_evidence, ev_path = _parse_ccnl_from_sources(artifacts)
     review.ccnl_source_status = evidence
-    review.ccnl_order_count = len(ccnl_rows)
+    ccnl_block = (reconcile or {}).get("ccnl") or {}
+
+    if ccnl_block.get("order_count") is not None:
+        review.ccnl_order_count = _safe_int(ccnl_block.get("order_count"))
+        review.filled_order_count = _safe_int(ccnl_block.get("filled_order_count"))
+        review.partial_order_count = _safe_int(ccnl_block.get("partial_order_count"))
+        review.canceled_order_count = _safe_int(ccnl_block.get("canceled_order_count"))
+        review.failed_order_count = _safe_int(ccnl_block.get("failed_order_count"))
+        review.exchange_coverage = list(ccnl_block.get("exchange_coverage") or [])
+    else:
+        review.ccnl_order_count = len(ccnl_rows)
+        for row in ccnl_rows:
+            exec_q = _safe_int(_first_present(row, EXEC_QTY_FIELDS))
+            status = str(row.get("status") or row.get("order_status") or "").lower()
+            cancelled = str(row.get("cncl_yn") or row.get("cancelled") or "").upper() == "Y"
+            if cancelled or status == "cancelled":
+                review.canceled_order_count += 1
+            elif exec_q <= 0 and status in ("failed", "rejected"):
+                review.failed_order_count += 1
+            elif exec_q > 0 and status == "partial":
+                review.partial_order_count += 1
+            elif exec_q > 0:
+                review.filled_order_count += 1
 
     ccnl_by_id: Dict[str, Dict[str, Any]] = {}
     for row in ccnl_rows:
         oid = str(_first_present(row, ORDER_ID_FIELDS) or "")
-        if not oid:
-            continue
-        ccnl_by_id[oid] = row
-        exec_q = _safe_int(_first_present(row, EXEC_QTY_FIELDS))
-        status = str(row.get("status") or row.get("order_status") or "").lower()
-        cancelled = str(row.get("cncl_yn") or row.get("cancelled") or "").upper() == "Y"
-        if cancelled or status == "cancelled":
-            review.canceled_order_count += 1
-        elif exec_q <= 0 and status in ("failed", "rejected"):
-            review.failed_order_count += 1
-        elif exec_q > 0 and status == "partial":
-            review.partial_order_count += 1
-        elif exec_q > 0:
-            review.filled_order_count += 1
+        if oid:
+            ccnl_by_id[oid] = row
 
     db_with_id = [r for r in artifacts.trade_rows if str(r.get("order_id") or "").strip()]
     if db_with_id:
         matched = sum(1 for r in db_with_id if str(r.get("order_id")) in ccnl_by_id)
         review.order_id_coverage_rate = round(matched / len(db_with_id), 4)
+    elif reconcile and isinstance(reconcile.get("db_reconcile"), dict):
+        review.order_id_coverage_rate = _safe_float(reconcile["db_reconcile"].get("order_id_coverage_rate"), 1.0)
     elif artifacts.trade_rows:
         review.order_id_coverage_rate = 0.0
     else:
         review.order_id_coverage_rate = 1.0 if not ccnl_rows else 0.0
 
+    ccnl_status = str(ccnl_block.get("status") or "").upper()
+    src = str(reconcile_path or evidence.source_file or "")
+
     for tr in artifacts.trade_rows:
         oid = str(tr.get("order_id") or "").strip()
         db_status = str(tr.get("order_status") or "").lower()
-        if not oid or oid not in ccnl_by_id:
-            if db_status in ("executed", "filled") and _safe_int(tr.get("executed_qty")) > 0:
-                review.findings.append(ReviewFinding(
-                    "KIS_EXECUTED_WITHOUT_FILL", "ERROR", "inquire-ccnl",
-                    f"order_id={oid}, db_status={db_status}, ccnl 없음",
-                    "체결 기록 불일치", "order_reconciler ccnl 조회 확인",
+        db_exec = _safe_int(tr.get("executed_qty"))
+
+        if db_status in ("executed", "filled") or db_exec > 0:
+            if not has_evidence:
+                review.findings.append(make_finding(
+                    "KIS_EXECUTED_FILL_UNVERIFIED",
+                    _missing_evidence_severity(strict),
+                    "inquire-ccnl",
+                    f"order_id={oid or 'N/A'}, db_status={db_status}, ccnl evidence 없음",
+                    "체결 증거 미확인", "order_reconcile ccnl evidence 저장 확인",
+                    evidence_source_file=src,
+                ))
+                continue
+
+        if not oid:
+            if db_status in ("executed", "filled") and has_evidence:
+                review.findings.append(make_finding(
+                    "KIS_ORDER_MISSING_ODNO", "ERROR", "inquire-ccnl",
+                    f"ticker={tr.get('ticker')}, db_status={db_status}, order_id empty",
+                    "체결 기록에 주문번호 없음", "주문 응답 ODNO 저장 확인",
+                    evidence_source_file=src,
                 ))
             continue
+
+        if oid not in ccnl_by_id:
+            if has_evidence and db_status in ("executed", "filled"):
+                review.findings.append(make_finding(
+                    "KIS_DB_CCNL_STATUS_MISMATCH", "WARN", "inquire-ccnl",
+                    f"order_id={oid}, db={db_status}, ccnl에 없음",
+                    "DB vs ccnl 불일치", "order_reconciler 재실행",
+                    evidence_source_file=src,
+                ))
+            continue
+
         cc = ccnl_by_id[oid]
         exec_q = _safe_int(_first_present(cc, EXEC_QTY_FIELDS))
         cc_status = str(cc.get("status") or cc.get("order_status") or "").lower()
         if db_status == "pending" and (exec_q > 0 or cc_status in ("executed", "filled", "cancelled", "failed")):
             review.db_vs_ccnl_mismatch_count += 1
-            review.findings.append(ReviewFinding(
+            review.findings.append(make_finding(
                 "KIS_DB_CCNL_STATUS_MISMATCH", "WARN", "inquire-ccnl",
                 f"order_id={oid}: db={db_status}, ccnl={cc_status}, exec={exec_q}",
                 "DB pending vs KIS 체결 불일치", "order_reconciler 재분류 확인",
+                evidence_source_file=src,
             ))
-        if db_status in ("executed", "filled") and exec_q == 0:
-            review.findings.append(ReviewFinding(
+        if db_status in ("executed", "filled") and exec_q == 0 and has_evidence:
+            review.findings.append(make_finding(
                 "KIS_EXECUTED_WITHOUT_FILL", "ERROR", "inquire-ccnl",
                 f"order_id={oid}, db executed but ccnl exec=0",
                 "체결수량 0", "TTTS3035R 조회 및 DB 업데이트",
+                evidence_source_file=src,
             ))
 
-    if not ccnl_rows and evidence.status == "MISSING":
-        review.findings.append(ReviewFinding(
-            "KIS_CCNL_MISSING", "WARN" if strict else "INFO", "inquire-ccnl",
-            "ccnl evidence 없음", "체결 검증 제한", "order_reconcile 결과 저장",
+    if ccnl_block.get("all_exchanges_failed"):
+        review.findings.append(make_finding(
+            "KIS_CCNL_ALL_EXCHANGES_FAILED", "ERROR", "inquire-ccnl",
+            "ccnl all_exchanges_failed=true", "체결내역 조회 실패", "거래소별 TTTS3035R 확인",
+            evidence_source_file=src,
         ))
-    if evidence.status == "FAILED" or (
+    elif evidence.status == "FAILED" or (
         "KIS_CCNL" in artifacts.logs_text and "모든 거래소" in artifacts.logs_text
     ):
-        review.findings.append(ReviewFinding(
+        review.findings.append(make_finding(
             "KIS_CCNL_ALL_EXCHANGES_FAILED", "ERROR", "inquire-ccnl",
             "ccnl 전 거래소 실패 로그", "체결내역 조회 실패", "거래소별 TTTS3035R 확인",
+            evidence_source_file=src,
         ))
+    elif not has_evidence:
+        review.findings.append(make_finding(
+            "KIS_CCNL_MISSING",
+            _missing_evidence_severity(strict),
+            "inquire-ccnl",
+            "ccnl evidence 없음", "체결 검증 제한", "order_reconcile 결과 저장",
+            evidence_source_file=src,
+        ))
+    elif ccnl_status in ("OK", "EMPTY") and review.ccnl_order_count == 0:
+        pass  # valid empty ccnl
+
     return review
 
 
-def _parse_order_response_from_row(row: Dict[str, Any]) -> Dict[str, Any]:
+def _parse_structured_context(row: Dict[str, Any]) -> Dict[str, Any]:
     ctx_raw = row.get("structured_context") or ""
     if isinstance(ctx_raw, str) and ctx_raw.strip():
         try:
-            ctx = json.loads(ctx_raw)
-            if isinstance(ctx, dict):
-                for k in ("kis_response", "order_response", "raw_response", "raw"):
-                    if isinstance(ctx.get(k), dict):
-                        return ctx[k]
-                if "rt_cd" in ctx:
-                    return ctx
+            parsed = json.loads(ctx_raw)
+            return parsed if isinstance(parsed, dict) else {}
         except json.JSONDecodeError:
-            pass
+            return {}
     if isinstance(ctx_raw, dict):
-        for k in ("kis_response", "order_response", "raw_response", "raw"):
-            if isinstance(ctx_raw.get(k), dict):
-                return ctx_raw[k]
+        return ctx_raw
+    return {}
+
+
+def _parse_order_response_from_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    ctx = _parse_structured_context(row)
+    for k in ("kis_response", "order_response", "raw_response", "raw"):
+        if isinstance(ctx.get(k), dict):
+            return ctx[k]
+    if "rt_cd" in ctx:
+        return ctx
     return {}
 
 
@@ -997,6 +1352,8 @@ def review_orders(
 ) -> KisOrderReview:
     review = KisOrderReview()
     market = artifacts.market
+    snap_payload, snap_path = load_account_snapshot_evidence(artifacts, session=artifacts.session)
+    snap_sellable = (snap_payload or {}).get("sellable_qty_by_ticker") or {}
     sellable_checks: Set[str] = set()
     if "SELLABLE_QTY_CHECK" in artifacts.logs_text:
         for m in re.finditer(r"\[SELLABLE_QTY_CHECK\]\s+ticker=(\S+)", artifacts.logs_text):
@@ -1010,10 +1367,11 @@ def review_orders(
 
     for row in order_rows:
         resp = _parse_order_response_from_row(row)
-        rt_cd = str(_first_present(resp, STATUS_FIELDS) or resp.get("rt_cd") or "")
-        odno = _first_present(resp, ORDER_ID_FIELDS) or row.get("order_id")
-        msg1 = str(resp.get("msg1") or "")
-        msg_cd = str(resp.get("msg_cd") or "")
+        row_ctx = _parse_structured_context(row)
+        rt_cd = str(_first_present(resp, STATUS_FIELDS) or resp.get("rt_cd") or row_ctx.get("rt_cd") or "")
+        odno = _first_present(resp, ORDER_ID_FIELDS) or row.get("order_id") or row_ctx.get("ODNO") or row_ctx.get("odno")
+        msg1 = str(resp.get("msg1") or row_ctx.get("msg1") or "")
+        msg_cd = str(resp.get("msg_cd") or row_ctx.get("msg_cd") or "")
         action = str(row.get("action", "")).upper()
         ticker = norm_ticker(row.get("ticker", ""), market)
 
@@ -1022,14 +1380,14 @@ def review_orders(
                 review.successful_order_count += 1
             else:
                 review.missing_odno_count += 1
-                review.findings.append(ReviewFinding(
+                review.findings.append(make_finding(
                     "KIS_ORDER_MISSING_ODNO", "ERROR", "order",
                     f"ticker={ticker}, rt_cd=0, odno empty",
                     "주문번호 누락", "주문 응답 ODNO 저장 확인",
                 ))
         elif rt_cd and rt_cd != "0":
             review.rejected_order_count += 1
-            review.findings.append(ReviewFinding(
+            review.findings.append(make_finding(
                 "KIS_ORDER_REJECTED", "WARN", "order",
                 f"ticker={ticker}, rt_cd={rt_cd}, msg1={msg1[:80]}",
                 "주문 거절", "거절 사유 및 잔고 확인",
@@ -1038,13 +1396,13 @@ def review_orders(
         combined = f"{msg1} {msg_cd}"
         if "주문수량이 가능수량보다" in msg1 or "가능수량" in msg1:
             review.sell_qty_exceeded_count += 1
-            review.findings.append(ReviewFinding(
+            review.findings.append(make_finding(
                 "KIS_SELL_QTY_EXCEEDED", "WARN", "order",
                 combined[:120], "매도 가능수량 초과", "sellable_qty clamp 확인",
             ))
         if "주문가능금액" in msg1 or "cash exceeded" in combined.lower():
             review.cash_exceeded_count += 1
-            review.findings.append(ReviewFinding(
+            review.findings.append(make_finding(
                 "KIS_CASH_EXCEEDED", "WARN", "order",
                 combined[:120], "주문가능금액 초과", "available_cash 확인",
             ))
@@ -1052,7 +1410,7 @@ def review_orders(
         db_status = str(row.get("order_status") or "").lower()
         if rt_cd and rt_cd != "0" and db_status in ("executed", "filled"):
             sev = "CRITICAL" if cfg.get("critical_on_failed_marked_as_executed", True) else "ERROR"
-            review.findings.append(ReviewFinding(
+            review.findings.append(make_finding(
                 "KIS_FAILED_MARKED_AS_EXECUTED", sev, "order",
                 f"order_id={odno}, rt_cd={rt_cd}, db_status={db_status}",
                 "실패 주문이 체결로 기록", "DB order_status 정정",
@@ -1062,22 +1420,42 @@ def review_orders(
             hold = balance.total_holding_qty_by_ticker.get(ticker, 0)
             pending = nccs.pending_sell_qty_by_ticker.get(ticker, 0)
             sellable = max(0, hold - pending)
-            if sellable == 0 and hold > 0 and pending >= hold:
+            ctx_sellable = _safe_int(row_ctx.get("sellable_qty"))
+            ctx_checked = bool(row_ctx.get("sellable_qty_checked"))
+            if row_ctx.get("clamp_action") == "skipped_zero_sellable" or (
+                ctx_checked and ctx_sellable == 0 and _safe_int(row.get("quantity")) > 0
+            ):
                 sev = "CRITICAL" if cfg.get("critical_on_sell_sent_with_zero_sellable_qty", True) else "ERROR"
-                review.findings.append(ReviewFinding(
+                review.findings.append(make_finding(
                     "KIS_SELL_SENT_WITH_ZERO_SELLABLE_QTY", sev, "order",
                     f"ticker={ticker}, sellable=0, sell submitted",
                     "0 sellable 매도 전송", "SELL_SKIP_NO_SELLABLE_QTY 가드 확인",
+                    evidence_source_file=str(snap_path or ""),
                 ))
-            if ticker.upper() not in sellable_checks and sellable <= hold:
-                review.findings.append(ReviewFinding(
-                    "KIS_SELL_WITHOUT_SELLABLE_CHECK", "WARN", "order",
-                    f"ticker={ticker}, no SELLABLE_QTY_CHECK log",
-                    "매도 전 sellable 검증 로그 없음", "trader _clamp_sell_qty 로그 확인",
+            elif sellable == 0 and hold > 0 and pending >= hold:
+                sev = "CRITICAL" if cfg.get("critical_on_sell_sent_with_zero_sellable_qty", True) else "ERROR"
+                review.findings.append(make_finding(
+                    "KIS_SELL_SENT_WITH_ZERO_SELLABLE_QTY", sev, "order",
+                    f"ticker={ticker}, sellable=0, sell submitted",
+                    "0 sellable 매도 전송", "SELL_SKIP_NO_SELLABLE_QTY 가드 확인",
+                    evidence_source_file=str(snap_path or ""),
+                ))
+            elif (
+                ticker.upper() not in sellable_checks
+                and not ctx_checked
+                and ticker not in snap_sellable
+            ):
+                review.findings.append(make_finding(
+                    "KIS_SELL_WITHOUT_SELLABLE_CHECK",
+                    _missing_evidence_severity(strict, normal="WARN"),
+                    "order",
+                    f"ticker={ticker}, no SELLABLE_QTY_CHECK log or structured_context",
+                    "매도 전 sellable 검증 evidence 부족", "trader _clamp_sell_qty evidence 저장 확인",
+                    evidence_source_file=str(snap_path or ""),
                 ))
 
     if "executed_sells=True" in artifacts.logs_text and review.rejected_order_count > 0:
-        review.findings.append(ReviewFinding(
+        review.findings.append(make_finding(
             "KIS_FAILED_MARKED_AS_EXECUTED", "CRITICAL", "order",
             "log executed_sells=True with rejected orders",
             "실패인데 executed_sells 처리", "trader run_sell_logic 반환값 확인",
@@ -1127,7 +1505,7 @@ def build_kis_endpoint_review(
         all_findings.extend(getattr(part, "findings", []))
 
     if include_logs and not artifacts.log_paths:
-        all_findings.append(ReviewFinding(
+        all_findings.append(make_finding(
             "LOG_UNAVAILABLE", "INFO", "",
             "output logs 없음", "로그 기반 교차검증 제한", "pipeline 로그 저장 확인",
         ))
@@ -1150,12 +1528,13 @@ def build_kis_endpoint_review(
                 elif name == "inquire-ccnl":
                     title = "KIS_CCNL_MISSING"
                 if not any(f.title == title for f in all_findings):
-                    all_findings.append(ReviewFinding(
+                    all_findings.append(make_finding(
                         title, "WARN" if cfg.get("warn_on_missing_kis_endpoint_evidence") else "ERROR",
                         name, f"status={rev.status}", "endpoint evidence 불완전", "KIS artifact/metadata 저장",
+                        evidence_source_file=rev.source_file,
                     ))
 
-    ker.endpoint_findings = all_findings
+    ker.endpoint_findings = finalize_findings(all_findings)
     ker.endpoint_health_score = _compute_health_score(all_findings)
     return ker
 
@@ -1212,7 +1591,7 @@ def run_performance_review(
     except Exception as e:
         review_error = str(e)
         logger.exception("Performance review analysis failed: %s", e)
-        all_findings.append(ReviewFinding(
+        all_findings.append(make_finding(
             "ACCOUNT_SNAPSHOT_INVALID",
             "ERROR",
             "",
@@ -1286,6 +1665,7 @@ def kis_review_to_json_summary(ker: KisEndpointReview) -> Dict[str, Any]:
             "tickers": br.tickers,
             "duplicate_tickers": br.duplicate_tickers,
             "holdings_value_usd": br.holdings_value_usd,
+            "evidence_source_file": br.balance_source_status.source_file or None,
         },
         "present_balance": {
             "status": pr.present_balance_source_status.status,
@@ -1294,6 +1674,7 @@ def kis_review_to_json_summary(ker: KisEndpointReview) -> Dict[str, Any]:
             "total_asset_usd": pr.total_asset_usd,
             "holdings_value_usd": pr.holdings_value_usd,
             "currency_consistency_status": pr.currency_consistency_status,
+            "evidence_source_file": pr.present_balance_source_status.source_file or None,
         },
         "nccs": {
             "status": nr.nccs_source_status.status,
@@ -1302,6 +1683,7 @@ def kis_review_to_json_summary(ker: KisEndpointReview) -> Dict[str, Any]:
             "open_orders_count": nr.open_orders_count,
             "pending_sell_qty_by_ticker": nr.pending_sell_qty_by_ticker,
             "stale_pending_orders_count": len(nr.stale_pending_orders),
+            "evidence_source_file": nr.nccs_source_status.source_file or None,
         },
         "ccnl": {
             "status": cr.ccnl_source_status.status,
@@ -1309,6 +1691,7 @@ def kis_review_to_json_summary(ker: KisEndpointReview) -> Dict[str, Any]:
             "exchange_coverage": cr.exchange_coverage,
             "order_id_coverage_rate": cr.order_id_coverage_rate,
             "db_vs_ccnl_mismatch_count": cr.db_vs_ccnl_mismatch_count,
+            "evidence_source_file": cr.ccnl_source_status.source_file or None,
         },
         "order": {
             "submitted_order_count": orr.submitted_order_count,
@@ -1356,45 +1739,65 @@ def render_markdown(result: PerformanceReviewResult) -> str:
         "## KIS Endpoint Review",
         "",
         "### Balance - inquire-balance",
+        f"- status: {br.balance_source_status.status}",
         f"- TR_ID 관측값: {br.balance_source_status.observed_tr_id or 'N/A'}",
         f"- 거래소 coverage: {', '.join(br.exchange_coverage) or 'none'}",
+        f"- evidence_source_file: {br.balance_source_status.source_file or 'N/A'}",
         f"- 보유종목 수: {br.holdings_count}",
         f"- 중복 ticker: {', '.join(br.duplicate_tickers) or 'none'}",
         f"- 평가금액 상태: ${br.holdings_value_usd:,.2f} ({br.balance_source_status.status})",
         "",
         "### Present Balance - inquire-present-balance",
+        f"- status: {pr.present_balance_source_status.status}",
         f"- USD 현금: ${pr.available_cash_usd:,.2f}",
         f"- USD 총자산: ${pr.total_asset_usd:,.2f}",
         f"- 통화 일관성: {pr.currency_consistency_status}",
+        f"- evidence_source_file: {pr.present_balance_source_status.source_file or 'N/A'}",
         f"- 거래소 루프 중복 합산 의심: "
         + ("yes" if any(f.title == "KIS_PRESENT_BALANCE_DUPLICATED_BY_EXCHANGE_LOOP" for f in pr.findings) else "no"),
         "",
         "### Open Orders - inquire-nccs",
+        f"- status: {nr.nccs_source_status.status}",
         f"- 미체결 주문 수: {nr.open_orders_count}",
         f"- 미체결 매도수량: {nr.pending_sell_qty_by_ticker}",
+        f"- evidence_source_file: {nr.nccs_source_status.source_file or 'N/A'}",
         f"- sellable_qty 검증: see findings",
         f"- 장기 pending 주문: {len(nr.stale_pending_orders)}",
         "",
         "### Order Fills - inquire-ccnl",
+        f"- status: {cr.ccnl_source_status.status}",
         f"- 주문번호 coverage: {cr.order_id_coverage_rate:.1%}",
+        f"- evidence_source_file: {cr.ccnl_source_status.source_file or 'N/A'}",
         f"- DB와 KIS 체결상태 비교 mismatch: {cr.db_vs_ccnl_mismatch_count}",
         f"- filled/partial/canceled/failed: {cr.filled_order_count}/{cr.partial_order_count}/"
         f"{cr.canceled_order_count}/{cr.failed_order_count}",
         "",
         "### Order Submit - order",
+        f"- status: {orr.order_status_quality}",
         f"- 주문 성공률: {orr.successful_order_count}/{orr.submitted_order_count}",
         f"- rt_cd/ODNO 품질: {orr.order_status_quality}",
         f"- missing ODNO: {orr.missing_odno_count}",
         f"- 가능수량 초과: {orr.sell_qty_exceeded_count}",
         f"- 주문가능금액 초과: {orr.cash_exceeded_count}",
         "",
-        "### KIS Endpoint Findings",
+        "## Findings",
         "",
-        "| severity | endpoint | title | evidence |",
-        "| --- | --- | --- | --- |",
+        "| severity | category | title | evidence | impact | recommendation | evidence_source |",
+        "| --- | --- | --- | --- | --- | --- | --- |",
     ]
     for f in result.findings:
-        lines.append(f"| {f.severity} | {f.endpoint} | {normalize_finding_title(f.title)} | {f.evidence[:80]} |")
+        cat = f.category or normalize_finding_category(f.title)
+        src = f.evidence_source_file or ""
+        lines.append(
+            f"| {f.severity} | {cat} | {normalize_finding_title(f.title)} | "
+            f"{f.evidence[:80]} | {f.impact[:60]} | {f.recommendation[:60]} | {src[:60]} |"
+        )
+    lines.extend(["", "### KIS Endpoint Findings", ""])
+    for f in result.findings:
+        cat = f.category or normalize_finding_category(f.title)
+        lines.append(
+            f"- **{f.severity}** [{cat}] {normalize_finding_title(f.title)}: {f.evidence[:120]}"
+        )
     if result.action_items:
         lines.extend(["", "## Action Items", ""])
         for item in result.action_items:

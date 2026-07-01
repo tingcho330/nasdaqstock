@@ -11,14 +11,16 @@ Order reconciler
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 from datetime import datetime, timedelta
-from typing import Dict, Any, List, Optional
+from pathlib import Path
+from typing import Dict, Any, List, Optional, Tuple
 
 from settings import settings
 import os
 
-from utils import setup_logging, KST, norm_ticker, is_us_market, kst_window_to_us_order_dates
+from utils import setup_logging, KST, norm_ticker, is_us_market, kst_window_to_us_order_dates, OUTPUT_DIR
 
 try:
     from account_snapshot import compute_sellable_qty, is_sell_order_success
@@ -42,6 +44,31 @@ except ImportError:
 
 
 logger = logging.getLogger("OrderReconciler")
+
+KIS_EVIDENCE_SCHEMA_VERSION = "1.0"
+NCCS_ENDPOINT = "/uapi/overseas-stock/v1/trading/inquire-nccs"
+CCNL_ENDPOINT = "/uapi/overseas-stock/v1/trading/inquire-ccnl"
+
+
+def _kis_tr_id_nccs(env: str) -> str:
+    return "VTTS3018R" if env == "vps" else "TTTS3018R"
+
+
+def _kis_tr_id_ccnl(env: str) -> str:
+    return "VTTS3035R" if env == "vps" else "TTTS3035R"
+
+
+def _exchange_status_from_results(
+    exchanges: List[str],
+    status_by_exchange: Dict[str, str],
+) -> str:
+    if not status_by_exchange:
+        return "FAILED"
+    if all(status_by_exchange.get(e) == "FAILED" for e in exchanges):
+        return "FAILED"
+    if any(status_by_exchange.get(e) == "OK" for e in exchanges):
+        return "OK"
+    return "EMPTY"
 
 def _mask_account(s: Optional[str]) -> str:
     """계좌/식별자 로그 마스킹(끝 2~3자리만 노출)."""
@@ -146,25 +173,30 @@ def _normalize_order_row(row: Any, *, overseas: bool = False) -> Optional[Dict[s
 
 
 def _fetch_overseas_open_orders(
-    kis: KIS, *, ovrs_excg_cd: str = "NASD"
-) -> Dict[str, Dict[str, Any]]:
-    """KIS inquire_nccs(해외 미체결) → order_id dict. NASD/NYSE/AMEX 순회."""
+    kis: KIS, *, ovrs_excg_cd: str = "NASD", env: str = "vps"
+) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
+    """KIS inquire_nccs(해외 미체결) → order_id dict + endpoint evidence."""
     orders: List[Dict[str, Any]] = []
     exchanges = list(US_BALANCE_EXCHANGES) if is_us_market() else [ovrs_excg_cd]
     failures: List[str] = []
+    status_by_exchange: Dict[str, str] = {}
     for exc in exchanges:
         try:
             if hasattr(kis, "inquire_nccs"):
                 df = kis.inquire_nccs(ovrs_excg_cd=exc)
                 if df is not None and not df.empty:
+                    status_by_exchange[exc] = "OK"
                     for _, row in df.iterrows():
                         o = _normalize_order_row(row, overseas=True)
                         if o:
                             o["ovrs_excg_cd"] = exc
                             orders.append(o)
+                else:
+                    status_by_exchange[exc] = "EMPTY"
         except Exception as e:
             msg = f"{exc}: {e}"
             failures.append(msg)
+            status_by_exchange[exc] = "FAILED"
             logger.warning("inquire_nccs(%s) 조회 실패: %s", exc, e)
 
     if failures and not orders:
@@ -174,9 +206,28 @@ def _fetch_overseas_open_orders(
         )
 
     by_id: Dict[str, Dict[str, Any]] = {}
+    pending_sell: Dict[str, int] = {}
     for o in orders:
         by_id[o["order_id"]] = o
-    return by_id
+        if o.get("side") == "sell":
+            t = o.get("ticker") or ""
+            pending_sell[t] = pending_sell.get(t, 0) + _safe_int(o.get("quantity", 0))
+
+    tr_id = _kis_tr_id_nccs(env)
+    all_failed = bool(exchanges) and all(status_by_exchange.get(e) == "FAILED" for e in exchanges)
+    evidence = {
+        "endpoint": NCCS_ENDPOINT,
+        "expected_tr_ids": ["TTTS3018R", "VTTS3018R"],
+        "observed_tr_ids": [tr_id],
+        "exchange_coverage": [e for e in exchanges if status_by_exchange.get(e) in ("OK", "EMPTY")],
+        "status_by_exchange": status_by_exchange,
+        "open_orders_count": len(orders),
+        "open_sell_orders_count": sum(1 for o in orders if o.get("side") == "sell"),
+        "pending_sell_qty_by_ticker": pending_sell,
+        "all_exchanges_failed": all_failed,
+        "status": _exchange_status_from_results(exchanges, status_by_exchange),
+    }
+    return by_id, evidence
 
 
 def _classify_kis_order_status(
@@ -225,12 +276,14 @@ def log_failed_sell_diagnostic(
 
 
 def _fetch_overseas_daily_orders(
-    kis: KIS, *, start_ymd: str, end_ymd: str, ovrs_excg_cd: str = "NASD"
-) -> Dict[str, Dict[str, Any]]:
-    """KIS inquire_ccnl(해외 주문체결내역) → order_id dict. NASD/NYSE/AMEX 순회."""
+    kis: KIS, *, start_ymd: str, end_ymd: str, ovrs_excg_cd: str = "NASD", env: str = "vps"
+) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
+    """KIS inquire_ccnl(해외 주문체결내역) → order_id dict + endpoint evidence."""
     orders: List[Dict[str, Any]] = []
     exchanges = list(US_BALANCE_EXCHANGES) if is_us_market() else [ovrs_excg_cd]
     failures: List[str] = []
+    status_by_exchange: Dict[str, str] = {}
+    filled = partial = canceled = failed = 0
     for exc in exchanges:
         try:
             if hasattr(kis, "inquire_ccnl"):
@@ -240,14 +293,28 @@ def _fetch_overseas_daily_orders(
                     ovrs_excg_cd=exc,
                 )
                 if df is not None and not df.empty:
+                    status_by_exchange[exc] = "OK"
                     for _, row in df.iterrows():
                         o = _normalize_order_row(row, overseas=True)
                         if o:
                             o["ovrs_excg_cd"] = exc
                             orders.append(o)
+                            exe = _safe_int(o.get("executed_qty", 0))
+                            qty = _safe_int(o.get("quantity", 0))
+                            if o.get("cancelled") and exe <= 0:
+                                canceled += 1
+                            elif exe <= 0:
+                                failed += 1
+                            elif qty > 0 and exe < qty:
+                                partial += 1
+                            elif exe > 0:
+                                filled += 1
+                else:
+                    status_by_exchange[exc] = "EMPTY"
         except Exception as e:
             msg = f"{exc}: {e}"
             failures.append(msg)
+            status_by_exchange[exc] = "FAILED"
             logger.warning("inquire_ccnl(%s) 조회 실패: %s", exc, e)
 
     if failures and not orders:
@@ -261,7 +328,24 @@ def _fetch_overseas_daily_orders(
     by_id: Dict[str, Dict[str, Any]] = {}
     for o in orders:
         by_id[o["order_id"]] = o
-    return by_id
+
+    tr_id = _kis_tr_id_ccnl(env)
+    all_failed = bool(exchanges) and all(status_by_exchange.get(e) == "FAILED" for e in exchanges)
+    evidence = {
+        "endpoint": CCNL_ENDPOINT,
+        "expected_tr_ids": ["TTTS3035R", "VTTS3035R"],
+        "observed_tr_ids": [tr_id],
+        "exchange_coverage": [e for e in exchanges if status_by_exchange.get(e) in ("OK", "EMPTY")],
+        "status_by_exchange": status_by_exchange,
+        "order_count": len(orders),
+        "filled_order_count": filled,
+        "partial_order_count": partial,
+        "canceled_order_count": canceled,
+        "failed_order_count": failed,
+        "all_exchanges_failed": all_failed,
+        "status": _exchange_status_from_results(exchanges, status_by_exchange),
+    }
+    return by_id, evidence
 
 
 def _fetch_open_orders_inquire_orders(
@@ -319,11 +403,11 @@ def _fetch_open_orders_inquire_orders(
 
 
 def _fetch_open_orders(
-    kis: KIS, *, start_ymd: Optional[str] = None, end_ymd: Optional[str] = None
-) -> Dict[str, Dict[str, Any]]:
+    kis: KIS, *, start_ymd: Optional[str] = None, end_ymd: Optional[str] = None, env: str = "vps"
+) -> Tuple[Dict[str, Dict[str, Any]], Optional[Dict[str, Any]]]:
     """MARKET에 따라 KIS 미체결 주문 조회."""
     if is_us_market():
-        by_id = _fetch_overseas_open_orders(kis)
+        by_id, evidence = _fetch_overseas_open_orders(kis, env=env)
         _db_dbg_log(
             "reconciler.fetch_overseas_nccs.OK",
             api="inquire-nccs",
@@ -331,21 +415,22 @@ def _fetch_open_orders(
             unique_order_ids=len(by_id),
             sample_ids=list(by_id.keys())[:8],
         )
-        return by_id
-    return _fetch_open_orders_inquire_orders(kis, start_ymd=start_ymd, end_ymd=end_ymd)
+        return by_id, evidence
+    return _fetch_open_orders_inquire_orders(kis, start_ymd=start_ymd, end_ymd=end_ymd), None
 
 
 def _fetch_daily_orders(
     kis: KIS, *, start_ymd: str, end_ymd: Optional[str] = None,
     since_dt: Optional[datetime] = None, until_dt: Optional[datetime] = None,
-) -> Dict[str, Dict[str, Any]]:
+    env: str = "vps",
+) -> Tuple[Dict[str, Dict[str, Any]], Optional[Dict[str, Any]]]:
     """MARKET에 따라 KIS 일자별 주문 조회."""
     end = end_ymd or start_ymd
     if is_us_market():
         if since_dt is not None and until_dt is not None:
             start_ymd, end = kst_window_to_us_order_dates(since_dt, until_dt)
-        return _fetch_overseas_daily_orders(kis, start_ymd=start_ymd, end_ymd=end)
-    return _fetch_daily_orders_domestic(kis, start_ymd=start_ymd, end_ymd=end)
+        return _fetch_overseas_daily_orders(kis, start_ymd=start_ymd, end_ymd=end, env=env)
+    return _fetch_daily_orders_domestic(kis, start_ymd=start_ymd, end_ymd=end), None
 
 
 def _fetch_daily_orders_domestic(
@@ -455,7 +540,9 @@ def backfill_orphan_order_ids(*, since_hours: int = 24, limit: int = 200) -> Dic
     orphans = recorder.get_orphan_trade_records(since_ts=since_ts, limit=limit)
     logger.info(f"orphan backfill 대상 {len(orphans)}건 (since={since_ts})")
 
-    daily_orders = _fetch_daily_orders(kis, start_ymd=start_ymd, end_ymd=end_ymd, since_dt=since_dt, until_dt=now_kst)
+    daily_orders, _ = _fetch_daily_orders(
+        kis, start_ymd=start_ymd, end_ymd=end_ymd, since_dt=since_dt, until_dt=now_kst, env=env,
+    )
     logger.info(f"KIS 일자별 주문(daily) backfill 조회: {len(daily_orders)}건 ({start_ymd}~{end_ymd})")
 
     updated = 0
@@ -499,6 +586,37 @@ def backfill_orphan_order_ids(*, since_hours: int = 24, limit: int = 200) -> Dic
     }
     logger.info(f"orphan backfill 결과: {summary}")
     return summary
+
+
+def order_reconcile_evidence_paths(
+    market: str,
+    trade_date: str,
+    output_dir: Optional[Path] = None,
+) -> Tuple[Path, Path]:
+    base = output_dir or OUTPUT_DIR
+    base.mkdir(parents=True, exist_ok=True)
+    dated = base / f"order_reconcile_{market}_{trade_date}.json"
+    latest = base / f"order_reconcile_latest_{market}.json"
+    return dated, latest
+
+
+def save_order_reconcile_evidence(
+    payload: Dict[str, Any],
+    *,
+    market: str,
+    trade_date: str,
+    output_dir: Optional[Path] = None,
+) -> Optional[Path]:
+    try:
+        dated_path, latest_path = order_reconcile_evidence_paths(market, trade_date, output_dir)
+        for path in (dated_path, latest_path):
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+        logger.info("[ORDER_RECONCILE_EVIDENCE_SAVED] path=%s", dated_path)
+        return dated_path
+    except Exception as e:
+        logger.error("[ORDER_RECONCILE_EVIDENCE_SAVE_FAILED] reason=%s", str(e)[:300])
+        return None
 
 
 def reconcile_open_orders(*, since_hours: int = 24, limit: int = 500) -> Dict[str, int]:
@@ -557,13 +675,16 @@ def reconcile_open_orders(*, since_hours: int = 24, limit: int = 500) -> Dict[st
     logger.info(f"리컨실 대상(open) {len(open_rows)}건 (since={since_ts})")
 
     today = end_ymd
-    open_orders = _fetch_open_orders(kis, start_ymd=start_ymd, end_ymd=end_ymd)
+    open_orders, nccs_evidence = _fetch_open_orders(
+        kis, start_ymd=start_ymd, end_ymd=end_ymd, env=env,
+    )
     open_api = "inquire_nccs" if is_us_market() else "inquire_orders"
     logger.info(
         f"KIS 미체결({open_api}) 조회: {len(open_orders)}건 "
         f"({start_ymd}~{end_ymd})"
     )
     daily_orders: Optional[Dict[str, Dict[str, Any]]] = None
+    ccnl_evidence: Optional[Dict[str, Any]] = None
 
     updated = 0
     to_executed = 0
@@ -592,12 +713,13 @@ def reconcile_open_orders(*, since_hours: int = 24, limit: int = 500) -> Dict[st
         # 2) 누락이면 daily를 1회만 로드해서 보완
         if not kis_o:
             if daily_orders is None:
-                daily_orders = _fetch_daily_orders(
+                daily_orders, ccnl_evidence = _fetch_daily_orders(
                     kis,
                     start_ymd=start_ymd,
                     end_ymd=end_ymd,
                     since_dt=since_dt,
                     until_dt=now_kst,
+                    env=env,
                 )
                 daily_api = "inquire_ccnl" if is_us_market() else "inquire_daily_order"
                 logger.info(
@@ -745,6 +867,49 @@ def reconcile_open_orders(*, since_hours: int = 24, limit: int = 500) -> Dict[st
     summary.update(backfill_summary)
     logger.info(f"리컨실+backfill 통합 결과: {summary}")
     _db_dbg_log("reconciler.done_with_backfill", **summary)
+
+    if is_us_market():
+        if ccnl_evidence is None:
+            daily_orders, ccnl_evidence = _fetch_daily_orders(
+                kis,
+                start_ymd=start_ymd,
+                end_ymd=end_ymd,
+                since_dt=since_dt,
+                until_dt=now_kst,
+                env=env,
+            )
+        market = os.getenv("MARKET", "SP500")
+        db_with_id = [
+            r for r in open_rows if str(r.get("order_id") or "").strip()
+        ]
+        matched = 0
+        if daily_orders and db_with_id:
+            matched = sum(
+                1 for r in db_with_id if str(r.get("order_id")) in daily_orders
+            )
+        coverage = round(matched / len(db_with_id), 4) if db_with_id else 1.0
+        evidence_payload = {
+            "schema_version": KIS_EVIDENCE_SCHEMA_VERSION,
+            "source": "kis_endpoint",
+            "market": market,
+            "trade_date": end_ymd,
+            "generated_at_kst": now_kst.isoformat(),
+            "nccs": nccs_evidence or {},
+            "ccnl": ccnl_evidence or {},
+            "db_reconcile": {
+                "checked_trade_records": len(open_rows),
+                "updated_trade_records": updated,
+                "db_vs_ccnl_mismatch_count": still_missing_after_daily,
+                "order_id_coverage_rate": coverage,
+            },
+            "findings": [],
+        }
+        save_order_reconcile_evidence(
+            evidence_payload,
+            market=market,
+            trade_date=end_ymd,
+        )
+
     return summary
 
 

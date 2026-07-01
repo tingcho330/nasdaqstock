@@ -47,6 +47,7 @@ PATTERNS_TO_CLEAN = {
 
 # 보존 회차(최 recent N일 logs)
 LOG_RETAIN_DAYS = int(os.getenv("LOG_RETAIN_DAYS", "14"))
+EVIDENCE_RETAIN_TRADING_DAYS = int(os.getenv("EVIDENCE_RETAIN_TRADING_DAYS", "20"))
 
 # 절대 보존(삭제 금지) 파일/경로
 PROTECT_FILES = {
@@ -59,7 +60,9 @@ PROTECT_DIRS = {
 }
 PROTECT_GLOBS = (
     "account_snapshot_*.json",
+    "account_snapshot_latest_*.json",
     "order_reconcile_*.json",
+    "order_reconcile_latest_*.json",
 )
 
 # 드라이런(미삭제) 모드: 1이면 목록/로그만 남기고 실제 삭제 안함
@@ -115,6 +118,20 @@ def _is_protected(p: Path) -> bool:
             if age_days <= LOG_RETAIN_DAYS:
                 return True
         except Exception:
+            return True
+    if p.suffix == ".json" and (
+        p.name.startswith("account_snapshot_") or p.name.startswith("order_reconcile_")
+    ):
+        date_hms = _extract_date_hms(p.name)
+        if date_hms:
+            try:
+                file_date = datetime.strptime(date_hms[:8], "%Y%m%d").replace(tzinfo=KST)
+                age_days = (datetime.now(KST) - file_date).days
+                if age_days <= EVIDENCE_RETAIN_TRADING_DAYS:
+                    return True
+            except Exception:
+                return True
+        if p.name.endswith("_latest.json") or "_latest_" in p.name:
             return True
     return False
 
