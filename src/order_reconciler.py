@@ -345,7 +345,7 @@ def _fetch_overseas_daily_orders(
         "all_exchanges_failed": all_failed,
         "status": _exchange_status_from_results(exchanges, status_by_exchange),
         "query_start_date": start_ymd,
-        "query_end_date": end,
+        "query_end_date": end_ymd,
     }
     return by_id, evidence
 
