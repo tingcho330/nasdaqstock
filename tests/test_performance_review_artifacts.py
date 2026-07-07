@@ -20,6 +20,7 @@ os.environ.setdefault("OUTPUT_DIR", str(ROOT / "output_test"))
 from performance_review import (  # noqa: E402
     ReviewArtifacts,
     _check_stale_artifacts,
+    _collect_scoped_stale_artifact_paths,
     build_kis_endpoint_review,
     collect_artifacts,
     extract_artifact_temporal_metadata,
@@ -75,7 +76,7 @@ def test_list_item_updated_at_as_generated_at(tmp_path):
 
 
 def test_empty_list_finding(tmp_path):
-    path = tmp_path / "screener_holdings_20260701_pm_SP500.json"
+    path = tmp_path / "screener_holdings_20260707_pm_SP500.json"
     path.write_text("[]", encoding="utf-8")
     art = _artifacts(tmp_path)
     findings = _check_stale_artifacts(art, strict=True)
@@ -84,7 +85,7 @@ def test_empty_list_finding(tmp_path):
 
 
 def test_unsupported_root_finding(tmp_path):
-    path = tmp_path / "screener_candidates_20260701_pm_SP500.json"
+    path = tmp_path / "screener_candidates_20260707_pm_SP500.json"
     path.write_text('"not-a-dict-or-list"', encoding="utf-8")
     art = _artifacts(tmp_path)
     findings = _check_stale_artifacts(art, strict=True)
@@ -158,3 +159,99 @@ def test_run_performance_review_no_analysis_failed(tmp_path, monkeypatch):
     assert result.context.get("review_error") is None
     report = review_out / "performance_review_SP500_daily_20260707.json"
     assert report.exists()
+
+
+def test_daily_review_ignores_out_of_scope_market_state(tmp_path):
+    """20260707 daily review는 202606xx market_state에 ARTIFACT_DATE_STALE를 발생시키지 않음."""
+    for day in ("20260602", "20260615", "20260630"):
+        (tmp_path / f"market_state_{day}_pm_SP500.json").write_text(
+            json.dumps({"trade_date": day, "session": "pm", "market": "SP500"}),
+            encoding="utf-8",
+        )
+    (tmp_path / "market_state_20260707_pm_SP500.json").write_text(
+        json.dumps({
+            "trade_date": "20260707",
+            "session": "pm",
+            "market": "SP500",
+            "generated_at_kst": "2026-07-07T10:00:00+09:00",
+        }),
+        encoding="utf-8",
+    )
+    art = _artifacts(tmp_path, review_date="20260707")
+    dated, latest = _collect_scoped_stale_artifact_paths(art)
+    assert len(dated) == 1
+    assert dated[0].name == "market_state_20260707_pm_SP500.json"
+    findings = _check_stale_artifacts(art, strict=True)
+    titles = [f.title for f in findings]
+    assert "ARTIFACT_DATE_STALE" not in titles
+    assert all("202606" not in (f.evidence or "") for f in findings)
+
+
+def test_weekly_review_only_checks_period_range(tmp_path):
+    for day in ("20260628", "20260629", "20260630", "20260701", "20260707"):
+        (tmp_path / f"market_state_{day}_pm_SP500.json").write_text(
+            json.dumps({
+                "trade_date": day,
+                "session": "pm",
+                "market": "SP500",
+                "generated_at_kst": f"2026-{day[4:6]}-{day[6:8]}T10:00:00+09:00",
+            }),
+            encoding="utf-8",
+        )
+    art = ReviewArtifacts(
+        market="SP500",
+        start_date="20260701",
+        review_date="20260707",
+        period="weekly",
+        session="pm",
+        output_dir=tmp_path,
+        db_path=tmp_path / "trading_data.db",
+        account_snapshot_paths=[],
+        order_reconcile_paths=[],
+        trade_rows=[],
+        logs_text="",
+    )
+    dated, _ = _collect_scoped_stale_artifact_paths(art)
+    dated_names = {p.name for p in dated}
+    assert "market_state_20260628_pm_SP500.json" not in dated_names
+    assert "market_state_20260630_pm_SP500.json" not in dated_names
+    assert "market_state_20260701_pm_SP500.json" in dated_names
+    assert "market_state_20260707_pm_SP500.json" in dated_names
+    findings = _check_stale_artifacts(art, strict=True)
+    assert "ARTIFACT_DATE_STALE" not in {f.title for f in findings}
+
+
+def test_latest_artifact_mismatch_single_finding(tmp_path):
+    path = tmp_path / "market_state_latest_SP500.json"
+    path.write_text(
+        json.dumps({
+            "trade_date": "20260630",
+            "session": "pm",
+            "market": "SP500",
+            "generated_at_kst": "2026-06-30T10:00:00+09:00",
+        }),
+        encoding="utf-8",
+    )
+    art = _artifacts(tmp_path, review_date="20260707")
+    findings = _check_stale_artifacts(art, strict=True)
+    mismatch = [f for f in findings if f.title == "LATEST_ARTIFACT_DATE_MISMATCH"]
+    assert len(mismatch) == 1
+    assert "market_state_latest_SP500.json" in mismatch[0].evidence
+
+
+def test_latest_artifact_in_scope_used_normally(tmp_path):
+    path = tmp_path / "market_state_latest_SP500.json"
+    path.write_text(
+        json.dumps({
+            "trade_date": "20260707",
+            "session": "pm",
+            "market": "SP500",
+            "generated_at_kst": "2026-07-07T10:00:00+09:00",
+        }),
+        encoding="utf-8",
+    )
+    art = _artifacts(tmp_path, review_date="20260707")
+    findings = _check_stale_artifacts(art, strict=True)
+    titles = {f.title for f in findings}
+    assert "LATEST_ARTIFACT_DATE_MISMATCH" not in titles
+    assert "ARTIFACT_DATE_STALE" not in titles

@@ -89,6 +89,7 @@ STANDARD_FINDINGS = {
     "ACCOUNT_SYNC_MISMATCH",
     "ACCOUNT_SNAPSHOT_INVALID",
     "ARTIFACT_DATE_STALE",
+    "LATEST_ARTIFACT_DATE_MISMATCH",
     "ARTIFACT_EMPTY_LIST",
     "ARTIFACT_UNSUPPORTED_JSON_ROOT",
     "ARTIFACT_PARSE_FAILED",
@@ -949,98 +950,203 @@ def _check_snapshot_date_findings(
     return findings
 
 
-def _check_stale_artifacts(artifacts: ReviewArtifacts, strict: bool) -> List[ReviewFinding]:
-    findings: List[ReviewFinding] = []
-    review_date = artifacts.review_date
-    stale_sev = "WARN" if strict else "INFO"
-    patterns = ("market_state_*", "gpt_trades_*", "screener_*", "collected_news_*")
+_STALE_ARTIFACT_GLOB_PATTERNS = ("market_state_*", "gpt_trades_*", "screener_*", "collected_news_*")
 
-    for pattern in patterns:
-        for path in artifacts.output_dir.glob(pattern):
+
+def _review_scope_dates(artifacts: ReviewArtifacts) -> Set[str]:
+    if artifacts.period == "daily":
+        return {artifacts.review_date}
+    return set(_dates_in_range(artifacts.start_date, artifacts.review_date))
+
+
+def _is_latest_artifact_path(path: Path) -> bool:
+    return "_latest" in path.stem.lower()
+
+
+def _artifact_kind_key(path: Path) -> str:
+    stem = path.stem.lower()
+    if "_latest" in stem:
+        return stem.split("_latest")[0]
+    return re.sub(r"_\d{8}.*$", "", stem) or stem
+
+
+def _artifact_matches_review_market(path: Path, market: str) -> bool:
+    artifact_market = _parse_artifact_filename(path).get("market", "").upper()
+    return not artifact_market or artifact_market == market.upper()
+
+
+def _collect_scoped_stale_artifact_paths(
+    artifacts: ReviewArtifacts,
+) -> Tuple[List[Path], Dict[str, Path]]:
+    """review date/period·market 범위 안의 dated artifact와 latest(종류별 1개)만 수집."""
+    scope = _review_scope_dates(artifacts)
+    dated_paths: List[Path] = []
+    latest_by_kind: Dict[str, Path] = {}
+
+    for pattern in _STALE_ARTIFACT_GLOB_PATTERNS:
+        for path in sorted(artifacts.output_dir.glob(pattern)):
             if not path.is_file() or path.suffix != ".json":
                 continue
-            src = str(path)
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    payload = json.load(f)
-            except Exception as exc:
-                findings.append(make_finding(
-                    "ARTIFACT_PARSE_FAILED", stale_sev, "",
-                    f"{path.name}: {str(exc)[:120]}",
-                    "artifact JSON 파싱 실패", "파일 손상·인코딩 확인",
-                    category="DATA_QUALITY",
-                    evidence_source_file=src,
-                ))
+            if not _artifact_matches_review_market(path, artifacts.market):
                 continue
-
-            if payload is None:
+            if _is_latest_artifact_path(path):
+                kind = _artifact_kind_key(path)
+                latest_by_kind.setdefault(kind, path)
                 continue
+            file_date = _parse_artifact_filename(path).get("date", "")
+            if file_date and file_date in scope:
+                dated_paths.append(path)
 
-            try:
-                meta = extract_artifact_temporal_metadata(path, payload)
-            except Exception as exc:
-                findings.append(make_finding(
-                    "ARTIFACT_PARSE_FAILED", stale_sev, "",
-                    f"{path.name}: metadata extract failed: {str(exc)[:120]}",
-                    "artifact 메타데이터 추출 실패", "파일 구조 확인",
-                    category="DATA_QUALITY",
-                    evidence_source_file=src,
-                ))
-                continue
+    return dated_paths, latest_by_kind
 
-            root_type = meta.get("root_type")
-            if root_type == "other":
-                findings.append(make_finding(
-                    "ARTIFACT_UNSUPPORTED_JSON_ROOT", "WARN", "",
-                    f"{path.name}: root_type={root_type}",
-                    "지원하지 않는 JSON root", "dict/list artifact로 저장 확인",
-                    category="DATA_QUALITY",
-                    evidence_source_file=src,
-                    evidence_trade_date=str(meta.get("artifact_date") or ""),
-                    evidence_generated_at=str(meta.get("generated_at") or ""),
-                ))
-                continue
 
-            if root_type == "list" and int(meta.get("item_count") or 0) == 0:
-                findings.append(make_finding(
-                    "ARTIFACT_EMPTY_LIST", stale_sev, "",
-                    f"{path.name}: empty list root",
-                    "빈 list artifact", "스크리너/파이프라인 재실행",
-                    category="DATA_QUALITY",
-                    evidence_source_file=src,
-                    evidence_trade_date=str(meta.get("artifact_date") or ""),
-                ))
-                continue
+def _stale_artifact_findings_for_path(
+    path: Path,
+    *,
+    stale_sev: str,
+) -> List[ReviewFinding]:
+    findings: List[ReviewFinding] = []
+    src = str(path)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except Exception as exc:
+        findings.append(make_finding(
+            "ARTIFACT_PARSE_FAILED", stale_sev, "",
+            f"{path.name}: {str(exc)[:120]}",
+            "artifact JSON 파싱 실패", "파일 손상·인코딩 확인",
+            category="DATA_QUALITY",
+            evidence_source_file=src,
+        ))
+        return findings
 
-            artifact_date = str(meta.get("artifact_date") or "").strip()
-            generated_at = str(
+    if payload is None:
+        return findings
+
+    try:
+        meta = extract_artifact_temporal_metadata(path, payload)
+    except Exception as exc:
+        findings.append(make_finding(
+            "ARTIFACT_PARSE_FAILED", stale_sev, "",
+            f"{path.name}: metadata extract failed: {str(exc)[:120]}",
+            "artifact 메타데이터 추출 실패", "파일 구조 확인",
+            category="DATA_QUALITY",
+            evidence_source_file=src,
+        ))
+        return findings
+
+    root_type = meta.get("root_type")
+    if root_type == "other":
+        findings.append(make_finding(
+            "ARTIFACT_UNSUPPORTED_JSON_ROOT", "WARN", "",
+            f"{path.name}: root_type={root_type}",
+            "지원하지 않는 JSON root", "dict/list artifact로 저장 확인",
+            category="DATA_QUALITY",
+            evidence_source_file=src,
+            evidence_trade_date=str(meta.get("artifact_date") or ""),
+            evidence_generated_at=str(meta.get("generated_at") or ""),
+        ))
+        return findings
+
+    if root_type == "list" and int(meta.get("item_count") or 0) == 0:
+        findings.append(make_finding(
+            "ARTIFACT_EMPTY_LIST", stale_sev, "",
+            f"{path.name}: empty list root",
+            "빈 list artifact", "스크리너/파이프라인 재실행",
+            category="DATA_QUALITY",
+            evidence_source_file=src,
+            evidence_trade_date=str(meta.get("artifact_date") or ""),
+        ))
+        return findings
+
+    artifact_date = str(meta.get("artifact_date") or "").strip()
+    generated_at = str(
+        meta.get("generated_at_kst") or meta.get("generated_at") or ""
+    ).strip()
+    generated_day = _date_yyyymmdd_from_iso(generated_at)
+
+    if artifact_date and generated_day and _calendar_day_gap(generated_day, artifact_date) >= 1:
+        findings.append(make_finding(
+            "ARTIFACT_DATE_STALE", stale_sev, "",
+            f"{path.name}: artifact_date={artifact_date}, generated={generated_day}",
+            "artifact 내부 날짜 stale", "파이프라인 재생성 확인",
+            category="DATA_QUALITY",
+            evidence_source_file=src,
+            evidence_trade_date=artifact_date,
+            evidence_generated_at=generated_at,
+        ))
+
+    return findings
+
+
+def _check_stale_artifacts(artifacts: ReviewArtifacts, strict: bool) -> List[ReviewFinding]:
+    findings: List[ReviewFinding] = []
+    stale_sev = "WARN" if strict else "INFO"
+    scope = _review_scope_dates(artifacts)
+    dated_paths, latest_by_kind = _collect_scoped_stale_artifact_paths(artifacts)
+
+    for path in dated_paths:
+        findings.extend(_stale_artifact_findings_for_path(path, stale_sev=stale_sev))
+
+    for _kind, path in sorted(latest_by_kind.items()):
+        src = str(path)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+        except Exception as exc:
+            findings.append(make_finding(
+                "ARTIFACT_PARSE_FAILED", stale_sev, "",
+                f"{path.name}: {str(exc)[:120]}",
+                "artifact JSON 파싱 실패", "파일 손상·인코딩 확인",
+                category="DATA_QUALITY",
+                evidence_source_file=src,
+            ))
+            continue
+
+        if payload is None:
+            continue
+
+        try:
+            meta = extract_artifact_temporal_metadata(path, payload)
+        except Exception as exc:
+            findings.append(make_finding(
+                "ARTIFACT_PARSE_FAILED", stale_sev, "",
+                f"{path.name}: metadata extract failed: {str(exc)[:120]}",
+                "artifact 메타데이터 추출 실패", "파일 구조 확인",
+                category="DATA_QUALITY",
+                evidence_source_file=src,
+            ))
+            continue
+
+        effective_date = str(meta.get("artifact_date") or "").strip()
+        if isinstance(payload, dict):
+            effective_date = (
+                effective_date
+                or _extract_evidence_date(payload)
+                or str(payload.get("date") or "").strip()
+            )
+
+        if effective_date in scope:
+            findings.extend(_stale_artifact_findings_for_path(path, stale_sev=stale_sev))
+            continue
+
+        findings.append(make_finding(
+            "LATEST_ARTIFACT_DATE_MISMATCH",
+            stale_sev,
+            "",
+            (
+                f"{path.name}: artifact_date={effective_date or 'N/A'}, "
+                f"review_scope={artifacts.start_date}~{artifacts.review_date}"
+            ),
+            "latest artifact 날짜가 review 범위 밖",
+            "해당 review date/period artifact 재생성 확인",
+            category="DATA_QUALITY",
+            evidence_source_file=src,
+            evidence_trade_date=effective_date,
+            evidence_generated_at=str(
                 meta.get("generated_at_kst") or meta.get("generated_at") or ""
-            ).strip()
-            generated_day = _date_yyyymmdd_from_iso(generated_at)
-
-            if artifact_date and review_date:
-                if _calendar_day_gap(review_date, artifact_date) >= 1:
-                    findings.append(make_finding(
-                        "ARTIFACT_DATE_STALE", stale_sev, "",
-                        f"{path.name}: artifact_date={artifact_date}, review_date={review_date}",
-                        "리뷰일과 artifact 날짜 불일치", "해당일 artifact 재생성 확인",
-                        category="DATA_QUALITY",
-                        evidence_source_file=src,
-                        evidence_trade_date=artifact_date,
-                        evidence_generated_at=generated_at,
-                    ))
-                    continue
-
-            if artifact_date and generated_day and _calendar_day_gap(generated_day, artifact_date) >= 1:
-                findings.append(make_finding(
-                    "ARTIFACT_DATE_STALE", stale_sev, "",
-                    f"{path.name}: artifact_date={artifact_date}, generated={generated_day}",
-                    "artifact 내부 날짜 stale", "파이프라인 재생성 확인",
-                    category="DATA_QUALITY",
-                    evidence_source_file=src,
-                    evidence_trade_date=artifact_date,
-                    evidence_generated_at=generated_at,
-                ))
+            ),
+        ))
 
     return findings
 
