@@ -218,36 +218,84 @@ def build_account_snapshot_evidence_payload(
     *,
     market: str,
     session: Optional[str] = None,
+    pipeline_context_source: Optional[str] = None,
+    generated_at_kst: Optional[str] = None,
 ) -> Dict[str, Any]:
     """KIS endpoint 요약 evidence (raw 응답·민감정보 제외)."""
     ep = snapshot.endpoint_evidence or {}
     cash = snapshot.cash_map or {}
-    available = _safe_float(cash.get("available_cash") or cash.get("ord_psbl_frcr_amt"))
-    total_asset = _safe_float(cash.get("tot_evlu_amt_usd") or cash.get("tot_evlu_amt"))
-    holdings_val = sum(_safe_float(h.get("evlu_amt")) for h in snapshot.holdings or [] if _safe_int(h.get("hldg_qty")) > 0)
+    available = _safe_float(
+        cash.get("available_cash_usd")
+        or cash.get("available_cash")
+        or cash.get("ord_psbl_frcr_amt")
+    )
+    holdings_val = round(
+        sum(
+            _safe_float(h.get("evlu_amt"))
+            for h in snapshot.holdings or []
+            if _safe_int(h.get("hldg_qty")) > 0
+        ),
+        2,
+    )
+    if holdings_val <= 0:
+        holdings_val = _safe_float(cash.get("holdings_value_usd"))
+    computed_total = round(available + holdings_val, 2)
+    total_asset = _safe_float(cash.get("total_asset_usd") or cash.get("tot_evlu_amt_usd"))
+    if total_asset <= 0:
+        total_asset = computed_total
+    available_krw = _safe_float(cash.get("available_cash_krw"))
+    total_asset_krw = _safe_float(cash.get("total_asset_krw") or cash.get("tot_evlu_amt_krw"))
+    holdings_val_krw = _safe_float(cash.get("holdings_value_krw"))
+    krw_cash = _safe_float(cash.get("krw_cash"))
     open_sell = snapshot.open_sell_order_count()
     open_buy = max(0, len(snapshot.open_orders or []) - open_sell)
+    snapshot_ts = snapshot.snapshot_ts or datetime.now(KST).isoformat()
+    gen_at = generated_at_kst or snapshot_ts
+    bal_ep = ep.get("balance") or {}
+    exchange_coverage = list(bal_ep.get("exchange_coverage") or snapshot.exchange_codes or [])
+    holding_exchange_coverage = sorted({
+        str(h.get("ovrs_excg_cd") or "").upper()
+        for h in snapshot.holdings or []
+        if str(h.get("ovrs_excg_cd") or "").strip()
+    })
     return _sanitize_evidence_value({
         "schema_version": KIS_EVIDENCE_SCHEMA_VERSION,
         "source": "kis_endpoint",
         "market": market,
         "trade_date": snapshot.trade_date,
         "session": session,
-        "snapshot_ts_kst": snapshot.snapshot_ts or datetime.now(KST).isoformat(),
+        "snapshot_ts_kst": snapshot_ts,
+        "pipeline_context_source": pipeline_context_source,
+        "generated_at_kst": gen_at,
         "valid": snapshot.valid,
         "error": snapshot.error or snapshot.invalid_reason or None,
+        "endpoint_evidence": ep,
         "endpoints": ep,
         "holdings_count": snapshot.holding_count,
         "tickers": list(snapshot.tickers or []),
-        "holdings_summary": _holdings_summary(snapshot.holdings, market),
-        "holdings_value_usd": round(holdings_val, 2),
+        "exchange_coverage": exchange_coverage,
+        "holding_exchange_coverage": holding_exchange_coverage,
+        "holdings_value_usd": holdings_val,
         "available_cash_usd": round(available, 2),
         "total_asset_usd": round(total_asset, 2),
+        "available_cash_krw": round(available_krw, 2),
+        "total_asset_krw": round(total_asset_krw, 2),
+        "holdings_value_krw": round(holdings_val_krw, 2),
+        "krw_cash": round(krw_cash, 2),
         "cash_map": {
             "USD": {
                 "available_cash": round(available, 2),
+                "total_asset": round(total_asset, 2),
+                "holdings_value": holdings_val,
                 "currency": "USD",
-            }
+            },
+            "KRW": {
+                "available_cash": round(available_krw, 2),
+                "total_asset": round(total_asset_krw, 2),
+                "holdings_value": round(holdings_val_krw, 2),
+                "krw_cash": round(krw_cash, 2),
+                "currency": "KRW",
+            },
         },
         "sell_pending_qty_by_ticker": dict(snapshot.sell_pending_qty_by_ticker or {}),
         "sellable_qty_by_ticker": dict(snapshot.sellable_qty_by_ticker or {}),
@@ -281,10 +329,18 @@ def save_account_snapshot_evidence(
     market: str,
     session: Optional[str] = None,
     output_dir: Optional[Path] = None,
+    pipeline_context_source: Optional[str] = None,
+    generated_at_kst: Optional[str] = None,
 ) -> Optional[Path]:
     """AccountSnapshot KIS endpoint evidence JSON 저장."""
     try:
-        payload = build_account_snapshot_evidence_payload(snapshot, market=market, session=session)
+        payload = build_account_snapshot_evidence_payload(
+            snapshot,
+            market=market,
+            session=session,
+            pipeline_context_source=pipeline_context_source,
+            generated_at_kst=generated_at_kst,
+        )
         dated_path, latest_path = account_snapshot_evidence_paths(
             market, snapshot.trade_date, session, output_dir,
         )

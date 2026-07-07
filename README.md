@@ -70,11 +70,11 @@
 - **EmergencyDrop·최소보유** — `emergency_drop_pct` **-13%** 급락 시 `min_holding_hours`(336h=**14일**) **예외** 즉시매도. 그 외 **전량·손절·RSI 등**은 매수일 기준 14일(`min_holding_hours`)·`rotation.min_holding_days`(14일) 적용. **부분익절(`PartialProfit`)은 14일 면제** — 장중 `direct_execute_partial` 또는 `trader` 파이프라인. 1주×50%는 **전량 treat**
 - **파이프라인 AM/PM 세션** — KST 시각·US ET 거래일 기준 `session`(`am`/`pm`)·`trade_date`를 산출물 파일명·환경변수로 고정 (자정 넘김 시 스크리너↔GPT 짝 유지)
 - **주문 정합성** — `order_reconciler.py` (DB `pending`/`partial` → KIS 조회: US `inquire-nccs`/`inquire-ccnl`, KR `inquire-orders`/`inquire-daily-ccld`로 `executed` 갱신; orphan `order_id` backfill·`--backfill-only`; 실행 후 **`order_reconcile_*.json` evidence 저장**)
-- **KIS endpoint evidence JSON** — `trader`/`kis_overseas_account`가 매매 직전 `account_snapshot_{market}_{date}[_{session}].json` + `account_snapshot_latest_{market}.json` 저장 (balance/present/nccs endpoint 요약·`present_balance.call_count`·`sellable_qty_by_ticker`; raw 응답·계좌번호·토큰 **미저장**). `_clamp_sell_qty()` 결과는 `trade_records.structured_context`에 `sellable_qty_checked` 등으로 기록
+- **KIS endpoint evidence JSON** — `trader`/`kis_overseas_account`가 매매 직전 `account_snapshot_{market}_{trade_date}[_{session}].json` + `account_snapshot_latest_{market}.json` 저장. `trade_date`·`session`은 **`resolve_pipeline_context()`** 기준(stale `PIPELINE_TRADE_DATE` 무시). `endpoint_evidence`(balance/present/nccs)·USD/KRW 분리 필드·`present_balance.call_count`(USD 1회)·`krw_aux_call_count`·`exchange_coverage`/`holding_exchange_coverage`·`sellable_qty_by_ticker` 포함. raw 응답·계좌번호·토큰 **미저장**. `_clamp_sell_qty()` 결과는 `trade_records.structured_context`에 `sellable_qty_checked`·`account_snapshot_file`·`snapshot_ts_kst` 등으로 기록
 - **영속 손절/목표(positions)** — `recorder.py`의 `positions` 테이블에 `stop_price/target_price`를 저장하고, `trader.run_sell_logic()`에서 **positions 레벨을 우선 적용**
 - **회전 정책 모듈화** — `rotation_policy.py`에서 최소 보유일·Δscore·예산/경제성·페어 상한(`max_pairs_per_run`)을 공통 정책으로 적용
 - **비밀값 분리** — API 키·계좌·웹훅은 `config/.env`만 사용
-- **KIS 엔드포인트 performance review** — `performance_review.py`가 **KIS API를 직접 호출하지 않고** `trading_data.db`·`balance_*/summary_*`·`account_snapshot_*`·`order_reconcile_*`·로그만 사후 분석. **증거 부족 vs 실제 운영 오류** 구분, finding `category`·`evidence_source_file`, strict/일반 모드 severity 분리, Markdown/JSON 보고서
+- **KIS 엔드포인트 performance review** — `performance_review.py`가 **KIS API를 직접 호출하지 않고** `trading_data.db`·`balance_*/summary_*`·`account_snapshot_*`·`order_reconcile_*`·로그만 사후 분석. evidence 우선순위(dated → latest 일치 → fallback+WARN), **증거 부족 vs 실제 운영 오류** 구분, finding `category`·`evidence_source_file`·`evidence_trade_date`·`evidence_generated_at`, strict/일반 severity 분리, weekly/monthly **ccnl 기간 coverage** 검증, Markdown/JSON 보고서
 - **reviewer.py** — `performance_review.py` wrapper (기본: `--period monthly`). 레거시 GPT config 튜닝(`run_review()`) 함수는 모듈 내 유지
 
 ---
@@ -238,11 +238,11 @@ screener.py --market SP500              health_check.py (AAPL @ NAS)
 | `balance_*`, `summary_*` | `account.py` (US: `currency: "USD"`) |
 | `daily_balances/balance_{open\|close}_*.json` | `integrated_manager` 일일 요약 — `kis_summary`(US)·`total_balance`·`cash`·`holdings_value`·`holdings_detail[]`·`summary_file` |
 | `trading_data.db` | `recorder.py` (`trade_records`, `positions`) |
-| `account_snapshot_{market}_{date}[_{am\|pm}].json` | `trader` KIS 스냅샷 evidence (`schema_version` 1.0, endpoints·holdings 요약) |
-| `account_snapshot_latest_{market}.json` | 최신 account snapshot evidence |
-| `order_reconcile_{market}_{date}.json` | `order_reconciler` nccs/ccnl·db_reconcile evidence |
+| `account_snapshot_{market}_{trade_date}[_{am\|pm}].json` | `trader` KIS 스냅샷 evidence (`schema_version` 1.0, `endpoint_evidence`, USD/KRW 분리, `pipeline_context_source`) |
+| `account_snapshot_latest_{market}.json` | 최신 account snapshot evidence (리뷰 date 불일치 시 fallback+WARN) |
+| `order_reconcile_{market}_{trade_date}.json` | `order_reconciler` nccs/ccnl·`query_start_date`/`query_end_date`·db_reconcile evidence |
 | `order_reconcile_latest_{market}.json` | 최신 order reconcile evidence |
-| `performance_reviews/performance_review_{market}_{period}_{date}.{json,md}` | `performance_review.py` — KIS endpoint review·finding(category·evidence_source) |
+| `performance_reviews/performance_review_{market}_{period}_{date}.{json,md}` | `performance_review.py` — KIS endpoint review·finding(category·evidence 메타) |
 | `performance_reviews/latest_{market}_{period}.{json,md}` | 최신 performance review |
 | `cache/` (`kis_token.json`, `*.mst`, `*.pkl`) | KIS·스크리너 |
 
@@ -381,31 +381,38 @@ api/kis_auth.KIS (DomesticStock + OverseasStock)
 | 구분 | 설명 |
 |------|------|
 | API 호출 | **금지** — `trader`·`kis_overseas_account`·`order_reconciler`만 KIS 호출 |
-| evidence 우선순위 (nccs) | `order_reconcile_*.json` → latest → `account_snapshot_*.json` → 로그 |
-| evidence 우선순위 (ccnl) | `order_reconcile_*.json` → latest → 로그 → DB reconciled status |
+| account_snapshot 우선순위 | `account_snapshot_{market}_{review_date}_{session}.json` → `_{review_date}.json` → latest(trade_date 일치) → latest fallback + `ACCOUNT_SNAPSHOT_DATE_MISMATCH` |
+| order_reconcile (daily) | `order_reconcile_{market}_{date}.json` → latest(trade_date 일치 시) |
+| order_reconcile (weekly/monthly) | 기간 내 `order_reconcile_{market}_{date}.json` **전부** 수집 · ccnl `query_start_date`~`query_end_date`로 DB 주문 coverage 판정 |
+| balance coverage | `status_by_exchange` 기준 (OK/EMPTY 정상, `row_count=0`은 실패 아님) — 보유종목 거래소와 무관 |
+| present_balance | USD primary `call_count=1` 정상 · KRW 보조는 `krw_aux_call_count` · `total_asset_usd`는 USD만 |
 | 민감정보 | raw KIS 응답·계좌번호·token·appkey는 evidence/보고서에 **저장하지 않음** |
 
 | KIS TR | endpoint | 리뷰 목적 |
 |--------|----------|-----------|
-| `TTTS3012R` | inquire-balance | 보유수량·평균단가·거래소 coverage(NASD/NYSE/AMEX) |
-| `CTRP6504R` | inquire-present-balance | USD 현금·총자산·`call_count`(중복 합산 판정) |
+| `TTTS3012R` | inquire-balance | 보유수량·평균단가·`status_by_exchange`(NASD/NYSE/AMEX) |
+| `CTRP6504R` | inquire-present-balance | USD 현금·총자산·`call_count`/`krw_aux_call_count`(거래소 loop 아님) |
 | `TTTS3018R` | inquire-nccs | 미체결·pending sell·`sellable_qty` |
-| `TTTS3035R` | inquire-ccnl | ODNO 체결·DB vs KIS 상태 |
+| `TTTS3035R` | inquire-ccnl | ODNO 체결·DB vs KIS 상태·기간 coverage |
 | `TTTT1002U`/`TTTT1006U` | order | rt_cd/ODNO 품질·거절·가능수량/주문가능금액 초과 |
 
 **finding category:** `DATA_QUALITY` · `OPERATIONS` · `TRADE_EXECUTION` · `RISK`
 
-**strict vs 일반 모드:** evidence 부재(`KIS_NCCS_MISSING`, `KIS_CCNL_MISSING`, `ACCOUNT_SNAPSHOT_KIS_MISSING`, `KIS_EXECUTED_FILL_UNVERIFIED` 등)는 strict=WARN, 일반=INFO. 실제 운영 오류(`KIS_SELL_SENT_WITH_ZERO_SELLABLE_QTY`, `KIS_EXECUTED_WITHOUT_FILL` with ccnl evidence 등)는 strict 여부와 무관하게 ERROR/CRITICAL.
+**strict vs 일반 모드:** evidence 부재(`KIS_NCCS_MISSING`, `KIS_CCNL_MISSING`, `KIS_PRESENT_BALANCE_EVIDENCE_MISSING`, `KIS_EXECUTED_FILL_UNVERIFIED` 등)는 strict=WARN, 일반=INFO. 실제 운영 오류(`KIS_PRESENT_BALANCE_CURRENCY_MIXED`, `KIS_SELL_SENT_WITH_ZERO_SELLABLE_QTY`, ccnl evidence 있는 `KIS_EXECUTED_WITHOUT_FILL` 등)는 strict 여부와 무관하게 ERROR/CRITICAL.
 
 **대표 finding**
 
 | finding | 의미 |
 |---------|------|
-| `KIS_PRESENT_BALANCE_DUPLICATED_BY_EXCHANGE_LOOP` | `present_balance.call_count≥2` + 총자산 2배 이상 — CRITICAL |
-| `KIS_PRESENT_BALANCE_EVIDENCE_MISSING` | present evidence 없음 — WARN/INFO (값만 부풀면 ERROR/CRITICAL 유지) |
-| `KIS_EXECUTED_FILL_UNVERIFIED` | ccnl evidence 없이 executed — WARN/INFO (ERROR 아님) |
+| `KIS_BALANCE_PARTIAL_EXCHANGE_COVERAGE` | `status_by_exchange`에 FAILED/MISSING 거래소만 — NASD만 보유해도 NYSE/AMEX EMPTY면 미발생 |
+| `KIS_PRESENT_BALANCE_DUPLICATED_BY_EXCHANGE_LOOP` | `call_count≥2` + 총자산 2배 이상 — CRITICAL (`call_count=1`이면 미발생) |
+| `KIS_PRESENT_BALANCE_CURRENCY_MIXED` | `total_asset_usd`가 `available_cash_usd+holdings_value_usd` 대비 10배 이상 — ERROR |
+| `KIS_PRESENT_BALANCE_EVIDENCE_MISSING` | `call_count` evidence 없음 — WARN/INFO |
+| `KIS_CCNL_PERIOD_COVERAGE_INCOMPLETE` | weekly/monthly에서 ccnl query range가 DB 주문 기간 미커버 — coverage 부족 주문은 mismatch 아님 |
+| `KIS_EXECUTED_FILL_UNVERIFIED` | ccnl evidence 없이 executed — WARN/INFO |
 | `KIS_EXECUTED_WITHOUT_FILL` | ccnl evidence 있고 exec_qty=0 — ERROR |
-| `KIS_SELL_WITHOUT_SELLABLE_CHECK` | 로그·`structured_context`·snapshot evidence 모두 없을 때만 |
+| `ACCOUNT_SNAPSHOT_DATE_MISMATCH` | evidence `trade_date`·`snapshot_ts_kst` 불일치 |
+| `KIS_SELL_WITHOUT_SELLABLE_CHECK` | `structured_context.sellable_qty_checked`·snapshot evidence 없을 때만 |
 
 ```bash
 # Docker (사후 분석 — 파이프라인과 독립)
@@ -422,11 +429,16 @@ PYTHONPATH=src OUTPUT_DIR=./output CONFIG_PATH=config/config.json \
 
 PYTHONPATH=src OUTPUT_DIR=./output CONFIG_PATH=config/config.json \
   python -m performance_review --market SP500 --period monthly --no-discord
+
+# 단위 테스트 (로컬 venv)
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt pytest
+PYTHONPATH=src OUTPUT_DIR=./output_test .venv/bin/python -m pytest \
+  tests/test_performance_review_kis_endpoints.py -v
 ```
 
 `config.json` → `performance_review`: `strict_kis_endpoints`, `weekly_enabled`, `monthly_enabled`, `max_findings` 등.
 
-**테스트:** `tests/test_performance_review_kis_endpoints.py` (39 케이스 — evidence JSON·category·strict mode·ccnl/sellable 오탐 완화 등)
+**테스트:** `tests/test_performance_review_kis_endpoints.py` (18 케이스 — present call_count·USD/KRW 혼합·balance coverage·ccnl 기간 coverage·sellable evidence 등)
 
 ---
 
@@ -813,8 +825,9 @@ trading_bot_260530_NASDAQ/
 | `Marcap` (US) | 마스터 미제공 → 0, 시총 필터 스킵 |
 | `investor_flow` (US) | 0 (국내 수급 API 경로) |
 | `dynamic_cash_management` | ⚠️ 보유 0·현금 100% 시 가용금 축소 가능 → 설정 확인 |
-| KIS endpoint performance review | ✅ artifact/DB/log 기반 · evidence JSON · category · strict/일반 severity · API 직접 호출 없음 |
-| `tests/test_performance_review_kis_endpoints.py` | ✅ 39 케이스 (evidence·category·ccnl/sellable 오탐 완화·present call_count 등) |
+| KIS endpoint performance review | ✅ artifact/DB/log 기반 · evidence JSON · USD/KRW 분리 · ccnl 기간 coverage · API 직접 호출 없음 |
+| `resolve_pipeline_context` account_snapshot trade_date | ✅ stale `PIPELINE_TRADE_DATE` 대신 resolved trade_date 저장 |
+| `tests/test_performance_review_kis_endpoints.py` | ✅ 18 케이스 (present call_count·balance coverage·ccnl period·sellable evidence 등) |
 
 실전 미국 매매 전: **`vps` → health_check → account → 스크리너 → 뉴스 → GPT → (선택) trader** 순으로 검증하세요.  
 `trading_params.buy_enabled=false`로 매도·리스크만 먼저 검증하는 것을 권장합니다.

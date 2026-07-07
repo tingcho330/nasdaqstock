@@ -344,6 +344,8 @@ def _fetch_overseas_daily_orders(
         "failed_order_count": failed,
         "all_exchanges_failed": all_failed,
         "status": _exchange_status_from_results(exchanges, status_by_exchange),
+        "query_start_date": start_ymd,
+        "query_end_date": end,
     }
     return by_id, evidence
 
@@ -893,7 +895,10 @@ def reconcile_open_orders(*, since_hours: int = 24, limit: int = 500) -> Dict[st
             "source": "kis_endpoint",
             "market": market,
             "trade_date": end_ymd,
+            "evidence_trade_date": end_ymd,
             "generated_at_kst": now_kst.isoformat(),
+            "query_start_date": start_ymd,
+            "query_end_date": end_ymd,
             "nccs": nccs_evidence or {},
             "ccnl": ccnl_evidence or {},
             "db_reconcile": {

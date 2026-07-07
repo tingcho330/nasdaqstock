@@ -20,9 +20,6 @@ output/*
 *.log
 *.csv
 
-# Tests (local only)
-tests/
-
 # Python
 __pycache__/
 *.py[cod]

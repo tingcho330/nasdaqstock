@@ -450,6 +450,7 @@ def load_kis_account_snapshot(
     nccs_status: Dict[str, str] = {}
     nccs_row_count: Dict[str, int] = {}
     present_call_count = 0
+    krw_aux_call_count = 0
     present_failed = False
 
     try:
@@ -513,6 +514,7 @@ def load_kis_account_snapshot(
                 natn_cd="840",
                 tr_mket_cd="00",
             )
+            krw_aux_call_count = 1
         except Exception as krw_err:
             logger.debug("present_balance KRW(01) 스킵: %s", krw_err)
 
@@ -555,24 +557,58 @@ def load_kis_account_snapshot(
         holdings = holdings_df.to_dict("records") if not holdings_df.empty else []
         holdings = [h for h in holdings if _i(h.get("hldg_qty")) > 0]
         tickers = sorted({_norm_sym(h.get("pdno"), market) for h in holdings if h.get("pdno")})
+        holding_exchanges: List[str] = sorted({
+            str(h.get("ovrs_excg_cd") or "").upper()
+            for h in holdings
+            if str(h.get("ovrs_excg_cd") or "").strip()
+        })
 
         def _nt(x):
             return _norm_sym(x, market)
 
         sellable = build_sellable_qty_map(holdings, sell_pending, norm_ticker_fn=_nt)
 
+        holdings_value_usd = round(
+            sum(_f(h.get("evlu_amt")) for h in holdings if _i(h.get("hldg_qty")) > 0),
+            2,
+        )
+        available_cash_usd = round(
+            _f(summary.get("available_cash") or summary.get("ord_psbl_frcr_amt")),
+            2,
+        )
+        kis_usd_total = _f(summary.get("tot_evlu_amt_usd"))
+        computed_total_usd = round(available_cash_usd + holdings_value_usd, 2)
+        if kis_usd_total > 0:
+            denom = max(computed_total_usd, 1.0)
+            if abs(kis_usd_total - computed_total_usd) / denom <= 0.25:
+                total_asset_usd = round(kis_usd_total, 2)
+            else:
+                total_asset_usd = computed_total_usd
+        else:
+            total_asset_usd = computed_total_usd
+
+        available_cash_krw = round(_f(summary.get("available_cash_krw")), 2)
+        total_asset_krw = round(_f(summary.get("tot_evlu_amt_krw")), 2)
+        holdings_value_krw = round(_f(summary.get("holdings_value_krw")), 2)
+        krw_cash = round(_f(summary.get("krw_cash")), 2)
+
         cash_map: Dict[str, Any] = {
             "currency": "USD",
-            "available_cash": _i(summary.get("available_cash")),
+            "available_cash": int(round(available_cash_usd)),
             "dnca_tot_amt": _i(summary.get("dnca_tot_amt")),
             "ord_psbl_frcr_amt": _i(summary.get("ord_psbl_frcr_amt")),
             "prvs_rcdl_excc_amt": _i(summary.get("prvs_rcdl_excc_amt")),
-            "tot_evlu_amt_usd": _i(summary.get("tot_evlu_amt_usd")),
-            "available_cash_krw": _i(summary.get("available_cash_krw")),
-            "tot_evlu_amt_krw": _i(summary.get("tot_evlu_amt_krw")),
+            "tot_evlu_amt_usd": int(round(total_asset_usd)),
+            "available_cash_usd": available_cash_usd,
+            "holdings_value_usd": holdings_value_usd,
+            "total_asset_usd": total_asset_usd,
+            "available_cash_krw": available_cash_krw,
+            "tot_evlu_amt_krw": total_asset_krw,
+            "total_asset_krw": total_asset_krw,
+            "holdings_value_krw": holdings_value_krw,
+            "krw_cash": krw_cash,
         }
-        tot_evlu = sum(_f(h.get("evlu_amt")) for h in holdings) + float(cash_map["available_cash"])
-        cash_map["tot_evlu_amt"] = int(round(tot_evlu))
+        cash_map["tot_evlu_amt"] = int(round(total_asset_usd))
 
         snap.holdings = holdings
         snap.cash_map = cash_map
@@ -605,6 +641,12 @@ def load_kis_account_snapshot(
         elif not summary:
             present_status = "EMPTY"
 
+        open_sell_count = sum(
+            1 for o in open_orders if str(o.get("side", "")).lower() == "sell"
+        )
+        nccs_all_failed = bool(exc_list) and all(
+            nccs_status.get(e) == "FAILED" for e in exc_list
+        )
         snap.endpoint_evidence = {
             "balance": {
                 "endpoint": "/uapi/overseas-stock/v1/trading/inquire-balance",
@@ -619,15 +661,23 @@ def load_kis_account_snapshot(
                 "expected_tr_ids": ["CTRP6504R", "VTRP6504R"],
                 "observed_tr_ids": [tr_present],
                 "call_count": present_call_count,
+                "krw_aux_call_count": krw_aux_call_count,
                 "status": present_status,
+                "available_cash_usd": available_cash_usd,
+                "total_asset_usd": total_asset_usd,
+                "available_cash_krw": available_cash_krw,
+                "total_asset_krw": total_asset_krw,
             },
             "nccs": {
                 "endpoint": "/uapi/overseas-stock/v1/trading/inquire-nccs",
                 "expected_tr_ids": ["TTTS3018R", "VTTS3018R"],
                 "observed_tr_ids": [tr_nccs],
-                "exchange_coverage": [e for e, s in nccs_status.items() if s in ("OK", "EMPTY")],
+                "exchange_coverage": list(exc_list),
                 "status_by_exchange": nccs_status,
                 "open_orders_count": len(open_orders),
+                "open_sell_orders_count": open_sell_count,
+                "pending_sell_qty_by_ticker": dict(sell_pending),
+                "all_exchanges_failed": nccs_all_failed,
             },
         }
 

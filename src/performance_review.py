@@ -73,6 +73,7 @@ STANDARD_FINDINGS = {
     "KIS_SELLABLE_QTY_NEGATIVE",
     "KIS_CCNL_MISSING",
     "KIS_CCNL_ALL_EXCHANGES_FAILED",
+    "KIS_CCNL_PERIOD_COVERAGE_INCOMPLETE",
     "KIS_DB_CCNL_STATUS_MISMATCH",
     "KIS_ORDER_MISSING_ODNO",
     "KIS_ORDER_REJECTED",
@@ -84,8 +85,11 @@ STANDARD_FINDINGS = {
     "KIS_SELL_WITHOUT_SELLABLE_CHECK",
     "KIS_SELL_SENT_WITH_ZERO_SELLABLE_QTY",
     "ACCOUNT_SNAPSHOT_KIS_MISSING",
+    "ACCOUNT_SNAPSHOT_DATE_MISMATCH",
     "ACCOUNT_SYNC_MISMATCH",
     "ACCOUNT_SNAPSHOT_INVALID",
+    "ARTIFACT_DATE_STALE",
+    "LEGACY_SELL_WITHOUT_SELLABLE_EVIDENCE",
     "LOG_UNAVAILABLE",
 }
 
@@ -129,6 +133,10 @@ def normalize_finding_category(title: str, category: Optional[str] = None) -> st
         return "RISK"
     if t.startswith("ACCOUNT_SNAPSHOT_") or t == "ACCOUNT_SYNC_MISMATCH":
         return "OPERATIONS"
+    if t == "ARTIFACT_DATE_STALE":
+        return "DATA_QUALITY"
+    if t == "LEGACY_SELL_WITHOUT_SELLABLE_EVIDENCE":
+        return "RISK"
     return "OPERATIONS"
 
 
@@ -141,6 +149,9 @@ def make_finding(
     recommendation: str = "",
     category: Optional[str] = None,
     evidence_source_file: str = "",
+    evidence_trade_date: str = "",
+    evidence_generated_at: str = "",
+    latest_fallback_used: bool = False,
 ) -> "ReviewFinding":
     return ReviewFinding(
         title=title,
@@ -151,6 +162,9 @@ def make_finding(
         recommendation=recommendation,
         category=normalize_finding_category(title, category),
         evidence_source_file=evidence_source_file,
+        evidence_trade_date=evidence_trade_date,
+        evidence_generated_at=evidence_generated_at,
+        latest_fallback_used=latest_fallback_used,
     )
 
 
@@ -284,6 +298,9 @@ class ReviewFinding:
     recommendation: str = ""
     category: str = ""
     evidence_source_file: str = ""
+    evidence_trade_date: str = ""
+    evidence_generated_at: str = ""
+    latest_fallback_used: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         cat = self.category or normalize_finding_category(self.title)
@@ -296,7 +313,24 @@ class ReviewFinding:
             "impact": self.impact,
             "recommendation": self.recommendation,
             "evidence_source_file": self.evidence_source_file or None,
+            "evidence_trade_date": self.evidence_trade_date or None,
+            "evidence_generated_at": self.evidence_generated_at or None,
+            "latest_fallback_used": self.latest_fallback_used or None,
         }
+
+
+@dataclass
+class EvidenceSelection:
+    payload: Optional[Dict[str, Any]] = None
+    path: Optional[Path] = None
+    latest_fallback_used: bool = False
+    evidence_trade_date: str = ""
+    evidence_generated_at: str = ""
+    pipeline_context_source: str = ""
+
+    @property
+    def source_file(self) -> str:
+        return str(self.path) if self.path else ""
 
 
 @dataclass
@@ -406,6 +440,7 @@ class PerformanceReviewResult:
 @dataclass
 class ReviewArtifacts:
     market: str
+    start_date: str
     review_date: str
     period: str
     session: Optional[str]
@@ -525,71 +560,184 @@ def _load_json(path: Optional[Path]) -> Optional[Dict[str, Any]]:
         return None
 
 
-def _pick_evidence_file(
-    paths: List[Path],
-    *,
-    exact_name: str,
-    latest_name: str,
-    prefix: str,
-    market: str,
-    trade_date: str,
-) -> Optional[Path]:
-    for p in paths:
-        if p.name == exact_name:
-            return p
-    for p in paths:
-        if p.name == latest_name:
-            return p
-    dated_matches = [
-        p for p in paths
-        if p.name.startswith(f"{prefix}_{market}_") and trade_date in p.name
-    ]
-    if dated_matches:
-        return sorted(dated_matches, key=lambda x: x.stat().st_mtime, reverse=True)[0]
-    return None
+def _extract_evidence_date(payload: Optional[Dict[str, Any]]) -> str:
+    if not payload:
+        return ""
+    return str(
+        payload.get("trade_date")
+        or payload.get("evidence_trade_date")
+        or ""
+    ).strip()
 
 
-def load_order_reconcile_evidence(
-    artifacts: ReviewArtifacts,
-) -> Tuple[Optional[Dict[str, Any]], Optional[Path]]:
-    market = artifacts.market
-    td = artifacts.review_date
-    path = _pick_evidence_file(
-        artifacts.order_reconcile_paths,
-        exact_name=f"order_reconcile_{market}_{td}.json",
-        latest_name=f"order_reconcile_latest_{market}.json",
-        prefix="order_reconcile",
-        market=market,
-        trade_date=td,
-    )
-    return _load_json(path), path
+def _extract_evidence_generated_at(payload: Optional[Dict[str, Any]]) -> str:
+    if not payload:
+        return ""
+    return str(
+        payload.get("generated_at_kst")
+        or payload.get("snapshot_ts_kst")
+        or payload.get("generated_at")
+        or ""
+    ).strip()
+
+
+def _endpoint_evidence_block(payload: Optional[Dict[str, Any]], name: str) -> Dict[str, Any]:
+    if not payload:
+        return {}
+    ep = payload.get("endpoint_evidence") or payload.get("endpoints") or {}
+    if isinstance(ep, dict):
+        block = ep.get(name)
+        if isinstance(block, dict):
+            return block
+    legacy = payload.get(name)
+    return legacy if isinstance(legacy, dict) else {}
+
+
+def _date_yyyymmdd_from_iso(ts: str) -> str:
+    if not ts:
+        return ""
+    digits = re.sub(r"\D", "", ts[:19])
+    return digits[:8] if len(digits) >= 8 else ""
+
+
+def _calendar_day_gap(later_yyyymmdd: str, earlier_yyyymmdd: str) -> int:
+    if not later_yyyymmdd or not earlier_yyyymmdd:
+        return 0
+    try:
+        a = _parse_date(later_yyyymmdd)
+        b = _parse_date(earlier_yyyymmdd)
+        return abs((a - b).days)
+    except ValueError:
+        return 0
+
+
+def _dates_in_range(start: str, end: str) -> List[str]:
+    try:
+        cur = _parse_date(start)
+        stop = _parse_date(end)
+    except ValueError:
+        return []
+    out: List[str] = []
+    while cur <= stop:
+        out.append(cur.strftime("%Y%m%d"))
+        cur += timedelta(days=1)
+    return out
+
+
+def _reconcile_date_from_path(path: Path, market: str) -> str:
+    m = re.search(rf"order_reconcile_{re.escape(market)}_(\d{{8}})", path.name)
+    return m.group(1) if m else ""
 
 
 def load_account_snapshot_evidence(
     artifacts: ReviewArtifacts,
     session: Optional[str] = None,
-) -> Tuple[Optional[Dict[str, Any]], Optional[Path]]:
+) -> EvidenceSelection:
     market = artifacts.market
     td = artifacts.review_date
-    exact = f"account_snapshot_{market}_{td}_{session}.json" if session else f"account_snapshot_{market}_{td}.json"
-    path = _pick_evidence_file(
-        artifacts.account_snapshot_paths,
-        exact_name=exact,
-        latest_name=f"account_snapshot_latest_{market}.json",
-        prefix="account_snapshot",
-        market=market,
-        trade_date=td,
+    sess = session or artifacts.session
+    paths = artifacts.account_snapshot_paths
+    candidates: List[Tuple[int, Path]] = []
+
+    def _rank(path: Path, priority: int) -> None:
+        if path.exists():
+            candidates.append((priority, path))
+
+    if sess:
+        _rank(artifacts.output_dir / f"account_snapshot_{market}_{td}_{sess}.json", 1)
+    _rank(artifacts.output_dir / f"account_snapshot_{market}_{td}.json", 2)
+    latest = artifacts.output_dir / f"account_snapshot_latest_{market}.json"
+    payload_latest = _load_json(latest)
+    latest_td = _extract_evidence_date(payload_latest)
+    if latest.exists() and latest_td == td:
+        _rank(latest, 3)
+    elif latest.exists():
+        _rank(latest, 4)
+
+    if not candidates:
+        return EvidenceSelection()
+
+    _, path = sorted(candidates, key=lambda x: x[0])[0]
+    payload = _load_json(path)
+    ev_td = _extract_evidence_date(payload)
+    latest_fallback = path.name.startswith("account_snapshot_latest_")
+    if latest_fallback and ev_td and ev_td != td:
+        latest_fallback = True
+    elif path.name.startswith("account_snapshot_latest_"):
+        latest_fallback = True
+    else:
+        latest_fallback = False
+
+    return EvidenceSelection(
+        payload=payload,
+        path=path,
+        latest_fallback_used=latest_fallback,
+        evidence_trade_date=ev_td,
+        evidence_generated_at=_extract_evidence_generated_at(payload),
+        pipeline_context_source=str((payload or {}).get("pipeline_context_source") or ""),
     )
-    if not path:
-        path = _pick_evidence_file(
-            artifacts.account_snapshot_paths,
-            exact_name=f"account_snapshot_{market}_{td}.json",
-            latest_name=f"account_snapshot_latest_{market}.json",
-            prefix="account_snapshot",
-            market=market,
-            trade_date=td,
+
+
+def load_order_reconcile_evidence(
+    artifacts: ReviewArtifacts,
+) -> EvidenceSelection:
+    market = artifacts.market
+    td = artifacts.review_date
+    exact = artifacts.output_dir / f"order_reconcile_{market}_{td}.json"
+    if exact.exists():
+        payload = _load_json(exact)
+        return EvidenceSelection(
+            payload=payload,
+            path=exact,
+            evidence_trade_date=_extract_evidence_date(payload) or td,
+            evidence_generated_at=_extract_evidence_generated_at(payload),
         )
-    return _load_json(path), path
+    latest = artifacts.output_dir / f"order_reconcile_latest_{market}.json"
+    payload = _load_json(latest)
+    if payload:
+        ev_td = _extract_evidence_date(payload)
+        return EvidenceSelection(
+            payload=payload,
+            path=latest,
+            latest_fallback_used=bool(ev_td and ev_td != td),
+            evidence_trade_date=ev_td,
+            evidence_generated_at=_extract_evidence_generated_at(payload),
+        )
+    return EvidenceSelection()
+
+
+def load_order_reconcile_evidences_for_period(
+    artifacts: ReviewArtifacts,
+) -> List[EvidenceSelection]:
+    market = artifacts.market
+    selections: List[EvidenceSelection] = []
+    wanted = set(_dates_in_range(artifacts.start_date, artifacts.review_date))
+    seen_dates: Set[str] = set()
+    for p in artifacts.order_reconcile_paths:
+        d = _reconcile_date_from_path(p, market)
+        if d and d in wanted and d not in seen_dates:
+            payload = _load_json(p)
+            if payload:
+                selections.append(EvidenceSelection(
+                    payload=payload,
+                    path=p,
+                    evidence_trade_date=_extract_evidence_date(payload) or d,
+                    evidence_generated_at=_extract_evidence_generated_at(payload),
+                ))
+                seen_dates.add(d)
+    if selections:
+        return sorted(selections, key=lambda s: s.evidence_trade_date or "")
+    single = load_order_reconcile_evidence(artifacts)
+    return [single] if single.payload else []
+
+
+def _finding_evidence_kwargs(sel: EvidenceSelection) -> Dict[str, Any]:
+    return {
+        "evidence_source_file": sel.source_file,
+        "evidence_trade_date": sel.evidence_trade_date,
+        "evidence_generated_at": sel.evidence_generated_at,
+        "latest_fallback_used": sel.latest_fallback_used,
+    }
 
 
 def _endpoint_block_has_evidence(block: Optional[Dict[str, Any]]) -> bool:
@@ -615,7 +763,7 @@ def _ccnl_evidence_available(
         if not ccnl.get("all_exchanges_failed"):
             return True, ccnl, reconcile_path
     if "ccnl" in artifacts.logs_text.lower() and "inquire_ccnl" in artifacts.logs_text.lower():
-        return True, None, None
+        return True, None, reconcile_path
     return False, None, reconcile_path
 
 
@@ -631,12 +779,129 @@ def _nccs_evidence_available(
         if not nccs.get("all_exchanges_failed"):
             return True, nccs, reconcile_path
     if snap:
-        ep = (snap.get("endpoints") or {}).get("nccs") or snap.get("nccs")
+        ep = _endpoint_evidence_block(snap, "nccs")
         if _endpoint_block_has_evidence(ep):
             return True, ep, snap_path
     if "[ACCOUNT_SNAPSHOT_KIS]" in artifacts.logs_text or "inquire_nccs" in artifacts.logs_text.lower():
         return True, None, None
     return False, None, reconcile_path or snap_path
+
+
+def _check_snapshot_date_findings(
+    snap_sel: EvidenceSelection,
+    artifacts: ReviewArtifacts,
+    strict: bool,
+) -> List[ReviewFinding]:
+    findings: List[ReviewFinding] = []
+    payload = snap_sel.payload or {}
+    ev_kw = _finding_evidence_kwargs(snap_sel)
+    ev_td = snap_sel.evidence_trade_date
+    review_td = artifacts.review_date
+    if snap_sel.latest_fallback_used and ev_td and ev_td != review_td:
+        findings.append(make_finding(
+            "ACCOUNT_SNAPSHOT_DATE_MISMATCH", "WARN", "account_snapshot",
+            f"latest fallback trade_date={ev_td}, review_date={review_td}",
+            "evidence 날짜 불일치", "해당일 account_snapshot 파일 생성 확인",
+            **ev_kw,
+        ))
+    elif ev_td and ev_td != review_td:
+        findings.append(make_finding(
+            "ACCOUNT_SNAPSHOT_DATE_MISMATCH", "WARN", "account_snapshot",
+            f"evidence trade_date={ev_td}, review_date={review_td}",
+            "evidence 날짜 불일치", "dated account_snapshot 사용 확인",
+            **ev_kw,
+        ))
+    snap_ts = str(payload.get("snapshot_ts_kst") or "")
+    snap_day = _date_yyyymmdd_from_iso(snap_ts)
+    trade_day = str(payload.get("trade_date") or ev_td or "")
+    if snap_day and trade_day and _calendar_day_gap(snap_day, trade_day) >= 1:
+        sev = "ERROR" if strict else "WARN"
+        findings.append(make_finding(
+            "ACCOUNT_SNAPSHOT_DATE_MISMATCH", sev, "account_snapshot",
+            f"snapshot_ts_kst={snap_day}, trade_date={trade_day}",
+            "스냅샷 시각과 trade_date 불일치", "resolve_pipeline_context trade_date 확인",
+            **ev_kw,
+        ))
+    return findings
+
+
+def _check_stale_artifacts(artifacts: ReviewArtifacts, strict: bool) -> List[ReviewFinding]:
+    findings: List[ReviewFinding] = []
+    patterns = ("market_state_*", "gpt_trades_*", "screener_*")
+    for pattern in patterns:
+        for path in artifacts.output_dir.glob(pattern):
+            if not path.is_file() or path.suffix != ".json":
+                continue
+            payload = _load_json(path)
+            if not payload:
+                continue
+            internal_date = str(
+                payload.get("trade_date")
+                or payload.get("date")
+                or payload.get("as_of")
+                or ""
+            ).strip()
+            if not internal_date:
+                dm = re.search(r"(\d{8})", path.stem)
+                internal_date = dm.group(1) if dm else ""
+            gen_at = str(
+                payload.get("generated_at_kst")
+                or payload.get("generated_at")
+                or payload.get("timestamp")
+                or ""
+            ).strip()
+            gen_day = _date_yyyymmdd_from_iso(gen_at)
+            if internal_date and gen_day and _calendar_day_gap(gen_day, internal_date) >= 1:
+                findings.append(make_finding(
+                    "ARTIFACT_DATE_STALE", "WARN" if strict else "INFO", "",
+                    f"{path.name}: internal_date={internal_date}, generated={gen_day}",
+                    "artifact 날짜 stale", "파이프라인 재생성 확인",
+                    evidence_source_file=str(path),
+                    evidence_trade_date=internal_date,
+                    evidence_generated_at=gen_at,
+                ))
+    return findings
+
+
+def _order_in_ccnl_coverage(order_row: Dict[str, Any], selections: List[EvidenceSelection]) -> bool:
+    ts = str(order_row.get("timestamp") or "")
+    order_day = _date_yyyymmdd_from_iso(ts)
+    if not order_day:
+        return False
+    for sel in selections:
+        payload = sel.payload or {}
+        ccnl = payload.get("ccnl") or {}
+        qs = str(ccnl.get("query_start_date") or payload.get("query_start_date") or "").strip()
+        qe = str(ccnl.get("query_end_date") or payload.get("query_end_date") or "").strip()
+        if qs and qe and qs <= order_day <= qe:
+            return True
+        ev_td = sel.evidence_trade_date
+        if ev_td and ev_td == order_day and (not qs or not qe):
+            return True
+    return False
+
+
+def _ccnl_period_coverage_complete(
+    artifacts: ReviewArtifacts,
+    selections: List[EvidenceSelection],
+) -> bool:
+    if not selections:
+        return False
+    wanted = set(_dates_in_range(artifacts.start_date, artifacts.review_date))
+    covered: Set[str] = set()
+    for sel in selections:
+        payload = sel.payload or {}
+        ccnl = payload.get("ccnl") or {}
+        qs = str(ccnl.get("query_start_date") or payload.get("query_start_date") or "").strip()
+        qe = str(ccnl.get("query_end_date") or payload.get("query_end_date") or "").strip()
+        if qs and qe:
+            for d in _dates_in_range(qs, qe):
+                if d in wanted:
+                    covered.add(d)
+        td = sel.evidence_trade_date
+        if td in wanted:
+            covered.add(td)
+    return wanted.issubset(covered)
 
 
 def collect_artifacts(
@@ -677,6 +942,7 @@ def collect_artifacts(
 
     return ReviewArtifacts(
         market=market,
+        start_date=start_date,
         review_date=end_date,
         period="daily",
         session=session,
@@ -767,7 +1033,10 @@ def review_balance(artifacts: ReviewArtifacts, strict: bool) -> KisBalanceReview
     review = KisBalanceReview()
     market = artifacts.market
     payload = _load_json(artifacts.balance_path)
-    snap_payload, snap_path = load_account_snapshot_evidence(artifacts, session=artifacts.session)
+    snap_sel = load_account_snapshot_evidence(artifacts, session=artifacts.session)
+    snap_payload = snap_sel.payload
+    snap_path = snap_sel.path
+    ev_kw = _finding_evidence_kwargs(snap_sel)
 
     records = _records_from_payload(payload or {})
     if snap_payload:
@@ -784,17 +1053,15 @@ def review_balance(artifacts: ReviewArtifacts, strict: bool) -> KisBalanceReview
     review.balance_source_status = _build_evidence(
         "inquire-balance",
         {**(payload or {}), **(snap_payload or {})},
-        source_file=str(snap_path or artifacts.balance_path or ""),
+        source_file=snap_sel.source_file or str(artifacts.balance_path or ""),
         records=records,
     )
-    if snap_path:
-        review.balance_source_status.source_file = str(snap_path)
 
     by_ticker_exc: Dict[str, Dict[str, int]] = {}
     qty_by_ticker: Dict[str, int] = {}
     avg_by_ticker: Dict[str, float] = {}
     holdings_value = 0.0
-    exchanges: Set[str] = set()
+    holding_exchanges: Set[str] = set()
 
     for rec in records:
         ticker = _norm_ticker(rec, market)
@@ -804,7 +1071,8 @@ def review_balance(artifacts: ReviewArtifacts, strict: bool) -> KisBalanceReview
         if qty <= 0:
             continue
         exc = str(_first_present(rec, EXCHANGE_FIELDS) or "UNKNOWN").upper()
-        exchanges.add(exc)
+        if exc != "UNKNOWN":
+            holding_exchanges.add(exc)
         by_ticker_exc.setdefault(ticker, {})
         by_ticker_exc[ticker][exc] = by_ticker_exc[ticker].get(exc, 0) + qty
         qty_by_ticker[ticker] = qty_by_ticker.get(ticker, 0) + qty
@@ -819,13 +1087,35 @@ def review_balance(artifacts: ReviewArtifacts, strict: bool) -> KisBalanceReview
             val = prpr * qty
         holdings_value += val
 
-    review.exchange_coverage = sorted(exchanges - {"UNKNOWN"})
-    review.missing_exchange_codes = [e for e in US_EXCHANGES if e not in review.exchange_coverage]
+    bal_ep = _endpoint_evidence_block(snap_payload, "balance")
+    status_by_exchange = {
+        str(k).upper(): str(v).upper()
+        for k, v in (bal_ep.get("status_by_exchange") or {}).items()
+    }
+    exchange_coverage = list(bal_ep.get("exchange_coverage") or snap_payload.get("exchange_coverage") or [])
+    if not exchange_coverage and status_by_exchange:
+        exchange_coverage = list(status_by_exchange.keys())
+
+    review.exchange_coverage = sorted(set(exchange_coverage))
+    review.missing_exchange_codes = [
+        e for e in US_EXCHANGES
+        if status_by_exchange.get(e) in ("FAILED", "MISSING")
+        or (e not in status_by_exchange and e not in review.exchange_coverage)
+    ]
+    if status_by_exchange:
+        review.missing_exchange_codes = [
+            e for e in US_EXCHANGES
+            if status_by_exchange.get(e, "") in ("FAILED", "MISSING")
+        ]
+
     review.tickers = sorted(qty_by_ticker.keys())
     review.holdings_count = len(review.tickers)
     review.total_holding_qty_by_ticker = qty_by_ticker
     review.avg_price_by_ticker = avg_by_ticker
-    review.holdings_value_usd = round(holdings_value, 2)
+    if snap_payload and snap_payload.get("holdings_value_usd") is not None:
+        review.holdings_value_usd = round(_safe_float(snap_payload.get("holdings_value_usd")), 2)
+    else:
+        review.holdings_value_usd = round(holdings_value, 2)
 
     for ticker, exc_map in by_ticker_exc.items():
         active = {e: q for e, q in exc_map.items() if q > 0 and e != "UNKNOWN"}
@@ -837,16 +1127,10 @@ def review_balance(artifacts: ReviewArtifacts, strict: bool) -> KisBalanceReview
                 "KIS_BALANCE_DUPLICATE_TICKER", "WARN", "inquire-balance",
                 f"{ticker} on exchanges {list(active.keys())}",
                 "다른 거래소 중복 보유", "ADR/특수케이스 또는 병합 로직 확인",
+                **ev_kw,
             ))
-        for exc, q in active.items():
-            if q > 0 and sum(1 for e2, q2 in active.items() if e2 == exc) > 1:
-                if ticker not in review.duplicate_tickers:
-                    review.duplicate_tickers.append(ticker)
-                review.findings.append(make_finding(
-                    "KIS_BALANCE_DUPLICATE_TICKER", "ERROR", "inquire-balance",
-                    f"{ticker} duplicated on {exc}",
-                    "동일 거래소 중복", "balance merge dedup 확인",
-                ))
+
+    review.findings.extend(_check_snapshot_date_findings(snap_sel, artifacts, strict))
 
     if not payload and not snap_payload:
         review.findings.append(make_finding(
@@ -854,18 +1138,19 @@ def review_balance(artifacts: ReviewArtifacts, strict: bool) -> KisBalanceReview
             "balance/account_snapshot artifact 없음",
             "보유수량 검증 불가", "account.py 또는 trader snapshot 저장 확인",
         ))
-    elif review.missing_exchange_codes and review.exchange_coverage:
+    elif review.missing_exchange_codes:
         review.findings.append(make_finding(
             "KIS_BALANCE_PARTIAL_EXCHANGE_COVERAGE", "WARN", "inquire-balance",
-            f"coverage={review.exchange_coverage}, missing={review.missing_exchange_codes}",
-            "일부 거래소 잔고 미반영 가능", "NASD/NYSE/AMEX 전체 조회 로그 확인",
-            evidence_source_file=str(snap_path or ""),
+            f"status_by_exchange={status_by_exchange}, missing={review.missing_exchange_codes}",
+            "일부 거래소 balance 조회 실패", "NASD/NYSE/AMEX endpoint status 확인",
+            **ev_kw,
         ))
     if review.holdings_count > 0 and review.holdings_value_usd == 0:
         review.findings.append(make_finding(
             "ACCOUNT_SNAPSHOT_INVALID", "ERROR", "inquire-balance",
             f"holdings_count={review.holdings_count}, holdings_value_usd=0",
             "평가금액 검증 실패", "balance JSON evlu 필드 및 KIS 응답 확인",
+            **ev_kw,
         ))
     if not snap_payload:
         review.findings.append(make_finding(
@@ -880,7 +1165,9 @@ def review_balance(artifacts: ReviewArtifacts, strict: bool) -> KisBalanceReview
 def review_present_balance(artifacts: ReviewArtifacts, balance: KisBalanceReview, strict: bool) -> KisPresentBalanceReview:
     review = KisPresentBalanceReview()
     payload = _load_json(artifacts.summary_path)
-    snap_payload, snap_path = load_account_snapshot_evidence(artifacts, session=artifacts.session)
+    snap_sel = load_account_snapshot_evidence(artifacts, session=artifacts.session)
+    snap_payload = snap_sel.payload
+    ev_kw = _finding_evidence_kwargs(snap_sel)
 
     cash_map: Dict[str, Any] = {}
     if payload:
@@ -893,50 +1180,65 @@ def review_present_balance(artifacts: ReviewArtifacts, balance: KisBalanceReview
             cm = snap_payload["cash_map"]
             if isinstance(cm.get("USD"), dict):
                 cash_map.update(cm["USD"])
-            cash_map.update(cm)
+            cash_map.update({k: v for k, v in cm.items() if isinstance(v, (int, float, str))})
         if snap_payload.get("available_cash_usd") is not None:
-            cash_map.setdefault("available_cash", snap_payload["available_cash_usd"])
+            cash_map["available_cash"] = snap_payload["available_cash_usd"]
         if snap_payload.get("total_asset_usd") is not None:
-            cash_map.setdefault("tot_evlu_amt_usd", snap_payload["total_asset_usd"])
+            cash_map["tot_evlu_amt_usd"] = snap_payload["total_asset_usd"]
         if snap_payload.get("holdings_value_usd") is not None:
-            cash_map.setdefault("holdings_value_usd", snap_payload["holdings_value_usd"])
+            cash_map["holdings_value_usd"] = snap_payload["holdings_value_usd"]
+        if snap_payload.get("available_cash_krw") is not None:
+            cash_map["available_cash_krw"] = snap_payload["available_cash_krw"]
+        if snap_payload.get("total_asset_krw") is not None:
+            cash_map["tot_evlu_amt_krw"] = snap_payload["total_asset_krw"]
 
     review.cash_map = {k: cash_map[k] for k in cash_map if not any(p.search(str(k)) for p in SENSITIVE_PATTERNS)}
     review.available_cash_usd = _safe_float(
-        cash_map.get("available_cash") or cash_map.get("ord_psbl_frcr_amt") or cash_map.get("prvs_rcdl_excc_amt")
+        cash_map.get("available_cash_usd")
+        or cash_map.get("available_cash")
+        or cash_map.get("ord_psbl_frcr_amt")
+        or cash_map.get("prvs_rcdl_excc_amt")
         or (snap_payload or {}).get("available_cash_usd")
-    )
-    review.total_asset_usd = _safe_float(
-        cash_map.get("tot_evlu_amt_usd") or cash_map.get("tot_evlu_amt")
-        or (snap_payload or {}).get("total_asset_usd")
     )
     review.holdings_value_usd = balance.holdings_value_usd or _safe_float(
         cash_map.get("holdings_value_usd") or (snap_payload or {}).get("holdings_value_usd")
     )
+    computed_total = review.available_cash_usd + review.holdings_value_usd
+    review.total_asset_usd = _safe_float(
+        cash_map.get("total_asset_usd")
+        or cash_map.get("tot_evlu_amt_usd")
+        or (snap_payload or {}).get("total_asset_usd")
+    )
+    if review.total_asset_usd <= 0 and computed_total > 0:
+        review.total_asset_usd = computed_total
 
     review.present_balance_source_status = _build_evidence(
         "inquire-present-balance",
         {**(payload or {}), **(snap_payload or {})},
-        source_file=str(snap_path or artifacts.summary_path or ""),
+        source_file=snap_sel.source_file or str(artifacts.summary_path or ""),
     )
-    if snap_path:
-        review.present_balance_source_status.source_file = str(snap_path)
 
-    has_krw = any(k.endswith("_krw") or "krw" in k.lower() for k in cash_map)
-    has_usd = review.available_cash_usd > 0 or "USD" in str(cash_map.get("currency", ""))
-    if has_krw and has_usd and review.total_asset_usd > 0 and _safe_float(cash_map.get("tot_evlu_amt_krw")) > 0:
-        usd_total = review.total_asset_usd
-        krw_total = _safe_float(cash_map.get("tot_evlu_amt_krw"))
-        if usd_total > 0 and krw_total > 0 and abs(usd_total - krw_total) < 1:
+    if computed_total > 0 and review.total_asset_usd >= computed_total * 10:
+        review.currency_consistency_status = "mixed_suspicious"
+        review.findings.append(make_finding(
+            "KIS_PRESENT_BALANCE_CURRENCY_MIXED", "ERROR", "inquire-present-balance",
+            f"total_asset_usd={review.total_asset_usd}, expected_usd={computed_total:.2f}",
+            "USD/KRW 혼합 의심", "total_asset_usd는 available_cash_usd+holdings_value_usd 기준",
+            **ev_kw,
+        ))
+    elif review.total_asset_usd > 0 and _safe_float(cash_map.get("tot_evlu_amt_krw")) > 0:
+        krw_total = _safe_float(cash_map.get("tot_evlu_amt_krw") or (snap_payload or {}).get("total_asset_krw"))
+        if abs(review.total_asset_usd - krw_total) < 1:
             review.currency_consistency_status = "mixed_suspicious"
             review.findings.append(make_finding(
-                "KIS_PRESENT_BALANCE_CURRENCY_MIXED", "WARN", "inquire-present-balance",
-                f"USD total={usd_total}, KRW total={krw_total}",
-                "통화 혼합 의심", "USD/KRW 필드 분리 저장 확인",
+                "KIS_PRESENT_BALANCE_CURRENCY_MIXED", "ERROR", "inquire-present-balance",
+                f"USD total={review.total_asset_usd}, KRW total={krw_total}",
+                "통화 혼합", "USD/KRW 필드 분리 저장 확인",
+                **ev_kw,
             ))
         else:
             review.currency_consistency_status = "mixed_ok"
-    elif has_usd:
+    elif review.available_cash_usd > 0 or review.total_asset_usd > 0:
         review.currency_consistency_status = "usd"
     else:
         review.currency_consistency_status = "unknown"
@@ -947,62 +1249,31 @@ def review_present_balance(artifacts: ReviewArtifacts, balance: KisBalanceReview
             "summary/account_snapshot 없음", "현금/총자산 검증 불가", "summary_YYYYMMDD.json 확인",
         ))
 
-    present_ep = {}
-    call_count = None
-    if snap_payload:
-        present_ep = (snap_payload.get("endpoints") or {}).get("present_balance") or {}
-        call_count = present_ep.get("call_count")
+    present_ep = _endpoint_evidence_block(snap_payload, "present_balance")
+    call_count = present_ep.get("call_count") if present_ep else None
 
     bal_val = review.holdings_value_usd or balance.holdings_value_usd
     total = review.total_asset_usd
     ratio = (total / bal_val) if bal_val > 0 and total > 0 else 0.0
-    src = str(snap_path or "")
 
     if call_count == 1:
         pass
     elif call_count is not None and call_count >= 2 and ratio >= 2.0:
-        sev = "CRITICAL" if ratio >= 2.5 else "ERROR"
+        sev = "CRITICAL"
         review.findings.append(make_finding(
             "KIS_PRESENT_BALANCE_DUPLICATED_BY_EXCHANGE_LOOP", sev, "inquire-present-balance",
             f"call_count={call_count}, total_asset_usd={total}, balance_holdings_value={bal_val}, ratio={ratio:.2f}",
             "거래소 루프 중복 합산 의심", "present_balance 단일 조회 vs 거래소별 합산 확인",
-            evidence_source_file=src,
+            **ev_kw,
         ))
-    elif not present_ep and call_count is None:
-        if ratio >= 2.5:
-            review.findings.append(make_finding(
-                "KIS_PRESENT_BALANCE_DUPLICATED_BY_EXCHANGE_LOOP", "CRITICAL", "inquire-present-balance",
-                f"total_asset_usd={total}, balance_holdings_value={bal_val}, ratio={ratio:.2f}",
-                "총자산 과대 (evidence 부족)", "CTRP6504R call_count evidence 저장 확인",
-                evidence_source_file=src,
-            ))
-        elif ratio >= 2.0:
-            review.findings.append(make_finding(
-                "KIS_PRESENT_BALANCE_DUPLICATED_BY_EXCHANGE_LOOP", "ERROR", "inquire-present-balance",
-                f"total/balance ratio={ratio:.2f}", "총자산 과대 가능", "present_balance evidence 확인",
-                evidence_source_file=src,
-            ))
-        else:
-            review.findings.append(make_finding(
-                "KIS_PRESENT_BALANCE_EVIDENCE_MISSING",
-                _missing_evidence_severity(strict),
-                "inquire-present-balance",
-                "present_balance endpoint evidence 없음",
-                "중복 합산 판정 제한", "account_snapshot evidence 저장 확인",
-                evidence_source_file=src,
-            ))
-    elif ratio >= 2.5:
+    elif call_count is None:
         review.findings.append(make_finding(
-            "KIS_PRESENT_BALANCE_DUPLICATED_BY_EXCHANGE_LOOP", "CRITICAL", "inquire-present-balance",
-            f"total_asset_usd={total}, balance_holdings_value={bal_val}, ratio={ratio:.2f}",
-            "총자산 과대", "present_balance 조회 로직 확인",
-            evidence_source_file=src,
-        ))
-    elif ratio >= 2.0:
-        review.findings.append(make_finding(
-            "KIS_PRESENT_BALANCE_DUPLICATED_BY_EXCHANGE_LOOP", "WARN", "inquire-present-balance",
-            f"total/balance ratio={ratio:.2f}", "총자산 과대 가능", "CTRP6504R 단일 호출 결과 사용 확인",
-            evidence_source_file=src,
+            "KIS_PRESENT_BALANCE_EVIDENCE_MISSING",
+            _missing_evidence_severity(strict),
+            "inquire-present-balance",
+            "present_balance call_count evidence 없음",
+            "중복 합산 판정 제한", "account_snapshot present_balance.call_count 저장 확인",
+            **ev_kw,
         ))
 
     return review
@@ -1014,8 +1285,12 @@ def _parse_nccs_from_sources(artifacts: ReviewArtifacts, market: str) -> Tuple[L
     evidence = KisEndpointEvidence(endpoint_name="inquire-nccs", endpoint_path=KIS_ENDPOINT_META["inquire-nccs"]["path"])
     has_evidence = False
 
-    reconcile, reconcile_path = load_order_reconcile_evidence(artifacts)
-    snap_payload, snap_path = load_account_snapshot_evidence(artifacts, session=artifacts.session)
+    reconcile_sel = load_order_reconcile_evidence(artifacts)
+    reconcile = reconcile_sel.payload
+    reconcile_path = reconcile_sel.path
+    snap_sel = load_account_snapshot_evidence(artifacts, session=artifacts.session)
+    snap_payload = snap_sel.payload
+    snap_path = snap_sel.path
     nccs_ok, nccs_block, ev_path = _nccs_evidence_available(
         reconcile, reconcile_path, snap_payload, snap_path, artifacts,
     )
@@ -1046,7 +1321,7 @@ def _parse_nccs_from_sources(artifacts: ReviewArtifacts, market: str) -> Tuple[L
             for k, v in pmap.items():
                 pending_sell[str(k)] = pending_sell.get(str(k), 0) + _safe_int(v)
         if not evidence.observed_tr_id:
-            ep = (payload.get("endpoints") or {}).get("nccs") or {}
+            ep = _endpoint_evidence_block(payload, "nccs")
             evidence = _build_evidence("inquire-nccs", payload, source_file=str(p), records=oo)
             if ep.get("observed_tr_ids"):
                 evidence.observed_tr_id = ",".join(ep.get("observed_tr_ids") or [])
@@ -1081,7 +1356,10 @@ def _parse_nccs_from_sources(artifacts: ReviewArtifacts, market: str) -> Tuple[L
 def review_nccs(artifacts: ReviewArtifacts, balance: KisBalanceReview, strict: bool) -> KisNccsReview:
     review = KisNccsReview()
     market = artifacts.market
-    reconcile, reconcile_path = load_order_reconcile_evidence(artifacts)
+    reconcile_sel = load_order_reconcile_evidence(artifacts)
+    reconcile = reconcile_sel.payload
+    reconcile_path = reconcile_sel.path
+    ev_kw = _finding_evidence_kwargs(reconcile_sel)
     orders, pending_sell, evidence, has_evidence = _parse_nccs_from_sources(artifacts, market)
     review.nccs_source_status = evidence
     review.pending_sell_qty_by_ticker = pending_sell
@@ -1106,7 +1384,7 @@ def review_nccs(artifacts: ReviewArtifacts, balance: KisBalanceReview, strict: b
         review.findings.append(make_finding(
             "KIS_NCCS_ALL_EXCHANGES_FAILED", "ERROR", "inquire-nccs",
             "nccs all_exchanges_failed=true", "미체결 조회 실패", "TTTS3018R 거래소별 조회 확인",
-            evidence_source_file=str(reconcile_path or evidence.source_file or ""),
+            **ev_kw,
         ))
     elif "모든 거래소" in artifacts.logs_text and "nccs" in artifacts.logs_text.lower():
         review.findings.append(make_finding(
@@ -1121,7 +1399,7 @@ def review_nccs(artifacts: ReviewArtifacts, balance: KisBalanceReview, strict: b
             _missing_evidence_severity(strict),
             "inquire-nccs",
             "nccs evidence 없음", "pending 검증 제한", "order_reconcile 또는 account_snapshot 저장",
-            evidence_source_file=str(reconcile_path or evidence.source_file or ""),
+            **ev_kw,
         ))
 
     for ticker, hold_qty in balance.total_holding_qty_by_ticker.items():
@@ -1153,7 +1431,10 @@ def _parse_ccnl_from_sources(
 ) -> Tuple[List[Dict[str, Any]], KisEndpointEvidence, bool, Optional[Path]]:
     rows: List[Dict[str, Any]] = []
     evidence = KisEndpointEvidence(endpoint_name="inquire-ccnl", endpoint_path=KIS_ENDPOINT_META["inquire-ccnl"]["path"])
-    reconcile, reconcile_path = load_order_reconcile_evidence(artifacts)
+    reconcile_sel = load_order_reconcile_evidence(artifacts)
+    reconcile = reconcile_sel.payload
+    reconcile_path = reconcile_sel.path
+    ev_kw = _finding_evidence_kwargs(reconcile_sel)
     has_evidence, ccnl_block, ev_path = _ccnl_evidence_available(reconcile, reconcile_path, artifacts)
 
     if reconcile and isinstance(reconcile.get("ccnl"), dict):
@@ -1189,7 +1470,10 @@ def _parse_ccnl_from_sources(
 
 def review_ccnl(artifacts: ReviewArtifacts, strict: bool) -> KisCcnlReview:
     review = KisCcnlReview()
-    reconcile, reconcile_path = load_order_reconcile_evidence(artifacts)
+    reconcile_sel = load_order_reconcile_evidence(artifacts)
+    reconcile = reconcile_sel.payload
+    reconcile_path = reconcile_sel.path
+    ev_kw = _finding_evidence_kwargs(reconcile_sel)
     ccnl_rows, evidence, has_evidence, ev_path = _parse_ccnl_from_sources(artifacts)
     review.ccnl_source_status = evidence
     ccnl_block = (reconcile or {}).get("ccnl") or {}
@@ -1234,12 +1518,27 @@ def review_ccnl(artifacts: ReviewArtifacts, strict: bool) -> KisCcnlReview:
         review.order_id_coverage_rate = 1.0 if not ccnl_rows else 0.0
 
     ccnl_status = str(ccnl_block.get("status") or "").upper()
-    src = str(reconcile_path or evidence.source_file or "")
+    period_selections = (
+        load_order_reconcile_evidences_for_period(artifacts)
+        if artifacts.period in ("weekly", "monthly") or artifacts.start_date != artifacts.review_date
+        else [reconcile_sel]
+    )
+    period_complete = _ccnl_period_coverage_complete(artifacts, period_selections)
+    if not period_complete and artifacts.period in ("weekly", "monthly"):
+        review.findings.append(make_finding(
+            "KIS_CCNL_PERIOD_COVERAGE_INCOMPLETE",
+            "WARN" if strict else "INFO",
+            "inquire-ccnl",
+            f"period={artifacts.start_date}~{artifacts.review_date}, files={len(period_selections)}",
+            "ccnl 기간 coverage 부족", "기간 내 order_reconcile 파일 수집 확인",
+            **ev_kw,
+        ))
 
     for tr in artifacts.trade_rows:
         oid = str(tr.get("order_id") or "").strip()
         db_status = str(tr.get("order_status") or "").lower()
         db_exec = _safe_int(tr.get("executed_qty"))
+        in_coverage = _order_in_ccnl_coverage(tr, period_selections)
 
         if db_status in ("executed", "filled") or db_exec > 0:
             if not has_evidence:
@@ -1249,18 +1548,23 @@ def review_ccnl(artifacts: ReviewArtifacts, strict: bool) -> KisCcnlReview:
                     "inquire-ccnl",
                     f"order_id={oid or 'N/A'}, db_status={db_status}, ccnl evidence 없음",
                     "체결 증거 미확인", "order_reconcile ccnl evidence 저장 확인",
-                    evidence_source_file=src,
+                    **ev_kw,
                 ))
                 continue
 
         if not oid:
-            if db_status in ("executed", "filled") and has_evidence:
+            if db_status in ("executed", "filled") and has_evidence and in_coverage:
                 review.findings.append(make_finding(
                     "KIS_ORDER_MISSING_ODNO", "ERROR", "inquire-ccnl",
                     f"ticker={tr.get('ticker')}, db_status={db_status}, order_id empty",
                     "체결 기록에 주문번호 없음", "주문 응답 ODNO 저장 확인",
-                    evidence_source_file=src,
+                    **ev_kw,
                 ))
+            continue
+
+        if not in_coverage:
+            if has_evidence and db_status in ("executed", "filled", "pending"):
+                continue
             continue
 
         if oid not in ccnl_by_id:
@@ -1269,7 +1573,7 @@ def review_ccnl(artifacts: ReviewArtifacts, strict: bool) -> KisCcnlReview:
                     "KIS_DB_CCNL_STATUS_MISMATCH", "WARN", "inquire-ccnl",
                     f"order_id={oid}, db={db_status}, ccnl에 없음",
                     "DB vs ccnl 불일치", "order_reconciler 재실행",
-                    evidence_source_file=src,
+                    **ev_kw,
                 ))
             continue
 
@@ -1282,21 +1586,21 @@ def review_ccnl(artifacts: ReviewArtifacts, strict: bool) -> KisCcnlReview:
                 "KIS_DB_CCNL_STATUS_MISMATCH", "WARN", "inquire-ccnl",
                 f"order_id={oid}: db={db_status}, ccnl={cc_status}, exec={exec_q}",
                 "DB pending vs KIS 체결 불일치", "order_reconciler 재분류 확인",
-                evidence_source_file=src,
+                **ev_kw,
             ))
         if db_status in ("executed", "filled") and exec_q == 0 and has_evidence:
             review.findings.append(make_finding(
                 "KIS_EXECUTED_WITHOUT_FILL", "ERROR", "inquire-ccnl",
                 f"order_id={oid}, db executed but ccnl exec=0",
                 "체결수량 0", "TTTS3035R 조회 및 DB 업데이트",
-                evidence_source_file=src,
+                **ev_kw,
             ))
 
     if ccnl_block.get("all_exchanges_failed"):
         review.findings.append(make_finding(
             "KIS_CCNL_ALL_EXCHANGES_FAILED", "ERROR", "inquire-ccnl",
             "ccnl all_exchanges_failed=true", "체결내역 조회 실패", "거래소별 TTTS3035R 확인",
-            evidence_source_file=src,
+            **ev_kw,
         ))
     elif evidence.status == "FAILED" or (
         "KIS_CCNL" in artifacts.logs_text and "모든 거래소" in artifacts.logs_text
@@ -1304,7 +1608,7 @@ def review_ccnl(artifacts: ReviewArtifacts, strict: bool) -> KisCcnlReview:
         review.findings.append(make_finding(
             "KIS_CCNL_ALL_EXCHANGES_FAILED", "ERROR", "inquire-ccnl",
             "ccnl 전 거래소 실패 로그", "체결내역 조회 실패", "거래소별 TTTS3035R 확인",
-            evidence_source_file=src,
+            **ev_kw,
         ))
     elif not has_evidence:
         review.findings.append(make_finding(
@@ -1312,7 +1616,7 @@ def review_ccnl(artifacts: ReviewArtifacts, strict: bool) -> KisCcnlReview:
             _missing_evidence_severity(strict),
             "inquire-ccnl",
             "ccnl evidence 없음", "체결 검증 제한", "order_reconcile 결과 저장",
-            evidence_source_file=src,
+            **ev_kw,
         ))
     elif ccnl_status in ("OK", "EMPTY") and review.ccnl_order_count == 0:
         pass  # valid empty ccnl
@@ -1352,7 +1656,9 @@ def review_orders(
 ) -> KisOrderReview:
     review = KisOrderReview()
     market = artifacts.market
-    snap_payload, snap_path = load_account_snapshot_evidence(artifacts, session=artifacts.session)
+    snap_sel = load_account_snapshot_evidence(artifacts, session=artifacts.session)
+    snap_payload = snap_sel.payload
+    ev_kw = _finding_evidence_kwargs(snap_sel)
     snap_sellable = (snap_payload or {}).get("sellable_qty_by_ticker") or {}
     sellable_checks: Set[str] = set()
     if "SELLABLE_QTY_CHECK" in artifacts.logs_text:
@@ -1430,7 +1736,7 @@ def review_orders(
                     "KIS_SELL_SENT_WITH_ZERO_SELLABLE_QTY", sev, "order",
                     f"ticker={ticker}, sellable=0, sell submitted",
                     "0 sellable 매도 전송", "SELL_SKIP_NO_SELLABLE_QTY 가드 확인",
-                    evidence_source_file=str(snap_path or ""),
+                    **ev_kw,
                 ))
             elif sellable == 0 and hold > 0 and pending >= hold:
                 sev = "CRITICAL" if cfg.get("critical_on_sell_sent_with_zero_sellable_qty", True) else "ERROR"
@@ -1438,21 +1744,33 @@ def review_orders(
                     "KIS_SELL_SENT_WITH_ZERO_SELLABLE_QTY", sev, "order",
                     f"ticker={ticker}, sellable=0, sell submitted",
                     "0 sellable 매도 전송", "SELL_SKIP_NO_SELLABLE_QTY 가드 확인",
-                    evidence_source_file=str(snap_path or ""),
+                    **ev_kw,
                 ))
             elif (
                 ticker.upper() not in sellable_checks
                 and not ctx_checked
                 and ticker not in snap_sellable
             ):
-                review.findings.append(make_finding(
-                    "KIS_SELL_WITHOUT_SELLABLE_CHECK",
-                    _missing_evidence_severity(strict, normal="WARN"),
-                    "order",
-                    f"ticker={ticker}, no SELLABLE_QTY_CHECK log or structured_context",
-                    "매도 전 sellable 검증 evidence 부족", "trader _clamp_sell_qty evidence 저장 확인",
-                    evidence_source_file=str(snap_path or ""),
-                ))
+                order_ts = str(row.get("timestamp") or "")
+                legacy_cutoff = "2026-06-01"
+                if order_ts and order_ts[:10] < legacy_cutoff:
+                    review.findings.append(make_finding(
+                        "LEGACY_SELL_WITHOUT_SELLABLE_EVIDENCE", "INFO", "order",
+                        f"ticker={ticker}, legacy order without sellable evidence",
+                        "과거 주문 evidence 부족", "신규 주문부터 structured_context 저장됨",
+                        **ev_kw,
+                    ))
+                else:
+                    review.findings.append(make_finding(
+                        "KIS_SELL_WITHOUT_SELLABLE_CHECK",
+                        _missing_evidence_severity(strict, normal="WARN"),
+                        "order",
+                        f"ticker={ticker}, no SELLABLE_QTY_CHECK log or structured_context",
+                        "매도 전 sellable 검증 evidence 부족", "trader _clamp_sell_qty evidence 저장 확인",
+                        **ev_kw,
+                    ))
+            elif ctx_checked:
+                pass
 
     if "executed_sells=True" in artifacts.logs_text and review.rejected_order_count > 0:
         review.findings.append(make_finding(
@@ -1509,6 +1827,8 @@ def build_kis_endpoint_review(
             "LOG_UNAVAILABLE", "INFO", "",
             "output logs 없음", "로그 기반 교차검증 제한", "pipeline 로그 저장 확인",
         ))
+
+    all_findings.extend(_check_stale_artifacts(artifacts, strict))
 
     if strict:
         for name, rev in (
@@ -1666,6 +1986,8 @@ def kis_review_to_json_summary(ker: KisEndpointReview) -> Dict[str, Any]:
             "duplicate_tickers": br.duplicate_tickers,
             "holdings_value_usd": br.holdings_value_usd,
             "evidence_source_file": br.balance_source_status.source_file or None,
+            "evidence_trade_date": None,
+            "evidence_generated_at": None,
         },
         "present_balance": {
             "status": pr.present_balance_source_status.status,
@@ -1675,6 +1997,8 @@ def kis_review_to_json_summary(ker: KisEndpointReview) -> Dict[str, Any]:
             "holdings_value_usd": pr.holdings_value_usd,
             "currency_consistency_status": pr.currency_consistency_status,
             "evidence_source_file": pr.present_balance_source_status.source_file or None,
+            "evidence_trade_date": None,
+            "evidence_generated_at": None,
         },
         "nccs": {
             "status": nr.nccs_source_status.status,
@@ -1782,21 +2106,25 @@ def render_markdown(result: PerformanceReviewResult) -> str:
         "",
         "## Findings",
         "",
-        "| severity | category | title | evidence | impact | recommendation | evidence_source |",
-        "| --- | --- | --- | --- | --- | --- | --- |",
+        "| severity | category | title | evidence | impact | recommendation | evidence_source | evidence_trade_date | evidence_generated_at |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     for f in result.findings:
         cat = f.category or normalize_finding_category(f.title)
         src = f.evidence_source_file or ""
+        fallback = "yes" if f.latest_fallback_used else ""
         lines.append(
             f"| {f.severity} | {cat} | {normalize_finding_title(f.title)} | "
-            f"{f.evidence[:80]} | {f.impact[:60]} | {f.recommendation[:60]} | {src[:60]} |"
+            f"{f.evidence[:80]} | {f.impact[:60]} | {f.recommendation[:60]} | {src[:60]} | "
+            f"{f.evidence_trade_date or fallback} | {f.evidence_generated_at[:40] if f.evidence_generated_at else ''} |"
         )
     lines.extend(["", "### KIS Endpoint Findings", ""])
     for f in result.findings:
         cat = f.category or normalize_finding_category(f.title)
         lines.append(
-            f"- **{f.severity}** [{cat}] {normalize_finding_title(f.title)}: {f.evidence[:120]}"
+            f"- **{f.severity}** [{cat}] {normalize_finding_title(f.title)}: {f.evidence[:120]} "
+            f"(source={f.evidence_source_file or 'N/A'}, trade_date={f.evidence_trade_date or 'N/A'}, "
+            f"generated_at={f.evidence_generated_at or 'N/A'})"
         )
     if result.action_items:
         lines.extend(["", "## Action Items", ""])

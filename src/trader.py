@@ -51,9 +51,11 @@ from utils import (
     resolve_us_sell_order_params,
     resolve_us_buy_order_params,
     resolve_us_ovrs_excg,
+    resolve_pipeline_context,
 )
 from account_snapshot import (
     AccountSnapshot,
+    account_snapshot_evidence_paths,
     compute_sellable_qty,
     is_sell_order_success,
     is_sell_qty_exceeded_error,
@@ -843,20 +845,35 @@ class Trader:
         except Exception:
             start_ymd = end_ymd = datetime.now(KST).strftime("%Y%m%d")
 
+        ctx = resolve_pipeline_context(market=self.market)
+        trade_date = ctx["trade_date"]
+        pipeline_session = ctx.get("session")
+        env_td = (os.getenv("PIPELINE_TRADE_DATE") or "").strip()
+        if env_td and env_td != trade_date:
+            logger.warning(
+                "PIPELINE_TRADE_DATE=%s stale vs resolve_pipeline_context trade_date=%s; using resolved",
+                env_td,
+                trade_date,
+            )
         snap = load_kis_account_snapshot(
             self.kis,
             self.market,
-            trade_date=os.getenv("PIPELINE_TRADE_DATE", "") or datetime.now(KST).strftime("%Y%m%d"),
+            trade_date=trade_date,
             include_ccnl=False,
             ccnl_start_ymd=start_ymd,
             ccnl_end_ymd=end_ymd,
         )
-        session = os.getenv("PIPELINE_SESSION", "") or None
-        save_account_snapshot_evidence(
+        snap.trade_date = trade_date
+        session = (os.getenv("PIPELINE_SESSION") or pipeline_session or "").lower().strip()
+        generated_at = datetime.now(KST).isoformat()
+        saved_path = save_account_snapshot_evidence(
             snap,
             market=self.market,
             session=session if session in ("am", "pm") else None,
+            pipeline_context_source="resolve_pipeline_context",
+            generated_at_kst=generated_at,
         )
+        self._last_account_snapshot_evidence_path = saved_path
         if not snap.valid or snap.error:
             msg = snap.error or snap.invalid_reason or "KIS endpoint snapshot failed"
             logger.error("ACCOUNT_ENDPOINT_FAILED: %s", msg)
@@ -1009,6 +1026,25 @@ class Trader:
         sellable = int((snap.sellable_qty_by_ticker or {}).get(sym, compute_sellable_qty(holding_qty, pending)))
         return holding_qty, pending, sellable
 
+    def _sellable_evidence_meta(self, sellable_meta: Dict[str, Any]) -> Dict[str, Any]:
+        """_clamp_sell_qty evidence에 snapshot 파일/시각 보강."""
+        meta = dict(sellable_meta or {})
+        snap = self._latest_account_snapshot
+        if snap and snap.snapshot_ts:
+            meta.setdefault("snapshot_ts_kst", snap.snapshot_ts)
+        evidence_path = getattr(self, "_last_account_snapshot_evidence_path", None)
+        if evidence_path:
+            meta.setdefault("account_snapshot_file", str(evidence_path))
+        elif snap:
+            dated, _ = account_snapshot_evidence_paths(
+                self.market,
+                snap.trade_date,
+                os.getenv("PIPELINE_SESSION") if os.getenv("PIPELINE_SESSION") in ("am", "pm") else None,
+            )
+            if dated.exists():
+                meta.setdefault("account_snapshot_file", str(dated))
+        return meta
+
     def _clamp_sell_qty(self, ticker: str, requested_qty: int) -> Tuple[int, bool, str, Dict[str, Any]]:
         """
         매도 주문 수량을 KIS sellable_qty 기준으로 보정.
@@ -1035,7 +1071,7 @@ class Trader:
                 "sellable_qty": sellable_qty,
                 "clamp_action": clamp_action,
             }
-            return 0, True, "SELL_SKIP_NO_SELLABLE_QTY", meta
+            return 0, True, "SELL_SKIP_NO_SELLABLE_QTY", self._sellable_evidence_meta(meta)
         if requested_qty > sellable_qty:
             clamp_action = "clamped"
             logger.warning(
@@ -1052,7 +1088,7 @@ class Trader:
                 "sellable_qty": sellable_qty,
                 "clamp_action": clamp_action,
             }
-            return sellable_qty, False, "SELL_QTY_CLAMPED", meta
+            return sellable_qty, False, "SELL_QTY_CLAMPED", self._sellable_evidence_meta(meta)
         meta = {
             "sellable_qty_checked": True,
             "requested_qty": requested_qty,
@@ -1061,7 +1097,7 @@ class Trader:
             "sellable_qty": sellable_qty,
             "clamp_action": "none",
         }
-        return requested_qty, False, "OK", meta
+        return requested_qty, False, "OK", self._sellable_evidence_meta(meta)
 
     def _merge_sellable_evidence(
         self,
