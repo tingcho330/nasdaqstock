@@ -89,6 +89,9 @@ STANDARD_FINDINGS = {
     "ACCOUNT_SYNC_MISMATCH",
     "ACCOUNT_SNAPSHOT_INVALID",
     "ARTIFACT_DATE_STALE",
+    "ARTIFACT_EMPTY_LIST",
+    "ARTIFACT_UNSUPPORTED_JSON_ROOT",
+    "ARTIFACT_PARSE_FAILED",
     "LEGACY_SELL_WITHOUT_SELLABLE_EVIDENCE",
     "LOG_UNAVAILABLE",
 }
@@ -123,7 +126,9 @@ def normalize_finding_category(title: str, category: Optional[str] = None) -> st
     if category:
         return category
     t = normalize_finding_title(title)
-    if t.startswith("KIS_BALANCE_") or t.startswith("KIS_PRESENT_BALANCE_") or t == "LOG_UNAVAILABLE":
+    if t.startswith("ARTIFACT_") or t == "LOG_UNAVAILABLE":
+        return "DATA_QUALITY"
+    if t.startswith("KIS_BALANCE_") or t.startswith("KIS_PRESENT_BALANCE_"):
         return "DATA_QUALITY"
     if t.startswith("KIS_NCCS_") or t.startswith("KIS_CCNL_") or t.startswith("KIS_ORDER_"):
         return "OPERATIONS"
@@ -133,8 +138,6 @@ def normalize_finding_category(title: str, category: Optional[str] = None) -> st
         return "RISK"
     if t.startswith("ACCOUNT_SNAPSHOT_") or t == "ACCOUNT_SYNC_MISMATCH":
         return "OPERATIONS"
-    if t == "ARTIFACT_DATE_STALE":
-        return "DATA_QUALITY"
     if t == "LEGACY_SELL_WITHOUT_SELLABLE_EVIDENCE":
         return "RISK"
     return "OPERATIONS"
@@ -549,7 +552,7 @@ def load_trade_rows(db_path: Path, start: str, end: str) -> List[Dict[str, Any]]
     return rows
 
 
-def _load_json(path: Optional[Path]) -> Optional[Dict[str, Any]]:
+def _load_json(path: Optional[Path]) -> Any:
     if not path or not path.exists():
         return None
     try:
@@ -558,6 +561,127 @@ def _load_json(path: Optional[Path]) -> Optional[Dict[str, Any]]:
     except Exception as e:
         logger.debug("JSON 로드 실패 %s: %s", path, e)
         return None
+
+
+_ARTIFACT_DATE_KEYS = ("trade_date", "date", "pipeline_trade_date", "evidence_trade_date", "as_of")
+_ARTIFACT_GENERATED_KEYS = ("generated_at", "generated_at_kst", "snapshot_ts_kst", "updated_at", "timestamp")
+_ARTIFACT_SESSION_KEYS = ("session", "pipeline_session")
+_ARTIFACT_MARKET_KEYS = ("market",)
+_LIST_ITEM_GENERATED_KEYS = ("generated_at", "generated_at_kst", "updated_at", "timestamp")
+
+_ARTIFACT_FILENAME_PATTERNS: Tuple[re.Pattern, ...] = (
+    re.compile(r"^screener_candidates_full_(?P<date>\d{8})_(?P<session>am|pm)_(?P<market>[A-Z0-9]+)$", re.I),
+    re.compile(r"^screener_candidates_(?P<date>\d{8})_(?P<session>am|pm)_(?P<market>[A-Z0-9]+)$", re.I),
+    re.compile(r"^screener_holdings_(?P<date>\d{8})_(?P<session>am|pm)_(?P<market>[A-Z0-9]+)$", re.I),
+    re.compile(r"^screener_scores_(?P<date>\d{8})_(?P<session>am|pm)_(?P<market>[A-Z0-9]+)$", re.I),
+    re.compile(r"^market_state_(?P<date>\d{8})_(?P<session>am|pm)_(?P<market>[A-Z0-9]+)$", re.I),
+    re.compile(r"^gpt_trades_(?P<date>\d{8})_(?P<session>am|pm)_(?P<market>[A-Z0-9]+)$", re.I),
+    re.compile(r"^collected_news_(?P<date>\d{8})_(?P<session>am|pm)_(?P<market>[A-Z0-9]+)$", re.I),
+    re.compile(r"^account_snapshot_(?P<market>[A-Z0-9]+)_(?P<date>\d{8})_(?P<session>am|pm)$", re.I),
+    re.compile(r"^account_snapshot_(?P<market>[A-Z0-9]+)_(?P<date>\d{8})$", re.I),
+    re.compile(r"^order_reconcile_(?P<market>[A-Z0-9]+)_(?P<date>\d{8})$", re.I),
+    re.compile(r"^balance_(?P<date>\d{8})$", re.I),
+    re.compile(r"^summary_(?P<date>\d{8})$", re.I),
+)
+
+
+def _first_str_from_mapping(record: Dict[str, Any], keys: Sequence[str]) -> str:
+    for key in keys:
+        val = record.get(key)
+        if val not in (None, ""):
+            return str(val).strip()
+    return ""
+
+
+def _parse_artifact_filename(path: Path) -> Dict[str, str]:
+    stem = path.stem
+    for pattern in _ARTIFACT_FILENAME_PATTERNS:
+        match = pattern.match(stem)
+        if match:
+            groups = match.groupdict()
+            return {
+                "date": str(groups.get("date") or "").strip(),
+                "session": str(groups.get("session") or "").strip().lower(),
+                "market": str(groups.get("market") or "").strip().upper(),
+            }
+    date_match = re.search(r"(\d{8})", stem)
+    return {
+        "date": date_match.group(1) if date_match else "",
+        "session": "",
+        "market": "",
+    }
+
+
+def _list_generated_at_candidate(items: List[Any]) -> str:
+    candidates: List[str] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        for key in _LIST_ITEM_GENERATED_KEYS:
+            val = str(item.get(key) or "").strip()
+            if val:
+                candidates.append(val)
+    if not candidates:
+        return ""
+    return max(candidates, key=lambda s: (_date_yyyymmdd_from_iso(s), s))
+
+
+def extract_artifact_temporal_metadata(path: Path, payload: Any) -> Dict[str, Any]:
+    """artifact JSON 경로·payload에서 날짜/세션/시장/생성시각 메타데이터 추출."""
+    fname = _parse_artifact_filename(path)
+    meta: Dict[str, Any] = {
+        "artifact_date": "",
+        "artifact_session": fname.get("session", ""),
+        "artifact_market": fname.get("market", ""),
+        "generated_at": "",
+        "generated_at_kst": "",
+        "source": "",
+        "root_type": "other",
+        "item_count": 0,
+        "evidence_source_file": str(path),
+    }
+
+    if isinstance(payload, dict):
+        meta["root_type"] = "dict"
+        meta["item_count"] = 1
+        meta["artifact_date"] = (
+            _first_str_from_mapping(payload, _ARTIFACT_DATE_KEYS) or fname.get("date", "")
+        )
+        meta["artifact_session"] = (
+            _first_str_from_mapping(payload, _ARTIFACT_SESSION_KEYS) or fname.get("session", "")
+        )
+        meta["artifact_market"] = (
+            _first_str_from_mapping(payload, _ARTIFACT_MARKET_KEYS) or fname.get("market", "")
+        )
+        generated = _first_str_from_mapping(payload, _ARTIFACT_GENERATED_KEYS)
+        meta["generated_at"] = generated
+        meta["generated_at_kst"] = str(
+            payload.get("generated_at_kst") or payload.get("snapshot_ts_kst") or generated or ""
+        ).strip()
+        meta["source"] = str(payload.get("source") or "").strip()
+    elif isinstance(payload, list):
+        meta["root_type"] = "list"
+        meta["item_count"] = len(payload)
+        meta["artifact_date"] = fname.get("date", "")
+        meta["artifact_session"] = fname.get("session", "")
+        meta["artifact_market"] = fname.get("market", "")
+        generated = _list_generated_at_candidate(payload)
+        meta["generated_at"] = generated
+        meta["generated_at_kst"] = generated
+        if payload and isinstance(payload[0], dict):
+            meta["source"] = str(payload[0].get("source") or "").strip()
+    else:
+        meta["root_type"] = "other"
+        meta["artifact_date"] = fname.get("date", "")
+
+    if meta["artifact_date"] and len(meta["artifact_date"]) == 8 and meta["artifact_date"].isdigit():
+        pass
+    else:
+        day = _date_yyyymmdd_from_iso(meta["artifact_date"])
+        if day:
+            meta["artifact_date"] = day
+
+    return meta
 
 
 def _extract_evidence_date(payload: Optional[Dict[str, Any]]) -> str:
@@ -827,39 +951,97 @@ def _check_snapshot_date_findings(
 
 def _check_stale_artifacts(artifacts: ReviewArtifacts, strict: bool) -> List[ReviewFinding]:
     findings: List[ReviewFinding] = []
-    patterns = ("market_state_*", "gpt_trades_*", "screener_*")
+    review_date = artifacts.review_date
+    stale_sev = "WARN" if strict else "INFO"
+    patterns = ("market_state_*", "gpt_trades_*", "screener_*", "collected_news_*")
+
     for pattern in patterns:
         for path in artifacts.output_dir.glob(pattern):
             if not path.is_file() or path.suffix != ".json":
                 continue
-            payload = _load_json(path)
-            if not payload:
-                continue
-            internal_date = str(
-                payload.get("trade_date")
-                or payload.get("date")
-                or payload.get("as_of")
-                or ""
-            ).strip()
-            if not internal_date:
-                dm = re.search(r"(\d{8})", path.stem)
-                internal_date = dm.group(1) if dm else ""
-            gen_at = str(
-                payload.get("generated_at_kst")
-                or payload.get("generated_at")
-                or payload.get("timestamp")
-                or ""
-            ).strip()
-            gen_day = _date_yyyymmdd_from_iso(gen_at)
-            if internal_date and gen_day and _calendar_day_gap(gen_day, internal_date) >= 1:
+            src = str(path)
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    payload = json.load(f)
+            except Exception as exc:
                 findings.append(make_finding(
-                    "ARTIFACT_DATE_STALE", "WARN" if strict else "INFO", "",
-                    f"{path.name}: internal_date={internal_date}, generated={gen_day}",
-                    "artifact 날짜 stale", "파이프라인 재생성 확인",
-                    evidence_source_file=str(path),
-                    evidence_trade_date=internal_date,
-                    evidence_generated_at=gen_at,
+                    "ARTIFACT_PARSE_FAILED", stale_sev, "",
+                    f"{path.name}: {str(exc)[:120]}",
+                    "artifact JSON 파싱 실패", "파일 손상·인코딩 확인",
+                    category="DATA_QUALITY",
+                    evidence_source_file=src,
                 ))
+                continue
+
+            if payload is None:
+                continue
+
+            try:
+                meta = extract_artifact_temporal_metadata(path, payload)
+            except Exception as exc:
+                findings.append(make_finding(
+                    "ARTIFACT_PARSE_FAILED", stale_sev, "",
+                    f"{path.name}: metadata extract failed: {str(exc)[:120]}",
+                    "artifact 메타데이터 추출 실패", "파일 구조 확인",
+                    category="DATA_QUALITY",
+                    evidence_source_file=src,
+                ))
+                continue
+
+            root_type = meta.get("root_type")
+            if root_type == "other":
+                findings.append(make_finding(
+                    "ARTIFACT_UNSUPPORTED_JSON_ROOT", "WARN", "",
+                    f"{path.name}: root_type={root_type}",
+                    "지원하지 않는 JSON root", "dict/list artifact로 저장 확인",
+                    category="DATA_QUALITY",
+                    evidence_source_file=src,
+                    evidence_trade_date=str(meta.get("artifact_date") or ""),
+                    evidence_generated_at=str(meta.get("generated_at") or ""),
+                ))
+                continue
+
+            if root_type == "list" and int(meta.get("item_count") or 0) == 0:
+                findings.append(make_finding(
+                    "ARTIFACT_EMPTY_LIST", stale_sev, "",
+                    f"{path.name}: empty list root",
+                    "빈 list artifact", "스크리너/파이프라인 재실행",
+                    category="DATA_QUALITY",
+                    evidence_source_file=src,
+                    evidence_trade_date=str(meta.get("artifact_date") or ""),
+                ))
+                continue
+
+            artifact_date = str(meta.get("artifact_date") or "").strip()
+            generated_at = str(
+                meta.get("generated_at_kst") or meta.get("generated_at") or ""
+            ).strip()
+            generated_day = _date_yyyymmdd_from_iso(generated_at)
+
+            if artifact_date and review_date:
+                if _calendar_day_gap(review_date, artifact_date) >= 1:
+                    findings.append(make_finding(
+                        "ARTIFACT_DATE_STALE", stale_sev, "",
+                        f"{path.name}: artifact_date={artifact_date}, review_date={review_date}",
+                        "리뷰일과 artifact 날짜 불일치", "해당일 artifact 재생성 확인",
+                        category="DATA_QUALITY",
+                        evidence_source_file=src,
+                        evidence_trade_date=artifact_date,
+                        evidence_generated_at=generated_at,
+                    ))
+                    continue
+
+            if artifact_date and generated_day and _calendar_day_gap(generated_day, artifact_date) >= 1:
+                findings.append(make_finding(
+                    "ARTIFACT_DATE_STALE", stale_sev, "",
+                    f"{path.name}: artifact_date={artifact_date}, generated={generated_day}",
+                    "artifact 내부 날짜 stale", "파이프라인 재생성 확인",
+                    category="DATA_QUALITY",
+                    evidence_source_file=src,
+                    evidence_trade_date=artifact_date,
+                    evidence_generated_at=generated_at,
+                ))
+
     return findings
 
 
@@ -1092,7 +1274,9 @@ def review_balance(artifacts: ReviewArtifacts, strict: bool) -> KisBalanceReview
         str(k).upper(): str(v).upper()
         for k, v in (bal_ep.get("status_by_exchange") or {}).items()
     }
-    exchange_coverage = list(bal_ep.get("exchange_coverage") or snap_payload.get("exchange_coverage") or [])
+    exchange_coverage = list(
+        bal_ep.get("exchange_coverage") or (snap_payload or {}).get("exchange_coverage") or []
+    )
     if not exchange_coverage and status_by_exchange:
         exchange_coverage = list(status_by_exchange.keys())
 
