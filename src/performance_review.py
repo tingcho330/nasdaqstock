@@ -35,6 +35,9 @@ logger = logging.getLogger("performance_review")
 
 US_EXCHANGES = ("NASD", "NYSE", "AMEX")
 
+# sellable_qty_checked structured_context 도입 시각 (KST). config sellable_qty_evidence_introduced_at로 override 가능.
+SELLABLE_QTY_EVIDENCE_INTRODUCED_AT = "2026-07-07T09:57:00+09:00"
+
 KIS_ENDPOINT_META = {
     "inquire-balance": {
         "path": "/uapi/overseas-stock/v1/trading/inquire-balance",
@@ -478,6 +481,7 @@ def _default_review_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
         "critical_on_failed_marked_as_executed": True,
         "warn_on_missing_kis_endpoint_evidence": True,
         "warn_on_partial_exchange_coverage": True,
+        "sellable_qty_evidence_introduced_at": SELLABLE_QTY_EVIDENCE_INTRODUCED_AT,
     }
     user = cfg.get("performance_review") or {}
     return {**defaults, **user}
@@ -2088,6 +2092,72 @@ def _parse_structured_context(row: Dict[str, Any]) -> Dict[str, Any]:
     return {}
 
 
+def _sellable_evidence_introduced_at(cfg: Dict[str, Any]) -> datetime:
+    raw = str(
+        cfg.get("sellable_qty_evidence_introduced_at")
+        or SELLABLE_QTY_EVIDENCE_INTRODUCED_AT
+    ).strip()
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        dt = datetime.fromisoformat(SELLABLE_QTY_EVIDENCE_INTRODUCED_AT.replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=KST)
+    return dt.astimezone(KST)
+
+
+def _parse_order_timestamp_kst(ts: str) -> Optional[datetime]:
+    raw = str(ts or "").strip()
+    if not raw:
+        return None
+    for candidate in (raw, raw.replace(" ", "T", 1) if " " in raw and "T" not in raw else raw):
+        try:
+            dt = datetime.fromisoformat(candidate.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                return dt.replace(tzinfo=KST)
+            return dt.astimezone(KST)
+        except ValueError:
+            continue
+    try:
+        return datetime.strptime(raw[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=KST)
+    except ValueError:
+        return None
+
+
+def _sell_order_finding_evidence(
+    *,
+    ticker: str,
+    order_id: str,
+    timestamp: str,
+    order_status: str,
+    reason: str,
+    aux: str = "",
+) -> str:
+    parts = [
+        f"ticker={ticker}",
+        f"order_id={order_id}",
+        f"timestamp={timestamp}",
+        f"order_status={order_status}",
+        f"reason={reason}",
+    ]
+    if aux:
+        parts.append(aux)
+    return ", ".join(parts)
+
+
+def _nccs_sellable_auxiliary_evidence(nccs: KisNccsReview) -> str:
+    status = str(nccs.nccs_source_status.status or "").upper()
+    if status not in ("OK", "EMPTY"):
+        return ""
+    pending = nccs.pending_sell_qty_by_ticker or {}
+    if pending:
+        return f"nccs_status={status}, pending_sell_qty_by_ticker={pending}"
+    return (
+        f"nccs_status={status}, open_sell_orders_count={nccs.open_sell_orders_count}, "
+        f"pending_sell_qty_by_ticker={pending}"
+    )
+
+
 def _parse_order_response_from_row(row: Dict[str, Any]) -> Dict[str, Any]:
     ctx = _parse_structured_context(row)
     for k in ("kis_response", "order_response", "raw_response", "raw"):
@@ -2108,9 +2178,7 @@ def review_orders(
     review = KisOrderReview()
     market = artifacts.market
     snap_sel = load_account_snapshot_evidence(artifacts, session=artifacts.session)
-    snap_payload = snap_sel.payload
     ev_kw = _finding_evidence_kwargs(snap_sel)
-    snap_sellable = (snap_payload or {}).get("sellable_qty_by_ticker") or {}
     sellable_checks: Set[str] = set()
     if "SELLABLE_QTY_CHECK" in artifacts.logs_text:
         for m in re.finditer(r"\[SELLABLE_QTY_CHECK\]\s+ticker=(\S+)", artifacts.logs_text):
@@ -2174,18 +2242,32 @@ def review_orders(
             ))
 
         if action == "SELL" and rt_cd in ("0", "") and odno:
+            order_id = str(odno).strip()
+            order_ts = str(row.get("timestamp") or "").strip()
+            if not ticker or not order_id or not order_ts:
+                continue
+
             hold = balance.total_holding_qty_by_ticker.get(ticker, 0)
             pending = nccs.pending_sell_qty_by_ticker.get(ticker, 0)
             sellable = max(0, hold - pending)
             ctx_sellable = _safe_int(row_ctx.get("sellable_qty"))
             ctx_checked = bool(row_ctx.get("sellable_qty_checked"))
+            aux = _nccs_sellable_auxiliary_evidence(nccs)
+
             if row_ctx.get("clamp_action") == "skipped_zero_sellable" or (
                 ctx_checked and ctx_sellable == 0 and _safe_int(row.get("quantity")) > 0
             ):
                 sev = "CRITICAL" if cfg.get("critical_on_sell_sent_with_zero_sellable_qty", True) else "ERROR"
                 review.findings.append(make_finding(
                     "KIS_SELL_SENT_WITH_ZERO_SELLABLE_QTY", sev, "order",
-                    f"ticker={ticker}, sellable=0, sell submitted",
+                    _sell_order_finding_evidence(
+                        ticker=ticker,
+                        order_id=order_id,
+                        timestamp=order_ts,
+                        order_status=db_status,
+                        reason="sellable_qty=0 sell submitted",
+                        aux=aux,
+                    ),
                     "0 sellable 매도 전송", "SELL_SKIP_NO_SELLABLE_QTY 가드 확인",
                     **ev_kw,
                 ))
@@ -2193,22 +2275,42 @@ def review_orders(
                 sev = "CRITICAL" if cfg.get("critical_on_sell_sent_with_zero_sellable_qty", True) else "ERROR"
                 review.findings.append(make_finding(
                     "KIS_SELL_SENT_WITH_ZERO_SELLABLE_QTY", sev, "order",
-                    f"ticker={ticker}, sellable=0, sell submitted",
+                    _sell_order_finding_evidence(
+                        ticker=ticker,
+                        order_id=order_id,
+                        timestamp=order_ts,
+                        order_status=db_status,
+                        reason="nccs pending consumed all holdings",
+                        aux=aux,
+                    ),
                     "0 sellable 매도 전송", "SELL_SKIP_NO_SELLABLE_QTY 가드 확인",
                     **ev_kw,
                 ))
-            elif (
-                ticker.upper() not in sellable_checks
-                and not ctx_checked
-                and ticker not in snap_sellable
-            ):
-                order_ts = str(row.get("timestamp") or "")
-                legacy_cutoff = "2026-06-01"
-                if order_ts and order_ts[:10] < legacy_cutoff:
+            elif ctx_checked:
+                continue
+            elif ticker.upper() in sellable_checks:
+                continue
+            else:
+                order_dt = _parse_order_timestamp_kst(order_ts)
+                if order_dt is None:
+                    continue
+                introduced_at = _sellable_evidence_introduced_at(cfg)
+                if order_dt < introduced_at:
                     review.findings.append(make_finding(
-                        "LEGACY_SELL_WITHOUT_SELLABLE_EVIDENCE", "INFO", "order",
-                        f"ticker={ticker}, legacy order without sellable evidence",
-                        "과거 주문 evidence 부족", "신규 주문부터 structured_context 저장됨",
+                        "LEGACY_SELL_WITHOUT_SELLABLE_EVIDENCE",
+                        "INFO",
+                        "order",
+                        _sell_order_finding_evidence(
+                            ticker=ticker,
+                            order_id=order_id,
+                            timestamp=order_ts,
+                            order_status=db_status,
+                            reason="pre_sellable_qty_evidence_order",
+                            aux=aux,
+                        ),
+                        "과거 주문 sellable evidence 없음",
+                        "과거 주문으로 sellable evidence 없음. 신규 SELL부터 검증",
+                        category="RISK",
                         **ev_kw,
                     ))
                 else:
@@ -2216,12 +2318,18 @@ def review_orders(
                         "KIS_SELL_WITHOUT_SELLABLE_CHECK",
                         _missing_evidence_severity(strict, normal="WARN"),
                         "order",
-                        f"ticker={ticker}, no SELLABLE_QTY_CHECK log or structured_context",
-                        "매도 전 sellable 검증 evidence 부족", "trader _clamp_sell_qty evidence 저장 확인",
+                        _sell_order_finding_evidence(
+                            ticker=ticker,
+                            order_id=order_id,
+                            timestamp=order_ts,
+                            order_status=db_status,
+                            reason="sellable_qty_checked missing",
+                            aux=aux,
+                        ),
+                        "매도 전 sellable 검증 evidence 부족",
+                        "trader _clamp_sell_qty evidence 저장 확인",
                         **ev_kw,
                     ))
-            elif ctx_checked:
-                pass
 
     if "executed_sells=True" in artifacts.logs_text and review.rejected_order_count > 0:
         review.findings.append(make_finding(

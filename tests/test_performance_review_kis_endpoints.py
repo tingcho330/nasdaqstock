@@ -283,7 +283,7 @@ def test_sellable_checked_skips_without_check(tmp_path):
     art = _artifacts(
         tmp_path,
         trade_rows=[{
-            "timestamp": "2026-07-07 10:00:00",
+            "timestamp": "2026-07-07T10:00:00+09:00",
             "order_id": "S1",
             "order_status": "executed",
             "action": "SELL",
@@ -296,13 +296,87 @@ def test_sellable_checked_skips_without_check(tmp_path):
     bal = KisBalanceReview()
     orr = review_orders(art, nccs, bal, strict=True, cfg={})
     assert "KIS_SELL_WITHOUT_SELLABLE_CHECK" not in _finding_titles(orr.findings)
+    assert "LEGACY_SELL_WITHOUT_SELLABLE_EVIDENCE" not in _finding_titles(orr.findings)
+
+
+def test_legacy_sell_without_sellable_evidence_info(tmp_path):
+    art = _artifacts(
+        tmp_path,
+        trade_rows=[{
+            "timestamp": "2026-06-15T10:00:00+09:00",
+            "order_id": "LEG1",
+            "order_status": "executed",
+            "action": "SELL",
+            "ticker": "AAPL",
+            "quantity": 1,
+            "structured_context": json.dumps({}),
+        }],
+    )
+    nccs = KisNccsReview()
+    nccs.nccs_source_status.status = "EMPTY"
+    bal = KisBalanceReview()
+    orr = review_orders(art, nccs, bal, strict=True, cfg={})
+    titles = _finding_titles(orr.findings)
+    assert "KIS_SELL_WITHOUT_SELLABLE_CHECK" not in titles
+    assert "LEGACY_SELL_WITHOUT_SELLABLE_EVIDENCE" in titles
+    legacy = [f for f in orr.findings if f.title == "LEGACY_SELL_WITHOUT_SELLABLE_EVIDENCE"][0]
+    assert legacy.severity == "INFO"
+    assert legacy.category == "RISK"
+    assert "order_id=LEG1" in legacy.evidence
+    assert "ticker=AAPL" in legacy.evidence
+    assert "nccs_status=EMPTY" in legacy.evidence
+
+
+def test_post_intro_sell_without_check_warns(tmp_path):
+    art = _artifacts(
+        tmp_path,
+        trade_rows=[{
+            "timestamp": "2026-07-07T10:00:00+09:00",
+            "order_id": "NEW1",
+            "order_status": "executed",
+            "action": "SELL",
+            "ticker": "MSFT",
+            "quantity": 1,
+            "structured_context": json.dumps({}),
+        }],
+    )
+    nccs = KisNccsReview()
+    bal = KisBalanceReview()
+    orr = review_orders(art, nccs, bal, strict=True, cfg={})
+    titles = _finding_titles(orr.findings)
+    assert "LEGACY_SELL_WITHOUT_SELLABLE_EVIDENCE" not in titles
+    assert "KIS_SELL_WITHOUT_SELLABLE_CHECK" in titles
+    warn = [f for f in orr.findings if f.title == "KIS_SELL_WITHOUT_SELLABLE_CHECK"][0]
+    assert warn.severity == "WARN"
+    assert "order_id=NEW1" in warn.evidence
+    assert "reason=sellable_qty_checked missing" in warn.evidence
+
+
+def test_legacy_sell_batch_no_warn(tmp_path):
+    """도입 이전 SELL 여러 건은 WARN 없이 LEGACY INFO만."""
+    rows = []
+    for i, day in enumerate(("2026-06-10", "2026-06-20", "2026-07-01")):
+        rows.append({
+            "timestamp": f"{day}T15:00:00+09:00",
+            "order_id": f"LEG{i}",
+            "order_status": "executed",
+            "action": "SELL",
+            "ticker": "AAPL",
+            "quantity": 1,
+            "structured_context": json.dumps({}),
+        })
+    art = _artifacts(tmp_path, trade_rows=rows)
+    orr = review_orders(art, KisNccsReview(), KisBalanceReview(), strict=True, cfg={})
+    titles = _finding_titles(orr.findings)
+    assert "KIS_SELL_WITHOUT_SELLABLE_CHECK" not in titles
+    assert sum(1 for f in orr.findings if f.title == "LEGACY_SELL_WITHOUT_SELLABLE_EVIDENCE") == 3
 
 
 def test_zero_sellable_sell_critical(tmp_path):
     art = _artifacts(
         tmp_path,
         trade_rows=[{
-            "timestamp": "2026-07-07 10:00:00",
+            "timestamp": "2026-07-07T10:00:00+09:00",
             "order_id": "S2",
             "order_status": "executed",
             "action": "SELL",
