@@ -366,3 +366,160 @@ def test_no_sensitive_info_in_output(tmp_path):
     blob = json.dumps(summary)
     assert "SECRETKEY" not in blob
     assert "1234567890" not in blob
+
+
+def _base_reconcile(**overrides) -> dict:
+    payload = {
+        "schema_version": "1.0",
+        "market": "SP500",
+        "trade_date": "20260707",
+        "ccnl": {
+            "endpoint": "/uapi/overseas-stock/v1/trading/inquire-ccnl",
+            "status": "OK",
+            "query_start_date": "20260704",
+            "query_end_date": "20260707",
+            "order_count": 1,
+            "filled_order_count": 1,
+            "exchange_coverage": ["NASD"],
+        },
+        "db_reconcile": {
+            "checked_trade_records": 0,
+            "db_vs_ccnl_mismatch_count": 0,
+            "order_id_coverage_rate": 1.0,
+        },
+        "findings": [],
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _write_reconcile(tmp_path: Path, payload: dict, name: str = "order_reconcile_SP500_20260707.json") -> Path:
+    path = tmp_path / name
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    return path
+
+
+def _trade_row(
+    order_id: str = "ORD001",
+    *,
+    ticker: str = "AAPL",
+    order_status: str = "executed",
+    timestamp: str = "2026-07-07T10:00:00+09:00",
+) -> dict:
+    return {
+        "order_id": order_id,
+        "ticker": ticker,
+        "order_status": order_status,
+        "executed_qty": 1,
+        "timestamp": timestamp,
+    }
+
+
+def _finding_codes(findings) -> set:
+    return {f.title for f in findings}
+
+
+def test_ccnl_trusts_reconcile_zero_mismatch_no_false_positive(tmp_path):
+    """db_vs_ccnl_mismatch_count=0이면 ccnl_orders 없어도 mismatch 미발생."""
+    _write_reconcile(tmp_path, _base_reconcile())
+    art = _artifacts(
+        tmp_path,
+        trade_rows=[_trade_row()],
+    )
+    review = review_ccnl(art, strict=False)
+    assert review.db_vs_ccnl_mismatch_count == 0
+    assert "KIS_DB_CCNL_STATUS_MISMATCH" not in _finding_codes(review.findings)
+
+
+def test_ccnl_empty_evidence_findings_no_mismatch_finding(tmp_path):
+    """order_reconcile findings=[]이면 mismatch finding을 추가 생성하지 않음."""
+    _write_reconcile(tmp_path, _base_reconcile(findings=[]))
+    art = _artifacts(
+        tmp_path,
+        trade_rows=[_trade_row(order_status="pending")],
+    )
+    review = review_ccnl(art, strict=False)
+    assert "KIS_DB_CCNL_STATUS_MISMATCH" not in _finding_codes(review.findings)
+
+
+def test_ccnl_zero_checked_zero_mismatch_is_normal(tmp_path):
+    """checked_trade_records=0, mismatch_count=0이면 정상."""
+    payload = _base_reconcile()
+    payload["db_reconcile"] = {
+        "checked_trade_records": 0,
+        "db_vs_ccnl_mismatch_count": 0,
+    }
+    _write_reconcile(tmp_path, payload)
+    art = _artifacts(tmp_path, trade_rows=[_trade_row()])
+    review = review_ccnl(art, strict=False)
+    assert review.db_vs_ccnl_mismatch_count == 0
+    assert "KIS_DB_CCNL_STATUS_MISMATCH" not in _finding_codes(review.findings)
+
+
+def test_ccnl_out_of_query_range_not_mismatch(tmp_path):
+    """ccnl query range 밖 주문은 mismatch가 아니라 coverage incomplete."""
+    reconcile = _base_reconcile()
+    del reconcile["db_reconcile"]
+    reconcile["findings"] = []
+    _write_reconcile(tmp_path, reconcile)
+    art = _artifacts(
+        tmp_path,
+        trade_rows=[_trade_row(timestamp="2026-07-01T10:00:00+09:00")],
+    )
+    review = review_ccnl(art, strict=False)
+    assert "KIS_DB_CCNL_STATUS_MISMATCH" not in _finding_codes(review.findings)
+    assert "KIS_CCNL_PERIOD_COVERAGE_INCOMPLETE" in _finding_codes(review.findings)
+
+
+def test_ccnl_mismatch_only_when_evidence_reports_positive_with_details(tmp_path):
+    """mismatch_count>0이고 evidence에 상세가 있을 때만 KIS_DB_CCNL_STATUS_MISMATCH."""
+    payload = _base_reconcile(
+        db_reconcile={
+            "checked_trade_records": 1,
+            "db_vs_ccnl_mismatch_count": 1,
+        },
+        findings=[
+            {
+                "title": "KIS_DB_CCNL_STATUS_MISMATCH",
+                "severity": "WARN",
+                "endpoint": "inquire-ccnl",
+                "evidence": "order_id=ORD001, ticker=AAPL, db_status=pending, ccnl_status=executed, ccnl_exec=1",
+                "impact": "DB vs ccnl 불일치",
+                "recommendation": "order_reconciler 재실행",
+            }
+        ],
+    )
+    _write_reconcile(tmp_path, payload)
+    art = _artifacts(tmp_path, trade_rows=[_trade_row(order_status="pending")])
+    review = review_ccnl(art, strict=False)
+    assert review.db_vs_ccnl_mismatch_count == 1
+    codes = _finding_codes(review.findings)
+    assert "KIS_DB_CCNL_STATUS_MISMATCH" in codes
+    mismatch = [f for f in review.findings if f.title == "KIS_DB_CCNL_STATUS_MISMATCH"][0]
+    assert "order_id=ORD001" in mismatch.evidence
+    assert "ticker=AAPL" in mismatch.evidence
+
+
+def test_ccnl_positive_mismatch_without_details_no_finding(tmp_path):
+    """mismatch_count>0이어도 evidence finding에 상세가 없으면 mismatch 미발생."""
+    payload = _base_reconcile(
+        db_reconcile={
+            "checked_trade_records": 1,
+            "db_vs_ccnl_mismatch_count": 1,
+        },
+        findings=[
+            {
+                "title": "KIS_DB_CCNL_STATUS_MISMATCH",
+                "severity": "WARN",
+                "endpoint": "inquire-ccnl",
+                "evidence": "",
+            }
+        ],
+    )
+    _write_reconcile(tmp_path, payload)
+    art = _artifacts(
+        tmp_path,
+        trade_rows=[_trade_row(order_status="pending")],
+    )
+    review = review_ccnl(art, strict=False)
+    assert "KIS_DB_CCNL_STATUS_MISMATCH" not in _finding_codes(review.findings)

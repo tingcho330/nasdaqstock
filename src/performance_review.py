@@ -1086,6 +1086,103 @@ def _ccnl_period_coverage_complete(
     return wanted.issubset(covered)
 
 
+def _reconcile_db_reconcile_block(reconcile: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not reconcile:
+        return {}
+    block = reconcile.get("db_reconcile")
+    return block if isinstance(block, dict) else {}
+
+
+def _reconcile_evidence_mismatch_count(reconcile: Optional[Dict[str, Any]]) -> Optional[int]:
+    db_rec = _reconcile_db_reconcile_block(reconcile)
+    if "db_vs_ccnl_mismatch_count" not in db_rec:
+        return None
+    return _safe_int(db_rec.get("db_vs_ccnl_mismatch_count"))
+
+
+def _trust_order_reconcile_db_ccnl_summary(reconcile: Optional[Dict[str, Any]]) -> bool:
+    """order_reconcile evidence가 mismatch 없음을 보고했으면 DB self-scan mismatch를 생략."""
+    mismatch = _reconcile_evidence_mismatch_count(reconcile)
+    if mismatch is None:
+        return False
+    if mismatch != 0:
+        return False
+    evidence_findings = reconcile.get("findings") if reconcile else None
+    if isinstance(evidence_findings, list) and len(evidence_findings) == 0:
+        return True
+    checked = _safe_int(_reconcile_db_reconcile_block(reconcile).get("checked_trade_records"))
+    if checked == 0:
+        return True
+    return True
+
+
+def _propagate_reconcile_mismatch_findings(
+    reconcile: Dict[str, Any],
+    ev_kw: Dict[str, Any],
+) -> List[ReviewFinding]:
+    out: List[ReviewFinding] = []
+    for item in reconcile.get("findings") or []:
+        if not isinstance(item, dict):
+            continue
+        title = normalize_finding_title(str(item.get("title") or ""))
+        if title != "KIS_DB_CCNL_STATUS_MISMATCH":
+            continue
+        evidence = str(item.get("evidence") or "").strip()
+        if not evidence:
+            continue
+        out.append(make_finding(
+            title,
+            str(item.get("severity") or "WARN"),
+            str(item.get("endpoint") or "inquire-ccnl"),
+            evidence,
+            str(item.get("impact") or "DB vs ccnl 불일치"),
+            str(item.get("recommendation") or "order_reconciler 재실행"),
+            category=str(item.get("category") or "OPERATIONS"),
+            evidence_source_file=str(item.get("evidence_source_file") or ev_kw.get("evidence_source_file") or ""),
+            evidence_trade_date=str(item.get("evidence_trade_date") or ev_kw.get("evidence_trade_date") or ""),
+            evidence_generated_at=str(item.get("evidence_generated_at") or ev_kw.get("evidence_generated_at") or ""),
+        ))
+    return out
+
+
+def _make_db_ccnl_mismatch_finding(
+    trade_row: Dict[str, Any],
+    *,
+    market: str,
+    ccnl_row: Optional[Dict[str, Any]] = None,
+    missing_reason: str = "",
+    ev_kw: Dict[str, Any],
+) -> Optional[ReviewFinding]:
+    oid = str(trade_row.get("order_id") or "").strip()
+    ticker = norm_ticker(str(trade_row.get("ticker") or ""), market)
+    db_status = str(trade_row.get("order_status") or "").lower()
+    if not oid:
+        return None
+    if ccnl_row is not None:
+        cc_status = str(ccnl_row.get("status") or ccnl_row.get("order_status") or "").lower()
+        exec_q = _safe_int(_first_present(ccnl_row, EXEC_QTY_FIELDS))
+        evidence = (
+            f"order_id={oid}, ticker={ticker}, db_status={db_status}, "
+            f"ccnl_status={cc_status}, ccnl_exec={exec_q}"
+        )
+    elif missing_reason:
+        evidence = (
+            f"order_id={oid}, ticker={ticker}, db_status={db_status}, "
+            f"missing_reason={missing_reason}"
+        )
+    else:
+        return None
+    return make_finding(
+        "KIS_DB_CCNL_STATUS_MISMATCH",
+        "WARN",
+        "inquire-ccnl",
+        evidence,
+        "DB vs ccnl 불일치",
+        "order_reconciler 재실행",
+        **ev_kw,
+    )
+
+
 def collect_artifacts(
     market: str,
     start_date: str,
@@ -1718,65 +1815,129 @@ def review_ccnl(artifacts: ReviewArtifacts, strict: bool) -> KisCcnlReview:
             **ev_kw,
         ))
 
-    for tr in artifacts.trade_rows:
-        oid = str(tr.get("order_id") or "").strip()
-        db_status = str(tr.get("order_status") or "").lower()
-        db_exec = _safe_int(tr.get("executed_qty"))
-        in_coverage = _order_in_ccnl_coverage(tr, period_selections)
+    db_rec = _reconcile_db_reconcile_block(reconcile)
+    evidence_mismatch_count = _reconcile_evidence_mismatch_count(reconcile)
+    trust_summary = _trust_order_reconcile_db_ccnl_summary(reconcile)
 
-        if db_status in ("executed", "filled") or db_exec > 0:
-            if not has_evidence:
+    if trust_summary:
+        review.db_vs_ccnl_mismatch_count = 0
+        if db_rec.get("order_id_coverage_rate") is not None:
+            review.order_id_coverage_rate = _safe_float(db_rec.get("order_id_coverage_rate"), review.order_id_coverage_rate)
+        for tr in artifacts.trade_rows:
+            db_status = str(tr.get("order_status") or "").lower()
+            db_exec = _safe_int(tr.get("executed_qty"))
+            if not has_evidence and (db_status in ("executed", "filled") or db_exec > 0):
                 review.findings.append(make_finding(
                     "KIS_EXECUTED_FILL_UNVERIFIED",
                     _missing_evidence_severity(strict),
                     "inquire-ccnl",
-                    f"order_id={oid or 'N/A'}, db_status={db_status}, ccnl evidence 없음",
+                    f"order_id={tr.get('order_id') or 'N/A'}, db_status={db_status}, ccnl evidence 없음",
                     "체결 증거 미확인", "order_reconcile ccnl evidence 저장 확인",
                     **ev_kw,
                 ))
+    elif evidence_mismatch_count is not None and evidence_mismatch_count > 0:
+        review.db_vs_ccnl_mismatch_count = evidence_mismatch_count
+        propagated = _propagate_reconcile_mismatch_findings(reconcile or {}, ev_kw)
+        if propagated:
+            review.findings.extend(propagated)
+        else:
+            for tr in artifacts.trade_rows:
+                oid = str(tr.get("order_id") or "").strip()
+                if not oid or not _order_in_ccnl_coverage(tr, period_selections):
+                    continue
+                db_status = str(tr.get("order_status") or "").lower()
+                cc = ccnl_by_id.get(oid)
+                if cc is None:
+                    if db_status not in ("executed", "filled"):
+                        continue
+                    finding = _make_db_ccnl_mismatch_finding(
+                        tr, market=artifacts.market, missing_reason="missing_from_ccnl", ev_kw=ev_kw,
+                    )
+                else:
+                    cc_status = str(cc.get("status") or cc.get("order_status") or "").lower()
+                    exec_q = _safe_int(_first_present(cc, EXEC_QTY_FIELDS))
+                    if db_status == "pending" and (
+                        exec_q > 0 or cc_status in ("executed", "filled", "cancelled", "failed")
+                    ):
+                        finding = _make_db_ccnl_mismatch_finding(
+                            tr, market=artifacts.market, ccnl_row=cc, ev_kw=ev_kw,
+                        )
+                    else:
+                        finding = None
+                if finding:
+                    review.findings.append(finding)
+    else:
+        out_of_coverage_count = 0
+        for tr in artifacts.trade_rows:
+            oid = str(tr.get("order_id") or "").strip()
+            db_status = str(tr.get("order_status") or "").lower()
+            db_exec = _safe_int(tr.get("executed_qty"))
+            in_coverage = _order_in_ccnl_coverage(tr, period_selections)
+
+            if db_status in ("executed", "filled") or db_exec > 0:
+                if not has_evidence:
+                    review.findings.append(make_finding(
+                        "KIS_EXECUTED_FILL_UNVERIFIED",
+                        _missing_evidence_severity(strict),
+                        "inquire-ccnl",
+                        f"order_id={oid or 'N/A'}, db_status={db_status}, ccnl evidence 없음",
+                        "체결 증거 미확인", "order_reconcile ccnl evidence 저장 확인",
+                        **ev_kw,
+                    ))
+                    continue
+
+            if not oid:
+                if db_status in ("executed", "filled") and has_evidence and in_coverage:
+                    review.findings.append(make_finding(
+                        "KIS_ORDER_MISSING_ODNO", "ERROR", "inquire-ccnl",
+                        f"ticker={tr.get('ticker')}, db_status={db_status}, order_id empty",
+                        "체결 기록에 주문번호 없음", "주문 응답 ODNO 저장 확인",
+                        **ev_kw,
+                    ))
                 continue
 
-        if not oid:
-            if db_status in ("executed", "filled") and has_evidence and in_coverage:
-                review.findings.append(make_finding(
-                    "KIS_ORDER_MISSING_ODNO", "ERROR", "inquire-ccnl",
-                    f"ticker={tr.get('ticker')}, db_status={db_status}, order_id empty",
-                    "체결 기록에 주문번호 없음", "주문 응답 ODNO 저장 확인",
-                    **ev_kw,
-                ))
-            continue
-
-        if not in_coverage:
-            if has_evidence and db_status in ("executed", "filled", "pending"):
+            if not in_coverage:
+                if has_evidence and db_status in ("executed", "filled", "pending"):
+                    out_of_coverage_count += 1
                 continue
-            continue
 
-        if oid not in ccnl_by_id:
-            if has_evidence and db_status in ("executed", "filled"):
+            if oid not in ccnl_by_id:
+                if has_evidence and db_status in ("executed", "filled"):
+                    finding = _make_db_ccnl_mismatch_finding(
+                        tr, market=artifacts.market, missing_reason="missing_from_ccnl", ev_kw=ev_kw,
+                    )
+                    if finding:
+                        review.db_vs_ccnl_mismatch_count += 1
+                        review.findings.append(finding)
+                continue
+
+            cc = ccnl_by_id[oid]
+            exec_q = _safe_int(_first_present(cc, EXEC_QTY_FIELDS))
+            cc_status = str(cc.get("status") or cc.get("order_status") or "").lower()
+            if db_status == "pending" and (
+                exec_q > 0 or cc_status in ("executed", "filled", "cancelled", "failed")
+            ):
+                finding = _make_db_ccnl_mismatch_finding(
+                    tr, market=artifacts.market, ccnl_row=cc, ev_kw=ev_kw,
+                )
+                if finding:
+                    review.db_vs_ccnl_mismatch_count += 1
+                    review.findings.append(finding)
+            if db_status in ("executed", "filled") and exec_q == 0 and has_evidence:
                 review.findings.append(make_finding(
-                    "KIS_DB_CCNL_STATUS_MISMATCH", "WARN", "inquire-ccnl",
-                    f"order_id={oid}, db={db_status}, ccnl에 없음",
-                    "DB vs ccnl 불일치", "order_reconciler 재실행",
+                    "KIS_EXECUTED_WITHOUT_FILL", "ERROR", "inquire-ccnl",
+                    f"order_id={oid}, ticker={tr.get('ticker')}, db_status={db_status}, ccnl_exec=0",
+                    "체결수량 0", "TTTS3035R 조회 및 DB 업데이트",
                     **ev_kw,
                 ))
-            continue
 
-        cc = ccnl_by_id[oid]
-        exec_q = _safe_int(_first_present(cc, EXEC_QTY_FIELDS))
-        cc_status = str(cc.get("status") or cc.get("order_status") or "").lower()
-        if db_status == "pending" and (exec_q > 0 or cc_status in ("executed", "filled", "cancelled", "failed")):
-            review.db_vs_ccnl_mismatch_count += 1
+        if out_of_coverage_count > 0 and artifacts.period == "daily" and has_evidence:
             review.findings.append(make_finding(
-                "KIS_DB_CCNL_STATUS_MISMATCH", "WARN", "inquire-ccnl",
-                f"order_id={oid}: db={db_status}, ccnl={cc_status}, exec={exec_q}",
-                "DB pending vs KIS 체결 불일치", "order_reconciler 재분류 확인",
-                **ev_kw,
-            ))
-        if db_status in ("executed", "filled") and exec_q == 0 and has_evidence:
-            review.findings.append(make_finding(
-                "KIS_EXECUTED_WITHOUT_FILL", "ERROR", "inquire-ccnl",
-                f"order_id={oid}, db executed but ccnl exec=0",
-                "체결수량 0", "TTTS3035R 조회 및 DB 업데이트",
+                "KIS_CCNL_PERIOD_COVERAGE_INCOMPLETE",
+                "WARN" if strict else "INFO",
+                "inquire-ccnl",
+                f"out_of_coverage_orders={out_of_coverage_count}",
+                "ccnl query range 밖 주문은 mismatch 제외", "order_reconcile query range 확인",
                 **ev_kw,
             ))
 
