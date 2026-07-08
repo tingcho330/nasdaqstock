@@ -481,6 +481,12 @@ def _default_review_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
         "critical_on_failed_marked_as_executed": True,
         "warn_on_missing_kis_endpoint_evidence": True,
         "warn_on_partial_exchange_coverage": True,
+        # US market artifacts often get generated in KST early morning of D+1 for trade_date D.
+        # Treat KST D 18:00 ~ D+1 09:00 as normal for snapshot_ts_kst/generated_at_kst.
+        # Override: set us_trade_date_kst_grace_hours to adjust the end hour (default 9).
+        "us_trade_date_kst_grace_start_hour": 18,
+        "us_trade_date_kst_grace_end_hour": 9,
+        "us_trade_date_kst_grace_hours": None,
         "sellable_qty_evidence_introduced_at": SELLABLE_QTY_EVIDENCE_INTRODUCED_AT,
     }
     user = cfg.get("performance_review") or {}
@@ -740,6 +746,49 @@ def _calendar_day_gap(later_yyyymmdd: str, earlier_yyyymmdd: str) -> int:
         return 0
 
 
+def _parse_kst_iso_datetime(ts: str) -> Optional[datetime]:
+    if not ts:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(ts).strip().replace("Z", "+00:00"))
+    except Exception:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=KST)
+    try:
+        return dt.astimezone(KST)
+    except Exception:
+        return dt
+
+
+def _is_us_market(market: str) -> bool:
+    m = (market or "").upper()
+    return m in ("SP500", "NASDAQ", "US", "NYSE", "AMEX", "NASD")
+
+
+def _in_us_trade_date_kst_grace_window(
+    trade_date: str,
+    ts_kst: Optional[datetime],
+    cfg: Optional[Dict[str, Any]],
+) -> bool:
+    """US trade_date D artifact can be created in KST late night~next morning."""
+    if not trade_date or ts_kst is None:
+        return False
+    try:
+        base = _parse_date(trade_date)
+    except ValueError:
+        return False
+    user = cfg or {}
+    start_h = int(user.get("us_trade_date_kst_grace_start_hour", 18))
+    end_h = int(user.get("us_trade_date_kst_grace_end_hour", 9))
+    override_end = user.get("us_trade_date_kst_grace_hours")
+    if override_end not in (None, ""):
+        end_h = int(override_end)
+    window_start = base + timedelta(hours=start_h)
+    window_end = base + timedelta(days=1, hours=end_h)
+    return window_start <= ts_kst <= window_end
+
+
 def _dates_in_range(start: str, end: str) -> List[str]:
     try:
         cur = _parse_date(start)
@@ -920,35 +969,73 @@ def _check_snapshot_date_findings(
     snap_sel: EvidenceSelection,
     artifacts: ReviewArtifacts,
     strict: bool,
+    cfg: Optional[Dict[str, Any]] = None,
 ) -> List[ReviewFinding]:
     findings: List[ReviewFinding] = []
     payload = snap_sel.payload or {}
     ev_kw = _finding_evidence_kwargs(snap_sel)
     ev_td = snap_sel.evidence_trade_date
     review_td = artifacts.review_date
+    snapshot_trade_date = str(payload.get("trade_date") or ev_td or "").strip()
+
+    snap_ts_raw = str(payload.get("snapshot_ts_kst") or "").strip()
+    gen_ts_raw = str(payload.get("generated_at_kst") or "").strip()
+    snap_dt = _parse_kst_iso_datetime(snap_ts_raw)
+    gen_dt = _parse_kst_iso_datetime(gen_ts_raw)
+    snap_day = _date_yyyymmdd_from_iso(snap_ts_raw)
+    gen_day = _date_yyyymmdd_from_iso(gen_ts_raw)
+
+    def _evidence(reason: str) -> str:
+        return (
+            f"review_date={review_td}, "
+            f"evidence_trade_date={ev_td}, "
+            f"snapshot_trade_date={snapshot_trade_date}, "
+            f"snapshot_ts_kst={snap_ts_raw}, "
+            f"generated_at_kst={gen_ts_raw}, "
+            f"reason={reason}"
+        )
+
+    # 4) snapshot.trade_date matches review_date -> treat as normal evidence first.
+    if snapshot_trade_date and snapshot_trade_date == review_td:
+        # 2/5) For US market, allow D 18:00 ~ D+1 morning window even if KST date is D+1.
+        if _is_us_market(artifacts.market):
+            if _in_us_trade_date_kst_grace_window(snapshot_trade_date, snap_dt, cfg) or _in_us_trade_date_kst_grace_window(snapshot_trade_date, gen_dt, cfg):
+                return findings
+
+        # 6) Real mismatch only when snapshot_ts is 2+ days away from trade_date.
+        if snap_day and _calendar_day_gap(snap_day, snapshot_trade_date) >= 2:
+            findings.append(make_finding(
+                "ACCOUNT_SNAPSHOT_DATE_MISMATCH", "ERROR", "account_snapshot",
+                _evidence("snapshot_ts_kst is 2+ days away from snapshot.trade_date"),
+                "스냅샷 시각이 trade_date와 명백히 불일치", "trade_date 계산/저장 로직 확인",
+                **ev_kw,
+            ))
+        if gen_day and _calendar_day_gap(gen_day, review_td) >= 2:
+            findings.append(make_finding(
+                "ACCOUNT_SNAPSHOT_DATE_MISMATCH", "ERROR", "account_snapshot",
+                _evidence("generated_at_kst is 2+ days away from review_date"),
+                "generated_at가 review scope와 명백히 무관", "pipeline 실행 시각/파일 선택 로직 확인",
+                **ev_kw,
+            ))
+        return findings
+
+    # 6) mismatch: snapshot.trade_date != review_date
+    if snapshot_trade_date and snapshot_trade_date != review_td:
+        sev = "WARN" if snap_sel.latest_fallback_used else "ERROR"
+        findings.append(make_finding(
+            "ACCOUNT_SNAPSHOT_DATE_MISMATCH", sev, "account_snapshot",
+            _evidence("snapshot.trade_date != review_date"),
+            "evidence trade_date 불일치", "해당일 account_snapshot 생성/선택 로직 확인",
+            **ev_kw,
+        ))
+        return findings
+
+    # 6) mismatch: latest fallback trade_date out of review scope (when trade_date missing in payload)
     if snap_sel.latest_fallback_used and ev_td and ev_td != review_td:
         findings.append(make_finding(
             "ACCOUNT_SNAPSHOT_DATE_MISMATCH", "WARN", "account_snapshot",
-            f"latest fallback trade_date={ev_td}, review_date={review_td}",
-            "evidence 날짜 불일치", "해당일 account_snapshot 파일 생성 확인",
-            **ev_kw,
-        ))
-    elif ev_td and ev_td != review_td:
-        findings.append(make_finding(
-            "ACCOUNT_SNAPSHOT_DATE_MISMATCH", "WARN", "account_snapshot",
-            f"evidence trade_date={ev_td}, review_date={review_td}",
-            "evidence 날짜 불일치", "dated account_snapshot 사용 확인",
-            **ev_kw,
-        ))
-    snap_ts = str(payload.get("snapshot_ts_kst") or "")
-    snap_day = _date_yyyymmdd_from_iso(snap_ts)
-    trade_day = str(payload.get("trade_date") or ev_td or "")
-    if snap_day and trade_day and _calendar_day_gap(snap_day, trade_day) >= 1:
-        sev = "ERROR" if strict else "WARN"
-        findings.append(make_finding(
-            "ACCOUNT_SNAPSHOT_DATE_MISMATCH", sev, "account_snapshot",
-            f"snapshot_ts_kst={snap_day}, trade_date={trade_day}",
-            "스냅샷 시각과 trade_date 불일치", "resolve_pipeline_context trade_date 확인",
+            _evidence("latest fallback trade_date != review_date"),
+            "latest fallback 사용으로 evidence 날짜 불일치", "dated account_snapshot 생성 확인",
             **ev_kw,
         ))
     return findings
@@ -1418,7 +1505,7 @@ def _build_evidence(
     return ev
 
 
-def review_balance(artifacts: ReviewArtifacts, strict: bool) -> KisBalanceReview:
+def review_balance(artifacts: ReviewArtifacts, strict: bool, cfg: Optional[Dict[str, Any]] = None) -> KisBalanceReview:
     review = KisBalanceReview()
     market = artifacts.market
     payload = _load_json(artifacts.balance_path)
@@ -1521,7 +1608,7 @@ def review_balance(artifacts: ReviewArtifacts, strict: bool) -> KisBalanceReview
                 **ev_kw,
             ))
 
-    review.findings.extend(_check_snapshot_date_findings(snap_sel, artifacts, strict))
+    review.findings.extend(_check_snapshot_date_findings(snap_sel, artifacts, strict, cfg))
 
     if not payload and not snap_payload:
         review.findings.append(make_finding(
@@ -2365,7 +2452,7 @@ def build_kis_endpoint_review(
     include_logs: bool = False,
 ) -> KisEndpointReview:
     ker = KisEndpointReview()
-    ker.balance_review = review_balance(artifacts, strict)
+    ker.balance_review = review_balance(artifacts, strict, cfg)
     ker.present_balance_review = review_present_balance(artifacts, ker.balance_review, strict)
     ker.nccs_review = review_nccs(artifacts, ker.balance_review, strict)
     ker.ccnl_review = review_ccnl(artifacts, strict)

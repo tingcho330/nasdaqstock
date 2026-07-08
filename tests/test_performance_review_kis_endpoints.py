@@ -179,7 +179,7 @@ def test_snapshot_trade_date_mismatch(tmp_path):
     snap["snapshot_ts_kst"] = "2026-07-07T10:00:00+09:00"
     _write_snap(tmp_path, "account_snapshot_SP500_20260707.json", snap)
     art = _artifacts(tmp_path, review_date="20260707")
-    bal = review_balance(art, strict=True)
+    bal = review_balance(art, strict=True, cfg={})
     assert "ACCOUNT_SNAPSHOT_DATE_MISMATCH" in _finding_titles(bal.findings)
 
 
@@ -188,10 +188,53 @@ def test_latest_fallback_warn(tmp_path):
     _write_snap(tmp_path, "account_snapshot_latest_SP500.json", snap)
     art = _artifacts(tmp_path, review_date="20260707")
     art.account_snapshot_paths = sorted(tmp_path.glob("account_snapshot_*.json"))
-    bal = review_balance(art, strict=True)
+    bal = review_balance(art, strict=True, cfg={})
     titles = _finding_titles(bal.findings)
     assert "ACCOUNT_SNAPSHOT_DATE_MISMATCH" in titles
     assert any(f.latest_fallback_used for f in bal.findings if f.title == "ACCOUNT_SNAPSHOT_DATE_MISMATCH")
+
+
+def test_snapshot_us_trade_date_kst_morning_ok_no_mismatch(tmp_path):
+    """review_date D, snapshot.trade_date D, snapshot_ts in KST D+1 morning is normal for US."""
+    snap = _base_snap(trade_date="20260707")
+    snap["snapshot_ts_kst"] = "2026-07-08T06:05:00+09:00"
+    snap["generated_at_kst"] = "2026-07-08T06:05:38+09:00"
+    _write_snap(tmp_path, "account_snapshot_SP500_20260707.json", snap)
+    art = _artifacts(tmp_path, review_date="20260707")
+    bal = review_balance(art, strict=True, cfg={})
+    assert "ACCOUNT_SNAPSHOT_DATE_MISMATCH" not in _finding_titles(bal.findings)
+
+
+def test_snapshot_trade_date_mismatch_review_date_error(tmp_path):
+    """review_date D, snapshot.trade_date D-1 should be mismatch."""
+    snap = _base_snap(trade_date="20260706")
+    snap["snapshot_ts_kst"] = "2026-07-07T20:00:00+09:00"
+    snap["generated_at_kst"] = "2026-07-07T20:00:10+09:00"
+    _write_snap(tmp_path, "account_snapshot_SP500_20260707.json", snap)
+    art = _artifacts(tmp_path, review_date="20260707")
+    bal = review_balance(art, strict=True, cfg={})
+    assert "ACCOUNT_SNAPSHOT_DATE_MISMATCH" in _finding_titles(bal.findings)
+
+
+def test_snapshot_ts_two_days_late_is_mismatch(tmp_path):
+    """snapshot_ts_kst 2+ days away from trade_date should be mismatch even if trade_date matches review."""
+    snap = _base_snap(trade_date="20260707")
+    snap["snapshot_ts_kst"] = "2026-07-09T10:00:00+09:00"  # D+2
+    snap["generated_at_kst"] = "2026-07-09T10:00:10+09:00"
+    _write_snap(tmp_path, "account_snapshot_SP500_20260707.json", snap)
+    art = _artifacts(tmp_path, review_date="20260707")
+    bal = review_balance(art, strict=True, cfg={})
+    assert "ACCOUNT_SNAPSHOT_DATE_MISMATCH" in _finding_titles(bal.findings)
+
+
+def test_latest_file_trade_date_out_of_scope_mismatch(tmp_path):
+    """latest snapshot trade_date out of review scope should trigger mismatch (fallback)."""
+    snap = _base_snap(trade_date="20260701")
+    _write_snap(tmp_path, "account_snapshot_latest_SP500.json", snap)
+    art = _artifacts(tmp_path, review_date="20260707")
+    art.account_snapshot_paths = sorted(tmp_path.glob("account_snapshot_*.json"))
+    bal = review_balance(art, strict=True, cfg={})
+    assert "ACCOUNT_SNAPSHOT_DATE_MISMATCH" in _finding_titles(bal.findings)
 
 
 def test_weekly_collects_all_order_reconcile_files(tmp_path):

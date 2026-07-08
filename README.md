@@ -411,7 +411,7 @@ api/kis_auth.KIS (DomesticStock + OverseasStock)
 | `KIS_CCNL_PERIOD_COVERAGE_INCOMPLETE` | weekly/monthly에서 ccnl query range가 DB 주문 기간 미커버 — coverage 부족 주문은 mismatch 아님 |
 | `KIS_EXECUTED_FILL_UNVERIFIED` | ccnl evidence 없이 executed — WARN/INFO |
 | `KIS_EXECUTED_WITHOUT_FILL` | ccnl evidence 있고 exec_qty=0 — ERROR |
-| `ACCOUNT_SNAPSHOT_DATE_MISMATCH` | evidence `trade_date`·`snapshot_ts_kst` 불일치 |
+| `ACCOUNT_SNAPSHOT_DATE_MISMATCH` | account_snapshot `trade_date`·`snapshot_ts_kst`/`generated_at_kst` 날짜 불일치(US는 KST 세션 보정 적용) |
 | `KIS_SELL_WITHOUT_SELLABLE_CHECK` | `structured_context.sellable_qty_checked`·snapshot evidence 없을 때만 |
 
 ```bash
@@ -437,6 +437,19 @@ PYTHONPATH=src OUTPUT_DIR=./output_test .venv/bin/python -m pytest \
 ```
 
 `config.json` → `performance_review`: `strict_kis_endpoints`, `weekly_enabled`, `monthly_enabled`, `max_findings` 등.
+
+**US(예: SP500) account_snapshot 날짜 판정(오탐 방지)**
+
+- **정상 케이스**: US trade_date=D의 `account_snapshot`이 KST로 **D 당일 밤~D+1 오전**에 생성되는 것은 정상입니다.
+- **KST grace window(기본값)**: \(D 18:00 KST ~ D+1 09:00 KST\)
+- **설정 키** (`config.json` → `performance_review`)
+  - `us_trade_date_kst_grace_start_hour` (기본 18)
+  - `us_trade_date_kst_grace_end_hour` (기본 9)
+  - `us_trade_date_kst_grace_hours` (설정 시 end_hour override)
+- **`ACCOUNT_SNAPSHOT_DATE_MISMATCH` 발생 조건**
+  - `snapshot.trade_date != review_date` → **ERROR** (단, latest fallback 사용으로만 불일치면 **WARN**)
+  - `snapshot_ts_kst`가 `trade_date` 대비 **2일 이상 차이** → **ERROR**
+  - `generated_at_kst`가 review scope와 **명백히 무관(2일 이상 차이)** → **ERROR**
 
 **테스트:** `tests/test_performance_review_kis_endpoints.py` (18 케이스 — present call_count·USD/KRW 혼합·balance coverage·ccnl 기간 coverage·sellable evidence 등)
 
