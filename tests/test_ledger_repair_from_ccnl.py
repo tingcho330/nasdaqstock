@@ -360,24 +360,38 @@ def tmp_output_pr(tmp_path, monkeypatch):
 
 
 def test_weekly_known_gross_pnl_129_1608(tmp_path):
-    from performance_review import _summarize_trades, _apply_broker_integrity_findings, ReviewArtifacts
+    from performance_review import (
+        _summarize_trades,
+        _apply_broker_integrity_findings,
+        ReviewArtifacts,
+        result_to_dict,
+        PerformanceReviewResult,
+        KisEndpointReview,
+        write_reports,
+    )
 
     rows = [
         {
-            "action": "SELL", "order_id": "0030524091", "profit_loss": -11.77,
+            "action": "SELL", "ticker": "INTC", "order_id": "0030524091",
+            "timestamp": "2026-07-07T22:30:58+09:00", "profit_loss": -11.77,
             "structured_context": json.dumps({
                 "gross_pnl": "-11.7700", "gross_pnl_complete": True,
                 "gross_pnl_basis": True, "net_pnl_complete": False,
+                "effective_trade_timestamp": "2026-07-07T22:30:58+09:00",
             }),
         },
         {
-            "action": "SELL", "order_id": "0031276871", "profit_loss": 140.9308,
+            "action": "SELL", "ticker": "SNDK", "order_id": "0031276871",
+            "timestamp": "2026-07-09T23:31:56+09:00", "profit_loss": 140.9308,
             "structured_context": json.dumps({
                 "gross_pnl": "140.9308", "gross_pnl_complete": True,
                 "gross_pnl_basis": True, "net_pnl_complete": False,
                 "broker_only": True, "backfilled_from": "kis_ccnl",
                 "source": "order_reconciler",
+                "reason_code": "BROKER_ONLY_BACKFILL",
+                "effective_trade_timestamp": "2026-07-09T23:31:56+09:00",
             }),
+            "reason_code": "BROKER_ONLY_BACKFILL",
         },
     ]
     perf = _summarize_trades(rows)
@@ -385,29 +399,139 @@ def test_weekly_known_gross_pnl_129_1608(tmp_path):
     assert perf["gross_complete_sell_count"] == 2
     assert perf["gross_incomplete_sell_count"] == 0
     assert abs(perf["known_gross_pnl"] - 129.1608) < 1e-4
+    assert abs(perf["gross_pnl"] - 129.1608) < 1e-4
     assert perf["gross_pnl_complete"] is True
     assert perf["net_pnl_complete"] is False
+    assert perf["net_pnl"] is None
+    assert perf["provisional_net_pnl"] is not None
     assert perf["gross_incomplete_orders"] == []
+    assert perf["broker_only_incomplete_count"] == 0
+    assert perf["backfilled_sell_evidence_unavailable_count"] == 1
+    assert perf["net_incomplete_sell_count"] == 2
+    assert isinstance(perf["net_incomplete_orders"], list)
+    assert len(perf["net_incomplete_orders"]) == 2
+    assert perf["net_incomplete_orders"][0]["ticker"] == "INTC"
+    assert perf["net_incomplete_orders"][0]["order_id_masked"] == "***4091"
+    assert perf["net_incomplete_orders"][0]["reason"] == "commission_or_tax_unavailable"
+    assert perf["net_incomplete_orders"][1]["ticker"] == "SNDK"
+    assert perf["net_incomplete_orders"][1]["order_id_masked"] == "***6871"
 
     art = ReviewArtifacts(
         market="SP500", start_date="20260707", review_date="20260714",
         period="weekly", session="pm", output_dir=tmp_path, db_path=tmp_path / "x.db",
     )
-    # broker-only already 0
     (tmp_path / "order_reconcile_SP500_20260714.json").write_text(
         json.dumps({
+            "broker_only_detected_count": 0,
             "broker_only_order_count": 0,
             "broker_only_orders": [],
+            "broker_only_incomplete_count": 0,
+            "broker_only_backfilled_count": 0,
             "findings": [],
-            "db_reconcile": {"broker_only_order_count": 0, "broker_only_orders": []},
+            "db_reconcile": {
+                "broker_only_detected_count": 0,
+                "broker_only_order_count": 0,
+                "broker_only_orders": [],
+                "broker_only_incomplete_count": 0,
+                "broker_only_backfilled_count": 0,
+            },
         }),
         encoding="utf-8",
     )
     findings = []
     status = _apply_broker_integrity_findings(findings, art, perf)
     assert status == "GROSS_COMPLETE_NET_INCOMPLETE"
+    assert perf["broker_only_incomplete_count"] == 0
+    assert perf["broker_only_detected_count"] == 0
     assert any(f.title == "GROSS_COMPLETE_NET_INCOMPLETE" for f in findings)
-    assert not any("broker-only backfill" in (f.recommendation or "").lower() for f in findings)
+
+    # Root metadata + no date masking
+    result = PerformanceReviewResult(
+        context={
+            "market": "SP500",
+            "period": "weekly",
+            "start_date": "20260707",
+            "end_date": "20260714",
+            "date_from": "20260707",
+            "date_to": "20260714",
+            "review_date": "20260707_20260714",
+            "review_scope": "date_range",
+            "report_key": "SP500_weekly_20260707_20260714",
+            "generated_at_kst": "2026-07-14T12:00:00+09:00",
+            "output_filename": "performance_review_SP500_weekly_20260707_20260714.json",
+        },
+        trade_performance=perf,
+        kis_endpoint_review=KisEndpointReview(),
+        findings=findings,
+        action_items=["수수료·세금 원장 확보 후 net P&L 확정"],
+    )
+    payload = result_to_dict(result)
+    assert payload["review_scope"] == "date_range"
+    assert payload["period"] == "weekly"
+    assert payload["date_from"] == "20260707"
+    assert payload["date_to"] == "20260714"
+    assert payload["review_date"] == "20260707_20260714"
+    assert payload["report_key"] == "SP500_weekly_20260707_20260714"
+    assert payload["context"]["start_date"] == "20260707"
+    assert payload["context"]["end_date"] == "20260714"
+    assert payload["trade_performance"]["net_pnl"] is None
+    assert payload["trade_performance"]["broker_only_incomplete_count"] == 0
+    orders = payload["trade_performance"]["net_incomplete_orders"]
+    assert orders[0]["ticker"] == "INTC"
+    assert orders[0]["reason"] == "commission_or_tax_unavailable"
+    assert "***" not in orders[0]["ticker"]
+    assert orders[0]["order_id_masked"].endswith("4091")
+    assert all("broker-only" not in a.lower() for a in result.action_items)
+    assert any("수수료·세금" in a for a in result.action_items)
+
+
+def test_review_scope_single_date_vs_range():
+    from performance_review import PerformanceReviewResult, result_to_dict, KisEndpointReview
+
+    single = result_to_dict(PerformanceReviewResult(
+        context={
+            "market": "SP500", "period": "daily",
+            "start_date": "20260707", "end_date": "20260707",
+            "date_from": "20260707", "date_to": "20260707",
+            "review_date": "20260707", "review_scope": "single_date",
+            "report_key": "SP500_daily_20260707",
+            "generated_at_kst": "2026-07-14T12:00:00+09:00",
+            "output_filename": "performance_review_SP500_daily_20260707.json",
+        },
+        kis_endpoint_review=KisEndpointReview(),
+    ))
+    assert single["review_scope"] == "single_date"
+    assert single["period"] == "daily"
+    assert single["date_from"] == "20260707"
+
+
+def test_redact_keeps_dates_masks_secrets():
+    from performance_review import _redact_sensitive, mask_order_id_tail
+
+    payload = _redact_sensitive({
+        "date_from": "20260707",
+        "date_to": "20260714",
+        "start_date": "20260707",
+        "end_date": "20260714",
+        "market": "SP500",
+        "ticker": "INTC",
+        "cano": "12345678",
+        "app_key": "secret-key",
+        "access_token": "tok",
+        "account_number": "9999",
+        "order_id": "0030524091",
+        "nested": {"effective_trade_timestamp": "2026-07-07T22:30:58+09:00"},
+    })
+    assert payload["date_from"] == "20260707"
+    assert payload["date_to"] == "20260714"
+    assert payload["start_date"] == "20260707"
+    assert payload["cano"] == "***REDACTED***"
+    assert payload["app_key"] == "***REDACTED***"
+    assert payload["access_token"] == "***REDACTED***"
+    assert payload["account_number"] == "***REDACTED***"
+    assert payload["order_id"] == "***4091"
+    assert payload["nested"]["effective_trade_timestamp"] == "2026-07-07T22:30:58+09:00"
+    assert mask_order_id_tail("0031276871") == "***6871"
 
 
 def test_backfilled_sell_sellable_finding():

@@ -110,11 +110,50 @@ STANDARD_FINDINGS = {
     "LOG_UNAVAILABLE",
 }
 
-SENSITIVE_PATTERNS = (
-    re.compile(r"(appkey|app_secret|secret|authorization|access_token|token)", re.I),
-    re.compile(r"(cano|acnt|account_no|account_number|계좌)", re.I),
-    re.compile(r"\b\d{8,12}\b"),
-)
+SENSITIVE_KEY_DENYLIST = frozenset({
+    "cano",
+    "account_number",
+    "account_no",
+    "acnt_prdt_cd",
+    "acnt",
+    "app_key",
+    "appkey",
+    "app_secret",
+    "access_token",
+    "authorization",
+    "password",
+    "phone",
+    "email",
+    "계좌",
+})
+
+# Never redact these keys (or their nested values when key matches) for date/report metadata
+SAFE_METADATA_KEYS = frozenset({
+    "review_date",
+    "date_from",
+    "date_to",
+    "start_date",
+    "end_date",
+    "trade_date",
+    "order_date",
+    "effective_trade_timestamp",
+    "generated_at",
+    "generated_at_kst",
+    "period",
+    "review_scope",
+    "report_key",
+    "output_filename",
+    "market",
+    "ticker",
+    "reason",
+    "review_status",
+    "gross_performance_status",
+    "net_performance_status",
+})
+
+ORDER_ID_MASK_KEYS = frozenset({
+    "order_id", "odno", "ODNO", "orgn_odno", "matched_buy_order_id",
+})
 
 TICKER_FIELDS = ("pdno", "ovrs_pdno", "ticker", "symbol", "code")
 QTY_FIELDS = ("hldg_qty", "ovrs_cblc_qty", "qty", "quantity")
@@ -277,22 +316,54 @@ def _records_from_payload(payload: Any) -> List[Dict[str, Any]]:
     return []
 
 
+def _is_sensitive_key(key: Any) -> bool:
+    kl = str(key or "").strip().lower().replace("-", "_")
+    if kl in SAFE_METADATA_KEYS:
+        return False
+    if kl in SENSITIVE_KEY_DENYLIST:
+        return True
+    # exact / suffix matches only — do not treat "date_from" as sensitive via substring "from"
+    for den in SENSITIVE_KEY_DENYLIST:
+        if kl == den or kl.endswith("_" + den) or kl.startswith(den + "_"):
+            return True
+    return False
+
+
+def mask_order_id_tail(order_id: Any) -> str:
+    """Keep last 4 chars; e.g. 0030524091 -> ***4091."""
+    s = str(order_id or "").strip()
+    if not s:
+        return "***"
+    return f"***{s[-4:]}"
+
+
 def _redact_sensitive(obj: Any) -> Any:
+    """Mask only explicit sensitive keys. Dates / tickers / report metadata stay intact."""
     if isinstance(obj, dict):
-        out = {}
+        out: Dict[str, Any] = {}
         for k, v in obj.items():
-            if any(p.search(str(k)) for p in SENSITIVE_PATTERNS):
+            ks = str(k)
+            if _is_sensitive_key(ks):
                 out[k] = "***REDACTED***"
-            else:
-                out[k] = _redact_sensitive(v)
+                continue
+            if ks in ORDER_ID_MASK_KEYS or ks.lower() in {x.lower() for x in ORDER_ID_MASK_KEYS}:
+                if isinstance(v, str) and v.strip():
+                    out[k] = mask_order_id_tail(v)
+                elif isinstance(v, list):
+                    out[k] = [
+                        mask_order_id_tail(x) if isinstance(x, str) else _redact_sensitive(x)
+                        for x in v
+                    ]
+                else:
+                    out[k] = _redact_sensitive(v)
+                continue
+            if ks == "order_id_masked":
+                out[k] = v  # already masked
+                continue
+            out[k] = _redact_sensitive(v)
         return out
     if isinstance(obj, list):
         return [_redact_sensitive(x) for x in obj]
-    if isinstance(obj, str):
-        s = obj
-        for p in SENSITIVE_PATTERNS:
-            s = p.sub("***", s)
-        return s
     return obj
 
 
@@ -1781,7 +1852,9 @@ def review_present_balance(artifacts: ReviewArtifacts, balance: KisBalanceReview
         if snap_payload.get("total_asset_krw") is not None:
             cash_map["tot_evlu_amt_krw"] = snap_payload["total_asset_krw"]
 
-    review.cash_map = {k: cash_map[k] for k in cash_map if not any(p.search(str(k)) for p in SENSITIVE_PATTERNS)}
+    review.cash_map = {
+        k: cash_map[k] for k in cash_map if not _is_sensitive_key(k)
+    }
     review.available_cash_usd = _safe_float(
         cash_map.get("available_cash_usd")
         or cash_map.get("available_cash")
@@ -2657,35 +2730,45 @@ def _summarize_trades(trade_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     known_gross = 0.0
     net_complete = True
     gross_complete = True
-    broker_only_unresolved = 0
     gross_complete_n = 0
     gross_incomplete_n = 0
     net_complete_n = 0
     net_incomplete_n = 0
-    gross_incomplete_orders: List[str] = []
-    net_incomplete_orders: List[str] = []
+    gross_incomplete_orders: List[Any] = []
+    net_incomplete_orders: List[Dict[str, Any]] = []
+    backfilled_sell_evidence_unavailable_count = 0
 
     for r in sells:
         ctx = _parse_structured_context(r)
         oid = str(r.get("order_id") or "")
+        ticker = str(r.get("ticker") or "")
+        eff_ts = effective_trade_timestamp_iso(r) or str(r.get("timestamp") or "")
         g_complete = ctx.get("gross_pnl_complete")
         # Missing flag treated as complete only when we have a known gross_pnl/profit
         if g_complete is False:
             gross_complete = False
             gross_incomplete_n += 1
             if oid:
-                gross_incomplete_orders.append(oid)
+                gross_incomplete_orders.append({
+                    "ticker": ticker,
+                    "order_id_masked": mask_order_id_tail(oid),
+                    "reason": ctx.get("incomplete_reason") or "gross_pnl_incomplete",
+                    "effective_trade_timestamp": eff_ts,
+                })
         else:
-            # treat as complete when flag True or absent with usable pnl
             if g_complete is True or ctx.get("gross_pnl") is not None or _safe_float(r.get("profit_loss")) != 0:
                 gross_complete_n += 1
             elif g_complete is None and ctx.get("gross_pnl") is None and _safe_float(r.get("profit_loss")) == 0:
-                # ambiguous — if explicitly incomplete reason, count incomplete
                 if ctx.get("incomplete_reason"):
                     gross_complete = False
                     gross_incomplete_n += 1
                     if oid:
-                        gross_incomplete_orders.append(oid)
+                        gross_incomplete_orders.append({
+                            "ticker": ticker,
+                            "order_id_masked": mask_order_id_tail(oid),
+                            "reason": ctx.get("incomplete_reason") or "gross_pnl_incomplete",
+                            "effective_trade_timestamp": eff_ts,
+                        })
                 else:
                     gross_complete_n += 1
             else:
@@ -2708,15 +2791,21 @@ def _summarize_trades(trade_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         else:
             net_complete = False
             net_incomplete_n += 1
-            if oid:
-                net_incomplete_orders.append(oid)
+            net_incomplete_orders.append({
+                "ticker": ticker,
+                "order_id_masked": mask_order_id_tail(oid),
+                "reason": "commission_or_tax_unavailable",
+                "effective_trade_timestamp": eff_ts,
+            })
 
-        if ctx.get("broker_only") and not ctx.get("net_pnl_complete", True):
-            broker_only_unresolved += 1
         if ctx.get("gross_pnl_basis") and not ctx.get("net_pnl_complete", False):
             net_complete = False
-        if ctx.get("broker_only") and ctx.get("gross_pnl_complete") is False:
-            broker_only_unresolved += 1
+
+        # Backfilled SELL without sellable evidence — separate from broker-only incomplete
+        if _is_broker_only_backfilled_sell(
+            ctx, reason_code=str(ctx.get("reason_code") or r.get("reason_code") or ""),
+        ) and not ctx.get("sellable_qty_checked"):
+            backfilled_sell_evidence_unavailable_count += 1
 
     if sells and gross_incomplete_n == 0:
         gross_complete = True
@@ -2724,12 +2813,17 @@ def _summarize_trades(trade_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         gross_complete = True
         net_complete = True
 
+    provisional_net = round(sum(_safe_float(r.get("profit_loss")) for r in sells), 2)
+    # Never publish net_pnl when fees/taxes unknown
+    net_pnl_out: Any = provisional_net if net_complete else None
+
     return {
         "trade_count": len(trade_rows),
         "sell_count": len(sells),
         "sell_trade_count": len(sells),
         "win_rate": round(len(wins) / len(sells), 4) if sells else 0.0,
-        "net_pnl": round(sum(_safe_float(r.get("profit_loss")) for r in sells), 2),
+        "net_pnl": net_pnl_out,
+        "provisional_net_pnl": provisional_net if not net_complete else None,
         "gross_pnl": round(known_gross, 4),
         "known_gross_pnl": round(known_gross, 4),
         "gross_pnl_complete": gross_complete,
@@ -2740,7 +2834,11 @@ def _summarize_trades(trade_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "net_incomplete_sell_count": net_incomplete_n,
         "gross_incomplete_orders": gross_incomplete_orders,
         "net_incomplete_orders": net_incomplete_orders,
-        "broker_only_incomplete_count": broker_only_unresolved,
+        # True broker-only incomplete comes from reconcile evidence (not backfilled net gaps)
+        "broker_only_incomplete_count": 0,
+        "broker_only_detected_count": 0,
+        "broker_only_backfilled_count": 0,
+        "backfilled_sell_evidence_unavailable_count": backfilled_sell_evidence_unavailable_count,
     }
 
 
@@ -2763,16 +2861,31 @@ def _apply_broker_integrity_findings(
             recon = {}
 
     broker_only_count = int(
-        (recon.get("db_reconcile") or {}).get("broker_only_order_count")
+        (recon.get("db_reconcile") or {}).get("broker_only_detected_count")
+        or (recon.get("db_reconcile") or {}).get("broker_only_order_count")
         or recon.get("broker_only_detected_count")
         or recon.get("broker_only_order_count")
         or 0
     )
+    broker_only_incomplete = int(
+        (recon.get("db_reconcile") or {}).get("broker_only_incomplete_count")
+        or recon.get("broker_only_incomplete_count")
+        or 0
+    )
+    broker_only_backfilled = int(
+        (recon.get("db_reconcile") or {}).get("broker_only_backfilled_count")
+        or recon.get("broker_only_backfilled_count")
+        or 0
+    )
+    trade_perf["broker_only_detected_count"] = broker_only_count
+    trade_perf["broker_only_incomplete_count"] = broker_only_incomplete
+    trade_perf["broker_only_backfilled_count"] = broker_only_backfilled
 
     for item in recon.get("findings") or []:
         title = normalize_finding_title(str(item.get("title") or ""))
         if not title:
             continue
+        # Do not treat BACKFILLED_SELL_SELLABLE as broker-only incompleteness
         sev = str(item.get("severity") or "ERROR")
         details = item.get("details") or {}
         findings.append(make_finding(
@@ -2785,6 +2898,8 @@ def _apply_broker_integrity_findings(
             category=item.get("category") or normalize_finding_category(title),
         ))
         if title == "BROKER_TRADE_MISSING_IN_DB":
+            status = "PERFORMANCE_DATA_INCOMPLETE"
+        if title == "BROKER_TRADE_BACKFILL_INCOMPLETE":
             status = "PERFORMANCE_DATA_INCOMPLETE"
 
     gross_ok = bool(trade_perf.get("gross_pnl_complete"))
@@ -2910,10 +3025,7 @@ def run_performance_review(
             "date_from": start_date,
             "date_to": end_date,
             "review_date": end_date if start_date == end_date else f"{start_date}_{end_date}",
-            "review_scope": (
-                "single_day" if start_date == end_date
-                else ("weekly" if period == "weekly" else "date_range")
-            ),
+            "review_scope": ("single_date" if start_date == end_date else "date_range"),
             "report_key": f"{market}_{period}_{performance_report_date_tag(period, start_date, end_date)}",
             "session": session,
             "strict_kis_endpoints": strict_kis,
@@ -2950,22 +3062,28 @@ def run_performance_review(
         result.summary_text += f"; error={review_error[:120]}"
 
     action_items: List[str] = []
-    for f in critical + errors + warns:
-        # Skip broker-only backfill actions when already zero
-        if f.title == "BROKER_TRADE_MISSING_IN_DB":
-            action_items.append(f"[{f.severity}] {f.title}: {f.recommendation}")
-            continue
-        if "broker-only backfill" in (f.recommendation or "").lower():
-            # only keep if reconcile still reports broker-only > 0
-            continue
-        action_items.append(f"[{f.severity}] {f.title}: {f.recommendation}")
-    # Prefer net incomplete guidance when applicable
+    broker_incomplete = int(trade_perf.get("broker_only_incomplete_count") or 0)
+    broker_detected = int(trade_perf.get("broker_only_detected_count") or 0)
     if trade_perf.get("review_status") == "GROSS_COMPLETE_NET_INCOMPLETE":
+        action_items.append("수수료·세금 원장 확보 후 net P&L 확정")
+    elif trade_perf.get("review_status") == "PERFORMANCE_DATA_INCOMPLETE":
+        for f in critical + errors:
+            if f.title in ("BROKER_TRADE_MISSING_IN_DB", "BROKER_TRADE_BACKFILL_INCOMPLETE"):
+                if broker_detected > 0 or broker_incomplete > 0:
+                    action_items.append(f"[{f.severity}] {f.title}: {f.recommendation}")
+            elif "broker-only" not in (f.recommendation or "").lower():
+                action_items.append(f"[{f.severity}] {f.title}: {f.recommendation}")
+    else:
+        for f in critical + errors:
+            if "broker-only" in (f.recommendation or "").lower() and broker_detected == 0 and broker_incomplete == 0:
+                continue
+            action_items.append(f"[{f.severity}] {f.title}: {f.recommendation}")
+    # Never emit broker-only backfill guidance when counts are already zero
+    if broker_detected == 0 and broker_incomplete == 0:
         action_items = [
             a for a in action_items
-            if "broker-only" not in a.lower()
+            if "broker-only" not in a.lower() and "BROKER_TRADE" not in a
         ]
-        action_items.insert(0, "[WARN] GROSS_COMPLETE_NET_INCOMPLETE: 수수료·세금 원장 확보 후 net P&L 확정")
     result.action_items = action_items[:10]
 
     date_tag = performance_report_date_tag(period, start_date, end_date)
