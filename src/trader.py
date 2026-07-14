@@ -57,6 +57,7 @@ from account_snapshot import (
     AccountSnapshot,
     account_snapshot_evidence_paths,
     compute_sellable_qty,
+    extract_account_file_date,
     is_sell_order_success,
     is_sell_qty_exceeded_error,
     log_account_snapshot_kis,
@@ -394,6 +395,7 @@ class Trader:
         self._latest_account_snapshot: Optional[AccountSnapshot] = None
         self._account_sync_mismatch = False
         self._buy_blocked_snapshot = False
+        self._account_file_stale = False
         self.allow_file_snapshot_fallback = bool(
             self.trading_guards.get("allow_file_snapshot_fallback", False)
         )
@@ -845,7 +847,7 @@ class Trader:
         except Exception:
             start_ymd = end_ymd = datetime.now(KST).strftime("%Y%m%d")
 
-        ctx = resolve_pipeline_context(market=self.market)
+        ctx = resolve_pipeline_context(market=self.market, mode="live")
         trade_date = ctx["trade_date"]
         pipeline_session = ctx.get("session")
         env_td = (os.getenv("PIPELINE_TRADE_DATE") or "").strip()
@@ -872,7 +874,13 @@ class Trader:
             session=session if session in ("am", "pm") else None,
             pipeline_context_source="resolve_pipeline_context",
             generated_at_kst=generated_at,
+            resolved_live_trade_date=trade_date,
         )
+        if saved_path is None:
+            logger.error(
+                "[ACCOUNT_SNAPSHOT_TARGET_DATE_MISMATCH] blocked save trade_date=%s",
+                trade_date,
+            )
         self._last_account_snapshot_evidence_path = saved_path
         if not snap.valid or snap.error:
             msg = snap.error or snap.invalid_reason or "KIS endpoint snapshot failed"
@@ -975,12 +983,20 @@ class Trader:
         return available_cash, holdings, cash_map
 
     def _validate_account_sync(self) -> bool:
-        """account.py balance 파일 vs KIS endpoint snapshot 동기화 검증."""
+        """account.py balance 파일 vs KIS endpoint snapshot 동기화 검증.
+
+        account_file_date != live snapshot.trade_date → ACCOUNT_FILE_STALE (WARN),
+        holdings 직접 비교 생략, ACCOUNT_SYNC_MISMATCH 미발생.
+        """
         if not is_us_market(self.market):
             return True
 
         snap = self.load_account_snapshot_from_kis(force=True)
         _, file_holdings, file_cash_map, balance_path = self._load_file_snapshot()
+
+        file_meta = extract_account_file_date(balance_path)
+        account_file_date = file_meta.get("account_file_date")
+        snapshot_trade_date = str(snap.trade_date or "").strip()
 
         file_tickers = sorted(
             {self._t(h.get("pdno", "")) for h in file_holdings if self._t(h.get("pdno", ""))}
@@ -989,6 +1005,22 @@ class Trader:
         file_count = len(file_tickers)
         kis_count = snap.holding_count
 
+        if account_file_date and snapshot_trade_date and account_file_date != snapshot_trade_date:
+            detail = (
+                f"[ACCOUNT_FILE_STALE] "
+                f"account_file={balance_path.name if balance_path else 'N/A'} "
+                f"account_file_date={account_file_date} "
+                f"account_file_mtime={file_meta.get('account_file_mtime')} "
+                f"snapshot_trade_date={snapshot_trade_date} "
+                f"snapshot_ts_kst={snap.snapshot_ts} "
+                f"tickers_account_file={file_tickers} tickers_kis={kis_tickers} "
+                f"comparison_skipped=true reason=account_file_date_ne_snapshot_trade_date"
+            )
+            logger.warning(detail)
+            # Stale file must not drive trading decisions
+            self._account_file_stale = True
+            return True
+
         if file_count == kis_count and file_tickers == kis_tickers:
             return True
 
@@ -996,14 +1028,19 @@ class Trader:
         self._buy_blocked_snapshot = True
         detail = (
             f"[ACCOUNT_SYNC_MISMATCH] "
-            f"account.py balance file={balance_path.name if balance_path else 'N/A'} "
+            f"account_file={balance_path.name if balance_path else 'N/A'} "
+            f"account_file_date={account_file_date} "
+            f"account_file_mtime={file_meta.get('account_file_mtime')} "
+            f"snapshot_trade_date={snapshot_trade_date} "
+            f"snapshot_ts_kst={snap.snapshot_ts} "
             f"trader snapshot source={snap.source} "
             f"balance TR_ID={snap.balance_endpoint} "
             f"present TR_ID={snap.present_balance_endpoint} "
             f"nccs TR_ID={snap.nccs_endpoint} "
             f"holding_count_account_file={file_count} holding_count_kis={kis_count} "
             f"tickers_account_file={file_tickers} tickers_kis={kis_tickers} "
-            f"cash_map={snap.cash_map} selected_exchanges={snap.exchange_codes}"
+            f"cash_map={snap.cash_map} selected_exchanges={snap.exchange_codes} "
+            f"comparison_skipped=false"
         )
         logger.error(detail)
         _notify_text(
@@ -2143,6 +2180,73 @@ class Trader:
         )
         return odno
 
+    def _persist_trade_durable(
+        self,
+        payload: Dict[str, Any],
+        *,
+        correlation_id: str = "",
+        strategy_type: str = "",
+        reason_code: str = "",
+    ) -> bool:
+        """Common DB persist with journal / recovery lock on failure."""
+        try:
+            from broker_order_persist import (
+                begin_broker_order,
+                mark_broker_accepted,
+                persist_broker_order_to_db,
+                new_correlation_id,
+            )
+        except ImportError:
+            ok = bool(record_trade(payload))
+            if not ok:
+                side = str(payload.get("side") or "").upper()
+                finding = "SELL_DB_PERSIST_FAILED" if side == "SELL" else "BUY_DB_PERSIST_FAILED"
+                logger.critical("[%s] ticker=%s order_id=%s", finding, payload.get("ticker"), payload.get("order_id"))
+            return ok
+
+        cid = correlation_id or new_correlation_id()
+        side = str(payload.get("side") or "buy")
+        ticker = str(payload.get("ticker") or "")
+        if not correlation_id:
+            try:
+                cid = begin_broker_order(
+                    market=self.market,
+                    ticker=ticker,
+                    side=side,
+                    requested_qty=int(payload.get("requested_qty") or payload.get("qty") or 0),
+                    requested_price=float(payload.get("price") or 0),
+                    strategy_type=strategy_type,
+                    reason_code=reason_code,
+                    structured_context=payload.get("strategy_details")
+                    if isinstance(payload.get("strategy_details"), dict)
+                    else {},
+                )
+            except RuntimeError as e:
+                logger.error("[ORDER_JOURNAL_RECOVERY_REQUIRED] %s", e)
+                return False
+        odno = str(payload.get("order_id") or "").strip()
+        if odno:
+            mark_broker_accepted(cid, broker_order_id=odno, broker_response={"ODNO": odno})
+        ctx = payload.get("strategy_details")
+        if isinstance(ctx, dict):
+            ctx = {**ctx, "correlation_id": cid}
+            payload = {**payload, "strategy_details": ctx}
+        ok, detail = persist_broker_order_to_db(
+            payload,
+            correlation_id=cid,
+            market=self.market,
+            strategy_type=strategy_type,
+            reason_code=reason_code,
+        )
+        if not ok:
+            logger.critical(
+                "[%s] ticker=%s detail=%s",
+                "SELL_DB_PERSIST_FAILED" if side.upper() == "SELL" else "BUY_DB_PERSIST_FAILED",
+                ticker,
+                detail,
+            )
+        return ok
+
     def _finalize_buy_result(self, *,
                              context: str,
                              name: str,
@@ -2179,7 +2283,7 @@ class Trader:
                     "strategy_details": {"batch": context, "order_type": "immediate_execution"}
                 }
                 _db_dbg_trade_in("trader.finalize_buy.EXECUTED_DB", _executed_payload, res=res)
-                record_trade(_executed_payload)
+                self._persist_trade_durable(_executed_payload, strategy_type=context)
                 self._maybe_add_cooldown(ticker, "매수 주문 실패", increment_fail=False)
                 return ("executed", executed_qty)
         # 접수만 된 경우 또는 제출됨 → pending 기록으로 당일 매도 방지가 즉시 적용되도록 DB에 남김
@@ -2198,7 +2302,7 @@ class Trader:
                         "strategy_details": {"batch": "PENDING", "order_type": "pending_15h20_confirmation", "context": context}
                     }
                     _db_dbg_trade_in("trader.finalize_buy.PENDING_DB", _pending_payload, res=res)
-                    record_trade(_pending_payload)
+                    self._persist_trade_durable(_pending_payload, strategy_type=context)
                     logger.info(f"[{context}] 주문 제출 완료: {name}({ticker}) {requested_qty}주 @ {self._money(price)} (15시 20분 체결 확인, 당일 매도 방지 적용)")
                 else:
                     logger.warning(
@@ -2221,11 +2325,12 @@ class Trader:
             "strategy_details": {"error": err, "reason_code": "BROKER_REJECT", "context": context}
         }
         _db_dbg_trade_in("trader.finalize_buy.FAILED_DB", _failed_payload, res=res)
-        record_trade(_failed_payload)
+        if odno:
+            self._persist_trade_durable(_failed_payload, strategy_type=context, reason_code="BROKER_REJECT")
         return ("failed", 0)
 
-    def _prevent_duplicate_orders(self, ticker: str, quantity: int) -> bool:
-        """중복 주문 방지"""
+    def _prevent_duplicate_pending_orders(self, ticker: str, quantity: int) -> bool:
+        """미체결 기반 중복 주문 방지"""
         # quantity를 정수로 변환 (문자열이 전달될 수 있는 경우 대비)
         quantity = _to_int(quantity)
         try:
@@ -2260,7 +2365,7 @@ class Trader:
         # quantity를 정수로 변환 (문자열이 전달될 수 있는 경우 대비)
         quantity = _to_int(quantity)
         # 1. 미체결 주문 확인
-        if not self._prevent_duplicate_orders(ticker, quantity):
+        if not self._prevent_duplicate_pending_orders(ticker, quantity):
             return {
                 "status": "blocked", 
                 "reason": "duplicate_prevention",

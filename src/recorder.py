@@ -632,6 +632,20 @@ class DataRecorder:
             _db_dbg_log("recorder.upsert.FAIL", error=str(e), order_id=order_id)
             return False
 
+    def get_known_order_ids(self) -> List[str]:
+        """Distinct non-empty order_id values in trade_records."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT DISTINCT order_id FROM trade_records "
+                    "WHERE order_id IS NOT NULL AND TRIM(order_id) != ''"
+                )
+                return [str(r[0]).strip() for r in cur.fetchall() if r and r[0]]
+        except Exception as e:
+            self.logger.error(f"get_known_order_ids 실패: {e}")
+            return []
+
     def mark_pending_buy_cancelled(self, ticker: str, target_date: Optional[datetime] = None) -> int:
         """
         해당 종목·해당 일자의 pending 매수 기록을 cancelled로 표시 (15시 20분 미체결 취소 시 호출).

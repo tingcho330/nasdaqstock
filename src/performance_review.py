@@ -89,8 +89,16 @@ STANDARD_FINDINGS = {
     "KIS_SELL_SENT_WITH_ZERO_SELLABLE_QTY",
     "ACCOUNT_SNAPSHOT_KIS_MISSING",
     "ACCOUNT_SNAPSHOT_DATE_MISMATCH",
+    "ACCOUNT_SNAPSHOT_TARGET_DATE_MISMATCH",
     "ACCOUNT_SYNC_MISMATCH",
+    "ACCOUNT_FILE_STALE",
     "ACCOUNT_SNAPSHOT_INVALID",
+    "BROKER_TRADE_MISSING_IN_DB",
+    "BROKER_TRADE_BACKFILL_INCOMPLETE",
+    "ORDER_JOURNAL_RECOVERY_REQUIRED",
+    "SELL_DB_PERSIST_FAILED",
+    "BUY_DB_PERSIST_FAILED",
+    "PERFORMANCE_DATA_INCOMPLETE",
     "ARTIFACT_DATE_STALE",
     "LATEST_ARTIFACT_DATE_MISMATCH",
     "ARTIFACT_EMPTY_LIST",
@@ -140,8 +148,20 @@ def normalize_finding_category(title: str, category: Optional[str] = None) -> st
         return "TRADE_EXECUTION"
     if t.startswith("KIS_SELL_") or t == "KIS_CASH_EXCEEDED":
         return "RISK"
-    if t.startswith("ACCOUNT_SNAPSHOT_") or t == "ACCOUNT_SYNC_MISMATCH":
+    if t.startswith("ACCOUNT_SNAPSHOT_") or t in (
+        "ACCOUNT_SYNC_MISMATCH",
+        "ACCOUNT_FILE_STALE",
+    ):
         return "OPERATIONS"
+    if t in (
+        "BROKER_TRADE_MISSING_IN_DB",
+        "BROKER_TRADE_BACKFILL_INCOMPLETE",
+        "ORDER_JOURNAL_RECOVERY_REQUIRED",
+        "SELL_DB_PERSIST_FAILED",
+        "BUY_DB_PERSIST_FAILED",
+        "PERFORMANCE_DATA_INCOMPLETE",
+    ):
+        return "DATA_INTEGRITY"
     if t == "LEGACY_SELL_WITHOUT_SELLABLE_EVIDENCE":
         return "RISK"
     return "OPERATIONS"
@@ -2508,12 +2528,104 @@ def build_kis_endpoint_review(
 def _summarize_trades(trade_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     sells = [r for r in trade_rows if str(r.get("action", "")).upper() == "SELL"]
     wins = [r for r in sells if _safe_float(r.get("profit_loss")) > 0]
+    gross_pnl = 0.0
+    net_complete = True
+    broker_only_unresolved = 0
+    for r in sells:
+        ctx = {}
+        raw = r.get("structured_context") or ""
+        if isinstance(raw, str) and raw.strip().startswith("{"):
+            try:
+                ctx = json.loads(raw)
+            except Exception:
+                ctx = {}
+        elif isinstance(raw, dict):
+            ctx = raw
+        if ctx.get("gross_pnl") is not None:
+            try:
+                gross_pnl += float(ctx.get("gross_pnl"))
+            except Exception:
+                pass
+        else:
+            gross_pnl += _safe_float(r.get("profit_loss"))
+        if ctx.get("broker_only") and not ctx.get("net_pnl_complete", True):
+            net_complete = False
+            broker_only_unresolved += 1
+        if ctx.get("gross_pnl_basis") and not ctx.get("net_pnl_complete", False):
+            net_complete = False
+
     return {
         "trade_count": len(trade_rows),
         "sell_count": len(sells),
         "win_rate": round(len(wins) / len(sells), 4) if sells else 0.0,
         "net_pnl": round(sum(_safe_float(r.get("profit_loss")) for r in sells), 2),
+        "gross_pnl": round(gross_pnl, 4),
+        "net_pnl_complete": net_complete,
+        "broker_only_incomplete_count": broker_only_unresolved,
     }
+
+
+def _apply_broker_integrity_findings(
+    findings: List[ReviewFinding],
+    artifacts: "ReviewArtifacts",
+    trade_perf: Dict[str, Any],
+) -> str:
+    """Propagate broker-only / stale findings; return review status label."""
+    status = "OK"
+    reconcile_sel = load_order_reconcile_evidence(artifacts)
+    recon = {}
+    if reconcile_sel and getattr(reconcile_sel, "payload", None):
+        recon = reconcile_sel.payload or {}
+    elif reconcile_sel and isinstance(getattr(reconcile_sel, "path", None), Path):
+        try:
+            with open(reconcile_sel.path, "r", encoding="utf-8") as f:
+                recon = json.load(f) or {}
+        except Exception:
+            recon = {}
+
+    for item in recon.get("findings") or []:
+        title = normalize_finding_title(str(item.get("title") or ""))
+        if not title:
+            continue
+        sev = str(item.get("severity") or "ERROR")
+        details = item.get("details") or {}
+        findings.append(make_finding(
+            title,
+            sev,
+            "order_reconcile",
+            json.dumps(details, ensure_ascii=False)[:400] if details else title,
+            item.get("impact") or "broker/DB 원장 불일치",
+            item.get("recommendation") or "order_reconciler --backfill-broker-only",
+            category=item.get("category") or normalize_finding_category(title),
+        ))
+        if title == "BROKER_TRADE_MISSING_IN_DB":
+            status = "PERFORMANCE_DATA_INCOMPLETE"
+
+    if trade_perf.get("broker_only_incomplete_count") or (
+        trade_perf.get("net_pnl_complete") is False
+    ):
+        status = "PERFORMANCE_DATA_INCOMPLETE"
+        if not any(f.title == "PERFORMANCE_DATA_INCOMPLETE" for f in findings):
+            findings.append(make_finding(
+                "PERFORMANCE_DATA_INCOMPLETE",
+                "ERROR",
+                "performance",
+                f"gross_pnl={trade_perf.get('gross_pnl')} net_complete={trade_perf.get('net_pnl_complete')}",
+                "수수료·세금 미확보 또는 broker-only 미복구로 최종 성과 확정 불가",
+                "broker-only backfill 및 수수료 원장 확보 후 재리뷰",
+            ))
+
+    # Stale daily balances excluded from performance math markers
+    for p in artifacts.daily_balance_paths:
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                bal = json.load(f) or {}
+        except Exception:
+            continue
+        if bal.get("valid") is False:
+            continue
+        # Mark ACCOUNT_FILE_STALE from reconcile/logs only — skip ticker mismatch noise
+    return status
 
 
 def run_performance_review(
@@ -2552,8 +2664,12 @@ def run_performance_review(
             artifacts, strict_kis, cfg, include_logs=include_logs,
         )
         max_findings = int(cfg.get("max_findings", 20))
-        all_findings = kis_review.endpoint_findings[:max_findings]
+        all_findings = list(kis_review.endpoint_findings)
         trade_perf = _summarize_trades(artifacts.trade_rows)
+        review_status = _apply_broker_integrity_findings(all_findings, artifacts, trade_perf)
+        all_findings = finalize_findings(all_findings)[:max_findings]
+        kis_review.endpoint_findings = all_findings
+        trade_perf["review_status"] = review_status
     except Exception as e:
         review_error = str(e)
         logger.exception("Performance review analysis failed: %s", e)

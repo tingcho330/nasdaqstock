@@ -69,12 +69,14 @@
 - **장중 리스크** — `background_risk_manager` (US: `market_hours.SP500.risk_poll_windows`·`sell_time_windows`·`direct_execute`·`direct_execute_partial`·NYSE 거래일; 장외는 다음 세션까지 대기·스레드 자동 재시작; 잔고 `prpr=0` 시 KIS HHDFS00000300/76200200·`trader._resolve_execution_price`와 동일 계열 시세 보정; 손절/목표 기준가는 **평단(`pchs_avg_pric`)** 우선)
 - **EmergencyDrop·최소보유** — `emergency_drop_pct` **-13%** 급락 시 `min_holding_hours`(336h=**14일**) **예외** 즉시매도. 그 외 **전량·손절·RSI 등**은 매수일 기준 14일(`min_holding_hours`)·`rotation.min_holding_days`(14일) 적용. **부분익절(`PartialProfit`)은 14일 면제** — 장중 `direct_execute_partial` 또는 `trader` 파이프라인. 1주×50%는 **전량 treat**
 - **파이프라인 AM/PM 세션** — KST 시각·US ET 거래일 기준 `session`(`am`/`pm`)·`trade_date`를 산출물 파일명·환경변수로 고정 (자정 넘김 시 스크리너↔GPT 짝 유지)
-- **주문 정합성** — `order_reconciler.py` (DB `pending`/`partial` → KIS 조회: US `inquire-nccs`/`inquire-ccnl`, KR `inquire-orders`/`inquire-daily-ccld`로 `executed` 갱신; orphan `order_id` backfill·`--backfill-only`; 실행 후 **`order_reconcile_*.json` evidence 저장**)
-- **KIS endpoint evidence JSON** — `trader`/`kis_overseas_account`가 매매 직전 `account_snapshot_{market}_{trade_date}[_{session}].json` + `account_snapshot_latest_{market}.json` 저장. `trade_date`·`session`은 **`resolve_pipeline_context()`** 기준(stale `PIPELINE_TRADE_DATE` 무시). `endpoint_evidence`(balance/present/nccs)·USD/KRW 분리 필드·`present_balance.call_count`(USD 1회)·`krw_aux_call_count`·`exchange_coverage`/`holding_exchange_coverage`·`sellable_qty_by_ticker` 포함. raw 응답·계좌번호·토큰 **미저장**. `_clamp_sell_qty()` 결과는 `trade_records.structured_context`에 `sellable_qty_checked`·`account_snapshot_file`·`snapshot_ts_kst` 등으로 기록
+- **주문 정합성** — `order_reconciler.py` (DB `pending`/`partial` → KIS 조회: US `inquire-nccs`/`inquire-ccnl`, KR `inquire-orders`/`inquire-daily-ccld`로 `executed` 갱신; orphan `order_id` backfill·`--backfill-only`; **broker-only 주문 검출** `BROKER_TRADE_MISSING_IN_DB`·명시적 **`--backfill-broker-only`**; 실행 후 **`order_reconcile_*.json` evidence 저장**)
+- **Durable order journal** — `broker_order_persist.py`: 주문 전 `correlation_id` journal → KIS 전송 → `trade_records` idempotent upsert → 성공 시에만 partial flag/cooldown. DB persist 실패 시 `SELL/BUY_DB_PERSIST_FAILED` CRITICAL·recovery lock·추가 주문 차단
+- **KIS endpoint evidence JSON** — `trader`/`kis_overseas_account`가 매매 직전 `account_snapshot_{market}_{trade_date}[_{session}].json` + `account_snapshot_latest_{market}.json` 저장. live `trade_date`는 **`resolve_market_trade_date(mode="live")` / `resolve_pipeline_context()`**로 매 실행 재계산(stale `PIPELINE_TRADE_DATE`·과거 balance/screener에서 **가져오지 않음**). dated/latest 저장 전 `snapshot.trade_date`==`resolved_live` 검증 실패 시 **과거 dated 파일 덮어쓰기 금지** (`ACCOUNT_SNAPSHOT_TARGET_DATE_MISMATCH`). `endpoint_evidence`(balance/present/nccs)·USD/KRW 분리 필드 포함. raw 응답·계좌번호·토큰 **미저장**
+- **ACCOUNT_FILE_STALE** — `balance_YYYYMMDD.json`의 `account_file_date`≠ live snapshot `trade_date`이면 holdings 직접 비교 생략·`ACCOUNT_SYNC_MISMATCH` 미발생 (같은 날짜 holdings 불일치만 ERROR)
 - **영속 손절/목표(positions)** — `recorder.py`의 `positions` 테이블에 `stop_price/target_price`를 저장하고, `trader.run_sell_logic()`에서 **positions 레벨을 우선 적용**
 - **회전 정책 모듈화** — `rotation_policy.py`에서 최소 보유일·Δscore·예산/경제성·페어 상한(`max_pairs_per_run`)을 공통 정책으로 적용
 - **비밀값 분리** — API 키·계좌·웹훅은 `config/.env`만 사용
-- **KIS 엔드포인트 performance review** — `performance_review.py`가 **KIS API를 직접 호출하지 않고** `trading_data.db`·`balance_*/summary_*`·`account_snapshot_*`·`order_reconcile_*`·로그만 사후 분석. evidence 우선순위(dated → latest 일치 → fallback+WARN), **증거 부족 vs 실제 운영 오류** 구분, finding `category`·`evidence_source_file`·`evidence_trade_date`·`evidence_generated_at`, strict/일반 severity 분리, weekly/monthly **ccnl 기간 coverage** 검증, Markdown/JSON 보고서
+- **KIS 엔드포인트 performance review** — `performance_review.py`가 **KIS API를 직접 호출하지 않고** `trading_data.db`·`balance_*/summary_*`·`account_snapshot_*`·`order_reconcile_*`·로그만 사후 분석. **broker-only 미복구 시 `PERFORMANCE_DATA_INCOMPLETE`**, gross/net 구분, finding `category`·`DATA_INTEGRITY`, weekly/monthly **ccnl 기간 coverage** 검증, Markdown/JSON 보고서
 - **reviewer.py** — `performance_review.py` wrapper (기본: `--period monthly`). 레거시 GPT config 튜닝(`run_review()`) 함수는 모듈 내 유지
 
 ---
@@ -152,6 +154,7 @@
 | 실현 손익 (KIS) | `ovrs_rlzt_pfls_amt` (TTTS3012R output2) | **USD** | close − open (누적 delta) |
 
 - 스냅샷 캡처 시 `kis_summary`를 `balance_{open\|close}_*.json`에 함께 저장합니다.
+- **daily balance source (우선순위):** ① 동일 `trade_date`의 KIS `account_snapshot_*.json`(valid) ② 동일일 KIS-derived 캐시. **금지:** 과거 `balance_*.json`을 현재로 복제·DB BUY/SELL 합산만으로 live position 대체. 기존 daily 파일은 **`--rebuild-daily-balance`** 없으면 덮어쓰지 않음.
 - `CTRP6504R`은 `WCRC_FRCR_DVSN_CD=02`(외화) + `01`(원화, `krw_cash`) 이중 조회합니다.
 - 과거 스냅샷은 `summary_file` 경로 또는 `summary_{file_date}.json`에서 동일 필드를 로드합니다.
 - **일일 수익률 Primary는 USD**입니다. 원화 총평가·환율 분해는 참고용입니다. US 요약에서는 혼합 단위 추정 **추정 수수료** 필드를 생략합니다.
@@ -172,13 +175,16 @@ docker compose exec integrated_manager python /app/run_integrated_manager.py --s
 
 ### 3.3 파이프라인 AM/PM 세션 · 거래일
 
-`integrated_manager`가 실행 시 `utils.resolve_pipeline_context()`로 다음을 계산하고, 하위 스크립트에 `--date`·`--session` 및 환경변수 `PIPELINE_TRADE_DATE`·`PIPELINE_SESSION`으로 전달합니다.
+`integrated_manager`가 실행 시 `utils.resolve_pipeline_context()` → 내부적으로 **`resolve_market_trade_date()`** 로 다음을 계산하고, 하위 스크립트에 `--date`·`--session` 및 환경변수 `PIPELINE_TRADE_DATE`·`PIPELINE_SESSION`으로 전달합니다.
 
 | 구분 | US (`MARKET=SP500`) | 국내 (`KOSPI` 등) |
 |------|---------------------|-------------------|
 | **pm** | KST **22:00~06:30** (22:50 스크리너·23:30 파이프라인·자정 이후 동일 사이클) | KST 12:00 이후 |
 | **am** | KST **06:30~22:00** (장후·주간 유지보수) | KST 12:00 이전 |
-| **trade_date** | **NYSE(ET) 거래일** — 자정 넘어도 동일 US 세션은 같은 `trade_date` | KST 달력일(휴장 시 직전 거래일) |
+| **trade_date (live)** | **America/New_York 현재·최근 NYSE 거래 세션** — 매 실행 재계산. stale `PIPELINE_TRADE_DATE`·과거 context(≥36h)·balance/screener 파일에서 **상속하지 않음** | KST 달력일(휴장 시 직전 거래일) |
+| **trade_date (historical/replay)** | `explicit_trade_date` 또는 env만 과거일 허용 | 동일 |
+
+컨텍스트 메타(저장·로그): `resolved_trade_date`, `resolution_mode`, `now_kst`/`now_et`, `stale_context_detected`, `fallback_reason`.
 
 `config.json` → `pipeline_sessions`로 경계 조정 가능:
 
@@ -186,7 +192,8 @@ docker compose exec integrated_manager python /app/run_integrated_manager.py --s
 "pipeline_sessions": { "pm_start": "22:00", "am_end": "06:30" }
 ```
 
-수동 오버라이드: `PIPELINE_SESSION=pm PIPELINE_TRADE_DATE=20260602`
+수동 오버라이드(테스트·replay): `PIPELINE_SESSION=pm` + historical 모드에서만 past `PIPELINE_TRADE_DATE`.  
+**live 운영 중 stale env가 남아 있으면 자동 무시하고 현재 US 거래일로 재계산합니다.**
 
 ### 3.3.1 파이프라인 PM vs 리스크 폴링 세션 (US)
 
@@ -212,7 +219,8 @@ screener.py --market SP500              health_check.py (AAPL @ NAS)
   → market_state_{date}_pm_SP500.json     → recorder → trading_data.db
          └──────────────────────────────────────────┘
                               (장중, 별도 컨테이너) risk_manager.py
-                              direct_execute 매도 → pending INSERT → order_reconciler → executed
+                              direct_execute 매도 → journal → DB pending → (성공 시) flags
+                                → order_reconciler → executed / broker-only 검출
 ```
 
 **`PIPELINE_SCRIPTS` (의존성 순):**
@@ -236,11 +244,13 @@ screener.py --market SP500              health_check.py (AAPL @ NAS)
 | `collected_news_{date}_{am\|pm}_SP500.json` | `news_collector.py` — `{status, text, articles[], meta}` (US: RSS+본문 scrape) |
 | `gpt_trades_{date}_{am\|pm}_SP500.json` | `gpt_analyzer.py` (`plans[]`, `session` 메타 포함) |
 | `balance_*`, `summary_*` | `account.py` (US: `currency: "USD"`) |
-| `daily_balances/balance_{open\|close}_*.json` | `integrated_manager` 일일 요약 — `kis_summary`(US)·`total_balance`·`cash`·`holdings_value`·`holdings_detail[]`·`summary_file` |
+| `daily_balances/balance_{open\|close}_*.json` | `integrated_manager` — KIS snapshot 우선·`trade_date`/`source`/`valid`/`broker_only_order_count` 메타 |
 | `trading_data.db` | `recorder.py` (`trade_records`, `positions`) |
-| `account_snapshot_{market}_{trade_date}[_{am\|pm}].json` | `trader` KIS 스냅샷 evidence (`schema_version` 1.0, `endpoint_evidence`, USD/KRW 분리, `pipeline_context_source`) |
+| `order_journal/order_{correlation_id}.json` | `broker_order_persist` — 주문 durable journal (`created`→`broker_accepted`→`db_persisted`/`persist_failed`) |
+| `order_persist_locks/*.lock` | DB persist 실패 시 동일 ticker/side 추가 주문 차단 |
+| `account_snapshot_{market}_{trade_date}[_{am\|pm}].json` | `trader` KIS 스냅샷 evidence (`schema_version` 1.0, live trade_date 검증 후 원자 저장) |
 | `account_snapshot_latest_{market}.json` | 최신 account snapshot evidence (리뷰 date 불일치 시 fallback+WARN) |
-| `order_reconcile_{market}_{trade_date}.json` | `order_reconciler` nccs/ccnl·`query_start_date`/`query_end_date`·db_reconcile evidence |
+| `order_reconcile_{market}_{trade_date}.json` | `order_reconciler` nccs/ccnl·broker-only findings·`raw_row_count`/`unique_order_count` |
 | `order_reconcile_latest_{market}.json` | 최신 order reconcile evidence |
 | `performance_reviews/performance_review_{market}_{period}_{date}.{json,md}` | `performance_review.py` — KIS endpoint review·finding(category·evidence 메타) |
 | `performance_reviews/latest_{market}_{period}.{json,md}` | 최신 performance review |
@@ -252,16 +262,29 @@ Git에는 `output/.gitkeep`만 추적합니다. `cleanup_output.py`는 `performa
 
 | 단계 | 동작 |
 |------|------|
-| `risk_manager` `direct_execute` | 주문 성공 + `order_id` → `record_trade` **`pending`**, `executed_qty=0` |
-| `order_reconciler` (06:10 등) | DB open 주문 ↔ KIS 조회 — **US:** `inquire-nccs` → `inquire-ccnl` / **KR:** `inquire-orders` → `inquire-daily-ccld` → **`executed`**·`executed_qty` 갱신 |
-| `trader` 매수 직후 | `inquire-ccnl`·잔고 delta로 체결 확인, `pending` 시 `add_pending_order` + DB 기록 |
-| orphan 방지 | `pending`이면서 `order_id` 없으면 INSERT 생략 |
+| 공통 persist | `broker_order_persist`: journal(`created`) → KIS → journal(`broker_accepted`) → **DB upsert 성공 확인** → 그다음 partial/cooldown |
+| `risk_manager` `direct_execute` / `_direct_execute_partial_sell` | 주문 성공 + `order_id` → **`pending` upsert**(`executed_qty=0`). persist 실패 시 `False` 반환·flag 미완료·`SELL_DB_PERSIST_FAILED` |
+| `trader` | `_persist_trade_durable()`로 BUY/SELL 공통 journal+upsert |
+| `order_reconciler` (06:10 등) | DB open ↔ KIS — **US:** `inquire-nccs` → `inquire-ccnl` / **KR:** `inquire-orders` → `inquire-daily-ccld` → **`executed`** 갱신 |
+| broker-only 검출 | CCNL unique `order_id` − DB `order_id` → `BROKER_TRADE_MISSING_IN_DB` (기본 **DB 미수정**) |
+| `--backfill-broker-only` | executed + qty/price/date 충족분만 idempotent upsert. 수수료·세금·전략타입 **추정 금지**. `gross_pnl`만 `structured_context` |
+| orphan 방지 | `pending`이면서 `order_id` 없으면 INSERT 생략 · 동일 `order_id` 재실행 시 중복 INSERT 없음 |
 
-리컨실 시 **체결가·`profit_loss`는 갱신하지 않음**(주문 시점 호가·추정 손익 유지). 정밀 손익은 KIS 체결가 기준 별도 검증 권장.
+리컨실 시 open 주문의 **체결가·`profit_loss`는 자동 갱신하지 않음**. broker-only backfill은 KIS CCNL 체결가·gross P&L만 기록 (`net_pnl_complete=false`).
 
 ```bash
 # 수동 리컨실 (Docker)
 docker compose exec integrated_manager python /app/src/order_reconciler.py --since-hours 36
+
+# broker-only dry-run → 실제 backfill
+docker compose exec integrated_manager python /app/src/order_reconciler.py \
+  --since-hours 240 --backfill-broker-only --dry-run
+docker compose exec integrated_manager python /app/src/order_reconciler.py \
+  --since-hours 240 --backfill-broker-only
+
+# daily balance 강제 재생성
+docker compose exec integrated_manager python /app/run_integrated_manager.py \
+  --rebuild-daily-balance --rebuild-type both
 
 # DB 행 확인
 docker compose exec integrated_manager sqlite3 /app/output/trading_data.db \
@@ -335,10 +358,11 @@ api/kis_auth.KIS (DomesticStock + OverseasStock)
 
 | 파일 | 역할 |
 |------|------|
-| `integrated_manager.py` | 스케줄, AM/PM·`trade_date` 컨텍스트, subprocess 파이프라인, open/close 잔액 스냅샷·**US/KR 일일 요약**(KIS summary 필드) |
+| `integrated_manager.py` | 스케줄, AM/PM·`trade_date` 컨텍스트, subprocess 파이프라인, open/close 잔액(**KIS snapshot 우선**)·`--rebuild-daily-balance`·**US/KR 일일 요약** |
 | `run_integrated_manager.py` | Docker / 로컬 진입점 |
-| `risk_manager.py` | 장중 리스크·`check_sell_condition`·`EmergencyDrop`·`direct_execute`(전량)·**`direct_execute_partial`(부분익절)**·`partial_sell_state` 연동 |
-| `partial_sell_state.py` | 부분익절 수량·`partial_sell_flags.json`·open SELL·매수 cooldown 공통 |
+| `risk_manager.py` | 장중 리스크·`EmergencyDrop`·`direct_execute`/`direct_execute_partial`·**journal+DB 성공 후** partial flag/cooldown |
+| `broker_order_persist.py` | 공통 주문 journal·`persist_broker_order_to_db`·recovery lock |
+| `partial_sell_state.py` | 부분익절 수량(`compute_partial_qty` 1주×50%=전량)·`partial_sell_flags.json`·cooldown 공통 |
 | `run_background_risk_manager.py` | 리스크 전용 컨테이너·백그라운드 스레드 생존 감시·재시작 |
 | `integrated_manager.BackgroundRiskManager` | `risk_poll_windows`·5분 주기·장외 `next_session_open_kst` 대기 |
 | `kis_market_data.py` | KIS 일봉 OHLCV·RSI/ATR 입력용 정규화 |
@@ -354,19 +378,19 @@ api/kis_auth.KIS (DomesticStock + OverseasStock)
 | `health_check.py` | US: `AAPL` @ `NAS`, KR: `005930` |
 | `news_collector.py` | US: Google RSS → publisher URL resolve → **본문 scrape**; KR: Naver API + 본문 scrape |
 | `gpt_analyzer.py` | GPT·휴리스틱; 1차 필터 `min_score_pass` **config 연동**; US/KR 프롬프트·USD Budget Guard |
-| `account.py` | 잔고·요약 JSON (`MARKET`에 따라 국내/해외 분기) |
+| `account.py` | 잔고·요약 JSON — `trade_date`/`generated_at_kst`/`source`/`valid` 메타 포함 |
 | `kis_overseas_account.py` | 해외 잔고 TR → 국내 JSON 호환 정규화 (USD) |
-| `trader.py` | 매수/매도·KIS `AccountSnapshot` 로드·evidence 저장·`_clamp_sell_qty` sellable evidence·`positions` 손절/목표 우선·부분익절 dedup·회전·`--batch-check-only` |
-| `recorder.py` | `trading_data.db`·`positions`·`order_id` UPSERT·`structured_context` JSON 저장 |
+| `trader.py` | 매수/매도·live trade_date snapshot·`ACCOUNT_FILE_STALE` vs `ACCOUNT_SYNC_MISMATCH`·`_persist_trade_durable`·sellable clamp·`--batch-check-only` |
+| `recorder.py` | `trading_data.db`·`positions`·`order_id` UPSERT·`get_known_order_ids`·`structured_context` |
 
 ### 공통·API
 
 | 파일 | 역할 |
 |------|------|
-| `utils.py` | `resolve_pipeline_context`, `load_us_ticker_exchange_maps`, `resolve_us_excd`/`resolve_us_ovrs_excg`, `resolve_us_buy_order_params`, `resolve_us_sell_order_params`, `risk_session_windows`, `find_latest_file`(세션·거래일 필터) |
-| `account_snapshot.py` | KIS endpoint `AccountSnapshot`·evidence JSON 빌드/저장·`compute_sellable_qty`·매매 유효성 검증 |
-| `order_reconciler.py` | `pending`/`partial` ↔ KIS 체결 리컨실·orphan `order_id` backfill·**order_reconcile evidence JSON** |
-| `performance_review.py` | **사후** KIS 5 TR evidence 리뷰·finding category·strict/일반 severity·보고서 (API 호출 **금지**) |
+| `utils.py` | `resolve_market_trade_date`·`resolve_pipeline_context`, US EXCD/OVRS 맵, buy/sell order params, `risk_session_windows`, `find_latest_file` |
+| `account_snapshot.py` | `AccountSnapshot`·atomic evidence 저장·**target date mismatch 가드**·`extract_account_file_date` |
+| `order_reconciler.py` | open 주문 리컨실·orphan backfill·**broker-only 검출/backfill**·CCNL Decimal 필드·evidence JSON |
+| `performance_review.py` | 사후 KIS evidence 리뷰·`BROKER_TRADE_*`·`PERFORMANCE_DATA_INCOMPLETE`·gross/net (API 호출 **금지**) |
 | `reviewer.py` | `performance_review` CLI wrapper + 레거시 `run_review()` (GPT config 튜닝) |
 | `cleanup_output.py` | 오래된 산출물 정리 (`performance_reviews/` 등 보호) |
 | `api/overseas_stock/overseas_stock_functions.py` | 해외 시세·잔고·주문 TR 래퍼 |
@@ -396,7 +420,7 @@ api/kis_auth.KIS (DomesticStock + OverseasStock)
 | `TTTS3035R` | inquire-ccnl | ODNO 체결·DB vs KIS 상태·기간 coverage |
 | `TTTT1002U`/`TTTT1006U` | order | rt_cd/ODNO 품질·거절·가능수량/주문가능금액 초과 |
 
-**finding category:** `DATA_QUALITY` · `OPERATIONS` · `TRADE_EXECUTION` · `RISK`
+**finding category:** `DATA_QUALITY` · `OPERATIONS` · `TRADE_EXECUTION` · `RISK` · `DATA_INTEGRITY`
 
 **strict vs 일반 모드:** evidence 부재(`KIS_NCCS_MISSING`, `KIS_CCNL_MISSING`, `KIS_PRESENT_BALANCE_EVIDENCE_MISSING`, `KIS_EXECUTED_FILL_UNVERIFIED` 등)는 strict=WARN, 일반=INFO. 실제 운영 오류(`KIS_PRESENT_BALANCE_CURRENCY_MIXED`, `KIS_SELL_SENT_WITH_ZERO_SELLABLE_QTY`, ccnl evidence 있는 `KIS_EXECUTED_WITHOUT_FILL` 등)는 strict 여부와 무관하게 ERROR/CRITICAL.
 
@@ -412,6 +436,14 @@ api/kis_auth.KIS (DomesticStock + OverseasStock)
 | `KIS_EXECUTED_FILL_UNVERIFIED` | ccnl evidence 없이 executed — WARN/INFO |
 | `KIS_EXECUTED_WITHOUT_FILL` | ccnl evidence 있고 exec_qty=0 — ERROR |
 | `ACCOUNT_SNAPSHOT_DATE_MISMATCH` | account_snapshot `trade_date`·`snapshot_ts_kst`/`generated_at_kst` 날짜 불일치(US는 KST 세션 보정 적용) |
+| `ACCOUNT_SNAPSHOT_TARGET_DATE_MISMATCH` | live 저장 시 filename date ≠ snapshot.trade_date ≠ resolved live — dated/latest **쓰기 차단** |
+| `ACCOUNT_FILE_STALE` | balance 파일 날짜 ≠ live snapshot trade_date — holdings 비교 생략 (WARN) |
+| `ACCOUNT_SYNC_MISMATCH` | **같은** trade_date에서 account file vs KIS holdings 불일치 — ERROR |
+| `BROKER_TRADE_MISSING_IN_DB` | KIS CCNL에만 있는 order_id — ERROR · 성과 신뢰도 저하 |
+| `BROKER_TRADE_BACKFILL_INCOMPLETE` | `--backfill-broker-only` 자격 미달(가격 등) — DB 변경 없음 |
+| `SELL_DB_PERSIST_FAILED` / `BUY_DB_PERSIST_FAILED` | KIS 성공 후 DB upsert 실패 — CRITICAL · recovery lock |
+| `ORDER_JOURNAL_RECOVERY_REQUIRED` | persist lock으로 추가 주문 차단 |
+| `PERFORMANCE_DATA_INCOMPLETE` | broker-only 미복구 또는 net 수수료 미확보 — 최종 승률/순손익 미확정 |
 | `KIS_SELL_WITHOUT_SELLABLE_CHECK` | `structured_context.sellable_qty_checked`·snapshot evidence 없을 때만 |
 
 ```bash
@@ -432,8 +464,8 @@ PYTHONPATH=src OUTPUT_DIR=./output CONFIG_PATH=config/config.json \
 
 # 단위 테스트 (로컬 venv)
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt pytest
-PYTHONPATH=src OUTPUT_DIR=./output_test .venv/bin/python -m pytest \
-  tests/test_performance_review_kis_endpoints.py -v
+PYTHONPATH=src OUTPUT_DIR=./output_test CONFIG_PATH=config/config.json \
+  .venv/bin/python -m pytest tests/ -q
 ```
 
 `config.json` → `performance_review`: `strict_kis_endpoints`, `weekly_enabled`, `monthly_enabled`, `max_findings` 등.
@@ -451,7 +483,7 @@ PYTHONPATH=src OUTPUT_DIR=./output_test .venv/bin/python -m pytest \
   - `snapshot_ts_kst`가 `trade_date` 대비 **2일 이상 차이** → **ERROR**
   - `generated_at_kst`가 review scope와 **명백히 무관(2일 이상 차이)** → **ERROR**
 
-**테스트:** `tests/test_performance_review_kis_endpoints.py` (18 케이스 — present call_count·USD/KRW 혼합·balance coverage·ccnl 기간 coverage·sellable evidence 등)
+**테스트:** `tests/test_performance_review_kis_endpoints.py` + `tests/test_broker_ledger_integrity.py` (broker-only·trade_date·stale account·persist journal 등) — 전체 **58** 케이스
 
 ---
 
@@ -775,17 +807,20 @@ trading_bot_260530_NASDAQ/
 │   ├── kis_overseas_account.py  # 해외 잔고 → balance/summary JSON (USD)
 │   ├── trader.py / risk_manager.py / account.py
 │   ├── kis_market_data.py       # KIS 일봉 OHLCV (RSI·손절/목표·ATR)
-│   ├── account_snapshot.py      # KIS AccountSnapshot (매매 primary)
-│   ├── order_reconciler.py
+│   ├── account_snapshot.py      # KIS AccountSnapshot (매매 primary)·date 가드
+│   ├── broker_order_persist.py  # 주문 journal + DB persist + recovery lock
+│   ├── order_reconciler.py      # 리컨실·broker-only 검출/backfill
 │   ├── performance_review.py    # KIS endpoint 사후 리뷰 (API 호출 금지)
 │   ├── reviewer.py              # performance_review wrapper
 │   ├── cleanup_output.py
 │   ├── rotation_policy.py / rotation_manager.py
 │   ├── integrated_manager.py
 │   ├── db_debug.py              # DB_RECORD_DEBUG 헬퍼
-│   └── utils.py                 # pipeline session, norm_ticker, fmt_money, …
+│   └── utils.py                 # resolve_market_trade_date, norm_ticker, …
 ├── tests/
-│   └── test_performance_review_kis_endpoints.py
+│   ├── test_performance_review_kis_endpoints.py
+│   ├── test_performance_review_artifacts.py
+│   └── test_broker_ledger_integrity.py
 ├── run_integrated_manager.py
 ├── run_background_risk_manager.py
 ├── docker-compose.yml
@@ -816,19 +851,23 @@ trading_bot_260530_NASDAQ/
 | US 해외 매수 ORD_DVSN (`resolve_us_buy_order_params`) | ✅ `00`+슬리피지 지정가 · `APBK0952` 선제 캡·KIS `msg1` 노출 |
 | US 해외 매도 ORD_DVSN (`resolve_us_sell_order_params`) | ✅ `00`+현재가 지정가 · DIRECT_SELL·trader·`ord_unpr=0` 차단 |
 | EmergencyDrop·min_holding (14일) | ✅ -13% 급락 예외 · 매수일 기준 336h/14d · **PartialProfit 면제** |
-| 장중 DIRECT_PARTIAL | ✅ `direct_execute_partial` · `partial_sell_flags` dedup |
+| 장중 DIRECT_PARTIAL | ✅ `direct_execute_partial` · **DB persist 성공 후** `partial_sell_flags` |
 | 해외 시세 EXCD 폴백·`HHDFS76200200` | ✅ `overseas_price` 후보 순회·상세 TR 폴백 (`risk_manager`·`trader`) |
 | 해외 평가손익 (`evlu_pfls_*`) | ✅ KIS 0 반환 시 `pchs_avg_pric`·`prpr`로 재계산 (`kis_overseas_account`) |
-| 해외 잔고 (`account.py` + `kis_overseas_account`) | ✅ USD·KRW 환산 필드 분리 |
+| 해외 잔고 (`account.py` + `kis_overseas_account`) | ✅ USD·KRW 환산 필드 분리 · balance 메타(`trade_date`/`source`/`valid`) |
 | USD 예수금 (`extract_cash_from_summary`) | ✅ `frcr_dncl_amt_2` 등 CTRP6504R 필드 매핑 |
 | `positions` 손절/목표·매도 우선 | ✅ `recorder` + `trader.run_sell_logic` |
 | 회전 정책 (`rotation_policy`) | ✅ `trader` 리밸런스·`max_pairs_per_run` |
-| 파이프라인 AM/PM·`trade_date` 연동 | ✅ 산출물 `_{date}_{am\|pm}_SP500`·env 전달 |
+| 파이프라인 AM/PM·`trade_date` 연동 | ✅ `resolve_market_trade_date(live)` · stale env 무시 |
 | 파이프라인 E2E (health → news → GPT) | ✅ 로컬 검증 (§7.3) |
-| 장중 리스크·즉시매도 (`direct_execute`) | ✅ `pending` DB 기록 → 리컨실 `executed` |
+| 장중 리스크·즉시매도 (`direct_execute`) | ✅ journal → pending DB → 실패 시 CRITICAL/lock · 리컨실 `executed` |
+| Durable order journal (`broker_order_persist`) | ✅ correlation_id · persist 실패 recovery · strategy flag 순서 보장 |
 | 리스크 세션 대기·세션 시작 재개 (`BackgroundRiskManager`) | ✅ `next_session_open_kst`·스레드 watchdog 재시작 · `22:30-05:00` KST |
 | 리스크 Discord (`DISCORD_WEBHOOK_URL_RISK`) | ✅ `config/.env` 단일 로드 (`docker-compose`에 `.env.risk` 없음) |
 | `order_reconciler`·`--backfill-only` | ✅ US: `inquire-ccnl`·`inquire-nccs` / KR: 일자별 주문으로 체결 해소 |
+| broker-only 검출·`--backfill-broker-only` | ✅ `BROKER_TRADE_MISSING_IN_DB` · 자격 충족분만 upsert · dry-run |
+| ACCOUNT_FILE_STALE / snapshot date 가드 | ✅ stale balance 비교 생략 · 과거 dated snapshot 덮어쓰기 방지 |
+| daily balance KIS source | ✅ account_snapshot 우선 · `--rebuild-daily-balance` |
 | US 일일 요약 open/close 짝 | ✅ `session_close_date`·`--capture-close` |
 | US 일일 요약 Discord 표기 | ✅ USD 수익률 Primary·원화 참고·환율 분해·예수금 세분화·`ovrs_rlzt_pfls_amt` |
 | `trader` 매도 체결 수량 (`_get_qty`) | ✅ 인스턴스 메서드·티커 정규화 (긴급 손절 등 매도 후 체결 확인) |
@@ -838,9 +877,9 @@ trading_bot_260530_NASDAQ/
 | `Marcap` (US) | 마스터 미제공 → 0, 시총 필터 스킵 |
 | `investor_flow` (US) | 0 (국내 수급 API 경로) |
 | `dynamic_cash_management` | ⚠️ 보유 0·현금 100% 시 가용금 축소 가능 → 설정 확인 |
-| KIS endpoint performance review | ✅ artifact/DB/log 기반 · evidence JSON · USD/KRW 분리 · ccnl 기간 coverage · API 직접 호출 없음 |
-| `resolve_pipeline_context` account_snapshot trade_date | ✅ stale `PIPELINE_TRADE_DATE` 대신 resolved trade_date 저장 |
-| `tests/test_performance_review_kis_endpoints.py` | ✅ 18 케이스 (present call_count·balance coverage·ccnl period·sellable evidence 등) |
+| KIS endpoint performance review | ✅ artifact/DB/log · broker-only/`PERFORMANCE_DATA_INCOMPLETE` · API 직접 호출 없음 |
+| `resolve_pipeline_context` live trade_date | ✅ `resolve_market_trade_date` · stale `PIPELINE_TRADE_DATE` 재계산 |
+| `tests/` (performance + broker ledger) | ✅ **58** passed |
 
 실전 미국 매매 전: **`vps` → health_check → account → 스크리너 → 뉴스 → GPT → (선택) trader** 순으로 검증하세요.  
 `trading_params.buy_enabled=false`로 매도·리스크만 먼저 검증하는 것을 권장합니다.

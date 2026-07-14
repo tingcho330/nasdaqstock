@@ -323,6 +323,41 @@ def account_snapshot_evidence_paths(
     return dated, latest
 
 
+def _atomic_write_json(path: Path, payload: Dict[str, Any]) -> None:
+    import os
+    import tempfile
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=path.stem + ".", suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2, default=str)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_name, path)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
+def validate_snapshot_target_dates(
+    *,
+    snapshot_trade_date: str,
+    resolved_live_trade_date: str,
+    target_filename_date: str,
+) -> Optional[str]:
+    """Return error code if dated/live/filename dates disagree; else None."""
+    a = str(snapshot_trade_date or "").strip()
+    b = str(resolved_live_trade_date or "").strip()
+    c = str(target_filename_date or "").strip()
+    if a and b and c and a == b == c:
+        return None
+    return "ACCOUNT_SNAPSHOT_TARGET_DATE_MISMATCH"
+
+
 def save_account_snapshot_evidence(
     snapshot: AccountSnapshot,
     *,
@@ -331,9 +366,39 @@ def save_account_snapshot_evidence(
     output_dir: Optional[Path] = None,
     pipeline_context_source: Optional[str] = None,
     generated_at_kst: Optional[str] = None,
+    resolved_live_trade_date: Optional[str] = None,
+    allow_date_mismatch: bool = False,
 ) -> Optional[Path]:
-    """AccountSnapshot KIS endpoint evidence JSON 저장."""
+    """AccountSnapshot KIS endpoint evidence JSON 저장 (원자적).
+
+    live 저장 시 snapshot.trade_date == resolved_live_trade_date == filename date
+    검증에 실패하면 dated/latest 모두 갱신하지 않는다.
+    """
     try:
+        trade_date = str(snapshot.trade_date or "").strip()
+        live_td = str(resolved_live_trade_date or trade_date).strip()
+        dated_path, latest_path = account_snapshot_evidence_paths(
+            market, trade_date, session, output_dir,
+        )
+        # filename date is the trade_date segment used to build dated_path
+        target_filename_date = trade_date
+        if not allow_date_mismatch:
+            mismatch = validate_snapshot_target_dates(
+                snapshot_trade_date=trade_date,
+                resolved_live_trade_date=live_td,
+                target_filename_date=target_filename_date,
+            )
+            if mismatch:
+                logger.error(
+                    "[%s] snapshot.trade_date=%s resolved_live=%s target_file_date=%s "
+                    "— dated/latest write blocked",
+                    mismatch,
+                    trade_date,
+                    live_td,
+                    target_filename_date,
+                )
+                return None
+
         payload = build_account_snapshot_evidence_payload(
             snapshot,
             market=market,
@@ -341,14 +406,65 @@ def save_account_snapshot_evidence(
             pipeline_context_source=pipeline_context_source,
             generated_at_kst=generated_at_kst,
         )
-        dated_path, latest_path = account_snapshot_evidence_paths(
-            market, snapshot.trade_date, session, output_dir,
-        )
-        for path in (dated_path, latest_path):
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(payload, f, ensure_ascii=False, indent=2)
+        payload["resolved_live_trade_date"] = live_td
+        _atomic_write_json(dated_path, payload)
+        _atomic_write_json(latest_path, payload)
         logger.info("[ACCOUNT_SNAPSHOT_SAVED] path=%s", dated_path)
         return dated_path
     except Exception as e:
         logger.error("[ACCOUNT_SNAPSHOT_SAVE_FAILED] reason=%s", str(e)[:300])
         return None
+
+
+def extract_account_file_date(
+    balance_path: Optional[Path],
+    payload: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Resolve account_file_date from metadata or filename; include mtime."""
+    meta: Dict[str, Any] = {
+        "account_file": str(balance_path) if balance_path else None,
+        "account_file_date": None,
+        "account_file_mtime": None,
+        "trade_date": None,
+        "source": None,
+        "valid": None,
+    }
+    if balance_path is not None:
+        try:
+            if balance_path.exists():
+                meta["account_file_mtime"] = balance_path.stat().st_mtime
+        except OSError:
+            pass
+        m = re.search(r"(\d{8})", balance_path.name)
+        if m:
+            meta["account_file_date"] = m.group(1)
+
+    data = payload
+    if data is None and balance_path is not None and balance_path.exists():
+        try:
+            with open(balance_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            data = None
+
+    if isinstance(data, dict):
+        td = (
+            data.get("trade_date")
+            or (data.get("metadata") or {}).get("trade_date")
+            or data.get("date")
+        )
+        if td and re.fullmatch(r"\d{8}", str(td).strip()):
+            meta["trade_date"] = str(td).strip()
+            meta["account_file_date"] = meta["trade_date"]
+        meta["source"] = data.get("source") or (data.get("metadata") or {}).get("source")
+        if "valid" in data:
+            meta["valid"] = data.get("valid")
+        elif isinstance(data.get("metadata"), dict) and "valid" in data["metadata"]:
+            meta["valid"] = data["metadata"].get("valid")
+        # Filename wins only when metadata missing
+        if not meta["account_file_date"] and balance_path is not None:
+            m = re.search(r"(\d{8})", balance_path.name)
+            if m:
+                meta["account_file_date"] = m.group(1)
+
+    return meta

@@ -615,13 +615,38 @@ class RiskManager:
         ovrs_excg_hint: Optional[str] = None,
         urgency: str = "urgent",
     ) -> bool:
-        """즉시 매도 — US: ORD_DVSN=00 + 현재가 지정가, KR: 시장가(ord_dvsn=01)."""
+        """즉시 매도 — US: ORD_DVSN=00 + 현재가 지정가, KR: 시장가(ord_dvsn=01).
+
+        Persist order: journal → KIS → journal accept → DB upsert → only then strategy flags.
+        DB persist failure returns False and creates recovery lock (does not mark partial/cooldown).
+        """
+        correlation_id = ""
         try:
             if qty <= 0:
                 logger.debug(f"[DIRECT_SELL] skip: qty<=0 (ticker={ticker})")
                 return False
 
             mkt = _market()
+            try:
+                from broker_order_persist import (
+                    begin_broker_order,
+                    has_persist_failure_lock,
+                    mark_broker_accepted,
+                    persist_broker_order_to_db,
+                )
+            except ImportError:
+                begin_broker_order = None  # type: ignore
+                has_persist_failure_lock = None  # type: ignore
+                mark_broker_accepted = None  # type: ignore
+                persist_broker_order_to_db = None  # type: ignore
+
+            if has_persist_failure_lock and has_persist_failure_lock(ticker, "SELL"):
+                logger.error(
+                    "[ORDER_JOURNAL_RECOVERY_REQUIRED] block direct sell ticker=%s",
+                    ticker,
+                )
+                return False
+
             px = self._quote_price_for_record(
                 ticker,
                 fallback_px=fallback_px,
@@ -636,14 +661,54 @@ class RiskManager:
             else:
                 ord_dvsn, ord_unpr = "01", 0
 
+            strategy_type = str(reason_meta.get("type") or reason_meta.get("mode") or "direct_execute")
+            reason_code = str(reason_meta.get("reason_code") or strategy_type)
+            structured_ctx = {
+                "mode": reason_meta.get("mode", "direct_execute"),
+                **reason_meta,
+            }
+            # Partial-rounding context (1주 × 0.5 → full exit)
+            if reason_meta.get("partial_qty") is not None or reason_meta.get("partial_profit_ratio") is not None:
+                original_qty = int(reason_meta.get("original_holding_qty") or qty)
+                ratio = float(reason_meta.get("partial_profit_ratio") or 0)
+                partial_qty = int(reason_meta.get("partial_qty") or qty)
+                full_exit = bool(reason_meta.get("full_exit_due_to_rounding")) or (
+                    original_qty == 1 and ratio > 0 and ratio < 1 and partial_qty >= original_qty
+                )
+                structured_ctx.update({
+                    "partial_profit_ratio": ratio,
+                    "partial_qty": partial_qty,
+                    "original_holding_qty": original_qty,
+                    "full_exit_due_to_rounding": full_exit,
+                    "position_closed": partial_qty >= original_qty,
+                })
+
+            if begin_broker_order:
+                try:
+                    correlation_id = begin_broker_order(
+                        market=mkt,
+                        ticker=ticker,
+                        side="SELL",
+                        requested_qty=int(qty),
+                        requested_price=float(px),
+                        order_type=ord_dvsn,
+                        strategy_type=strategy_type,
+                        reason_code=reason_code,
+                        structured_context=structured_ctx,
+                    )
+                except RuntimeError as e:
+                    logger.error("[DIRECT_SELL] journal blocked: %s", e)
+                    return False
+
             logger.info(
-                "[DIRECT_SELL] try submit: %s(%s) qty=%s reason=%s ord_dvsn=%s unpr=%s",
+                "[DIRECT_SELL] try submit: %s(%s) qty=%s reason=%s ord_dvsn=%s unpr=%s cid=%s",
                 name,
                 ticker,
                 qty,
                 reason_meta.get("type", ""),
                 ord_dvsn,
                 ord_unpr,
+                correlation_id or "N/A",
             )
             df = self._kis.order_cash(
                 ord_dv="01",
@@ -660,6 +725,7 @@ class RiskManager:
             rt_cd = ""
             msg_cd = ""
             msg1 = ""
+            broker_resp: Dict = {}
             if hasattr(df, "empty") and not df.empty:
                 rec = df.to_dict("records")[0]
                 if not odno:
@@ -667,44 +733,18 @@ class RiskManager:
                 rt_cd = str(rec.get("rt_cd", "")).strip()
                 msg_cd = str(rec.get("msg_cd", "") or "")
                 msg1 = str(rec.get("msg1", "") or "")
+                broker_resp = {
+                    "rt_cd": rt_cd,
+                    "msg_cd": msg_cd,
+                    "msg1": msg1,
+                    "ODNO": odno,
+                }
                 ok = (rt_cd == "0") or bool(odno)
             elif odno:
                 ok = True
-            if ok:
-                logger.info(f"[DIRECT_SELL] ✅ submitted: {name}({ticker}) {qty}주 (ODNO={odno or 'N/A'})")
-                try:
-                    current_price = px or self._quote_price_for_record(
-                        ticker,
-                        fallback_px=fallback_px,
-                        ovrs_excg_hint=ovrs_excg_hint,
-                    )
-                    from recorder import record_trade
-                    try:
-                        from db_debug import log_trade_in as _db_dbg_trade_in
-                    except ImportError:
-                        def _db_dbg_trade_in(*args, **kwargs):
-                            pass
-                    if not odno:
-                        logger.warning(
-                            f"[DIRECT_SELL] 주문번호 없음 → DB pending 생략: {name}({ticker}) "
-                            "(order_reconciler 연동 불가)"
-                        )
-                    else:
-                        _direct_sell_payload = {
-                            "side": "sell", "ticker": ticker, "name": name,
-                            "qty": qty, "price": current_price, "trade_status": "pending",
-                            "order_id": odno,
-                            "requested_qty": qty,
-                            "executed_qty": 0,
-                            "_debug_context": "risk_manager.direct_execute",
-                            "strategy_details": {"mode": "direct_execute", **reason_meta}
-                        }
-                        _db_dbg_trade_in("risk_manager.DIRECT_SELL_DB", _direct_sell_payload)
-                        record_trade(_direct_sell_payload)
-                except Exception as e:
-                    logger.debug(f"[DIRECT_SELL] record_trade 실패: {e}")
-                return True
-            else:
+                broker_resp = {"ODNO": odno}
+
+            if not ok:
                 logger.warning(
                     "[DIRECT_SELL] submit failed: %s(%s) qty=%s df_empty=%s rt_cd=%s msg_cd=%s msg1=%s",
                     name,
@@ -715,9 +755,145 @@ class RiskManager:
                     msg_cd or "N/A",
                     msg1 or "N/A",
                 )
+                return False
+
+            logger.info(f"[DIRECT_SELL] ✅ submitted: {name}({ticker}) {qty}주 (ODNO={odno or 'N/A'})")
+            if mark_broker_accepted and correlation_id:
+                mark_broker_accepted(
+                    correlation_id,
+                    broker_order_id=odno or "",
+                    broker_response=broker_resp,
+                )
+
+            if not odno:
+                logger.warning(
+                    f"[DIRECT_SELL] 주문번호 없음 → DB pending 생략: {name}({ticker}) "
+                    "(order_reconciler 연동 불가)"
+                )
+                # Broker accepted without ODNO — still treat as incomplete persist
+                return False
+
+            current_price = px or self._quote_price_for_record(
+                ticker,
+                fallback_px=fallback_px,
+                ovrs_excg_hint=ovrs_excg_hint,
+            )
+            _direct_sell_payload = {
+                "side": "sell",
+                "ticker": ticker,
+                "name": name,
+                "qty": qty,
+                "price": current_price,
+                "trade_status": "pending",
+                "order_id": odno,
+                "requested_qty": qty,
+                "executed_qty": 0,
+                "_debug_context": "risk_manager.direct_execute",
+                "strategy_details": {
+                    "mode": "direct_execute",
+                    "correlation_id": correlation_id,
+                    **structured_ctx,
+                },
+                "structured_context": {
+                    "mode": "direct_execute",
+                    "correlation_id": correlation_id,
+                    **structured_ctx,
+                    "broker_response": broker_resp,
+                },
+                "reason_code": reason_code,
+            }
+            try:
+                from db_debug import log_trade_in as _db_dbg_trade_in
+            except ImportError:
+                def _db_dbg_trade_in(*args, **kwargs):
+                    pass
+            _db_dbg_trade_in("risk_manager.DIRECT_SELL_DB", _direct_sell_payload)
+
+            if persist_broker_order_to_db and correlation_id:
+                db_ok, detail = persist_broker_order_to_db(
+                    _direct_sell_payload,
+                    correlation_id=correlation_id,
+                    market=mkt,
+                    strategy_type=strategy_type,
+                    reason_code=reason_code,
+                )
+                if not db_ok:
+                    logger.critical(
+                        "[SELL_DB_PERSIST_FAILED] ticker=%s order_id=%s cid=%s detail=%s",
+                        ticker,
+                        odno,
+                        correlation_id,
+                        detail,
+                    )
+                    return False
+            else:
+                from recorder import record_trade
+                if not record_trade(_direct_sell_payload):
+                    logger.critical(
+                        "[SELL_DB_PERSIST_FAILED] ticker=%s order_id=%s (legacy path)",
+                        ticker,
+                        odno,
+                    )
+                    return False
+            return True
         except Exception as e:
             logger.error(f"[DIRECT_SELL] exception: {e}")
+            if correlation_id:
+                try:
+                    from broker_order_persist import update_order_journal, JOURNAL_PERSIST_FAILED
+                    update_order_journal(
+                        correlation_id,
+                        status=JOURNAL_PERSIST_FAILED,
+                        recovery_required=True,
+                        extra={"exception": str(e)},
+                    )
+                except Exception:
+                    pass
         return False
+
+    def _direct_execute_partial_sell(
+        self,
+        ticker: str,
+        name: str,
+        qty: int,
+        reason_meta: Dict,
+        *,
+        fallback_px: int = 0,
+        ovrs_excg_hint: Optional[str] = None,
+        original_holding_qty: Optional[int] = None,
+    ) -> bool:
+        original = int(original_holding_qty or reason_meta.get("original_holding_qty") or qty)
+        ratio = float(reason_meta.get("partial_profit_ratio") or 0.5)
+        full_exit = (original == 1 and ratio > 0 and ratio < 1 and int(qty) >= original) or int(qty) >= original
+        meta = {
+            **reason_meta,
+            "mode": "direct_execute_partial",
+            "partial_qty": qty,
+            "original_holding_qty": original,
+            "full_exit_due_to_rounding": full_exit and original == 1 and ratio < 1,
+            "position_closed": int(qty) >= original,
+        }
+        ok = self._direct_execute_sell(
+            ticker,
+            name,
+            qty,
+            meta,
+            fallback_px=fallback_px,
+            ovrs_excg_hint=ovrs_excg_hint,
+            urgency="normal",
+        )
+        # Strategy flags ONLY after successful KIS + DB persist
+        if ok:
+            try:
+                mark_partial_sell(ticker)
+                add_post_partial_buy_cooldown(
+                    ticker,
+                    self._post_partial_buy_cooldown_days(),
+                    reason="부분익절 후 매수 차단(direct_partial)",
+                )
+            except Exception as e:
+                logger.error("[%s] partial sell 후처리 실패(DB는 성공): %s", ticker, e)
+        return ok
 
     def _keep_if_min_holding_hours_not_met(self, ticker: str) -> Optional[Tuple[str, str, Dict]]:
         """PartialProfit 제외 매도 공통 — min_holding_hours(14일) 미충족 시 KEEP."""
@@ -785,42 +961,6 @@ class RiskManager:
 
         self._recent_direct_sell[ticker] = now
         return True, ""
-
-    def _direct_execute_partial_sell(
-        self,
-        ticker: str,
-        name: str,
-        qty: int,
-        reason_meta: Dict,
-        *,
-        fallback_px: int = 0,
-        ovrs_excg_hint: Optional[str] = None,
-    ) -> bool:
-        meta = {
-            **reason_meta,
-            "mode": "direct_execute_partial",
-            "partial_qty": qty,
-        }
-        ok = self._direct_execute_sell(
-            ticker,
-            name,
-            qty,
-            meta,
-            fallback_px=fallback_px,
-            ovrs_excg_hint=ovrs_excg_hint,
-            urgency="normal",
-        )
-        if ok:
-            try:
-                mark_partial_sell(ticker)
-                add_post_partial_buy_cooldown(
-                    ticker,
-                    self._post_partial_buy_cooldown_days(),
-                    reason="부분익절 후 매수 차단(direct_partial)",
-                )
-            except Exception as e:
-                logger.debug("[%s] partial sell 후처리 실패: %s", ticker, e)
-        return ok
 
     def _ensure_summary_file_exists(self):
         """요약 파일이 없으면 account.py를 실행하여 생성"""
@@ -2364,11 +2504,16 @@ def _run_cycle(rm: RiskManager, *, notify_summary: bool = True) -> None:
                                 "type": sell_type,
                                 "reason": reason,
                                 "partial_profit_ratio": partial_ratio,
+                                "original_holding_qty": qty,
+                                "full_exit_due_to_rounding": (
+                                    partial_qty == qty and int(qty * partial_ratio) <= 0
+                                ),
                                 "time_window": rm.rules.time_windows_for_sells or 'ALL',
                                 **ctx,
                             },
                             fallback_px=cur_price,
                             ovrs_excg_hint=ovrs_hint,
+                            original_holding_qty=qty,
                         )
                         if ok:
                             logger.info(

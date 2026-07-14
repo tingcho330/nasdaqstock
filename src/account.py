@@ -327,8 +327,19 @@ if __name__ == "__main__":
         pprint.pprint(recs[0] if recs else {})
 
         # 저장(덮어쓰기) - 정상
-        dump_with_comments(balance_file, build_balance_comments(), df_balance, extra_fields={"status": "ok"})
-        sum_extra = {"status": "ok", **summary_extra}
+        generated_at = datetime.now(KST).isoformat()
+        bal_meta = {
+            "status": "ok",
+            "trade_date": today,
+            "generated_at_kst": generated_at,
+            "source": "kis_account",
+            "market": market,
+            "valid": True,
+            "holdings_source": "kis_inquire_balance" if not us_mode else "kis_overseas_balance",
+            "cash_source": "kis_inquire_balance" if not us_mode else "kis_present_balance",
+        }
+        dump_with_comments(balance_file, build_balance_comments(), df_balance, extra_fields=bal_meta)
+        sum_extra = {**bal_meta, **summary_extra}
         dump_with_comments(
             summary_file,
             build_summary_comments(us_mode=us_mode),

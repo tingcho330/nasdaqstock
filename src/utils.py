@@ -35,6 +35,7 @@ __all__ = [
     "is_regular_session",
     "next_session_open_kst",
     "resolve_pipeline_context",
+    "resolve_market_trade_date",
     "format_pipeline_artifact",
     "pipeline_artifact_path",
     "parse_pipeline_artifact_stem",
@@ -490,16 +491,13 @@ def _parse_schedule_hhmm(raw: str) -> dt_time:
     return _parse_hhmm(m.group(1), m.group(2))
 
 
-def _resolve_pipeline_trade_date(now_kst: datetime, market: str) -> str:
-    """산출물·GPT·트레이더가 공유할 거래일(YYYYMMDD). US는 ET 세션 기준."""
-    forced = os.getenv("PIPELINE_TRADE_DATE", "").strip()
-    if re.fullmatch(r"\d{8}", forced):
-        return forced
-
+def _compute_live_trade_date(now_kst: datetime, market: str) -> str:
+    """Clock/calendar based trade_date only (ignores PIPELINE_TRADE_DATE / artifacts)."""
     if is_us_market(market):
         et_now = now_kst.astimezone(_ET)
         et_d = et_now.date()
         t_kst = now_kst.time()
+        # US evening/overnight pipeline window (KST): use current ET session day when open.
         if t_kst >= dt_time(22, 0) or t_kst < dt_time(6, 30):
             if is_market_open_day(et_d, market):
                 return et_d.strftime("%Y%m%d")
@@ -512,16 +510,149 @@ def _resolve_pipeline_trade_date(now_kst: datetime, market: str) -> str:
     return previous_trading_day(d, market).strftime("%Y%m%d")
 
 
+def _resolve_pipeline_trade_date(now_kst: datetime, market: str) -> str:
+    """Legacy helper — live clock date only (PIPELINE_TRADE_DATE not honored here)."""
+    return _compute_live_trade_date(now_kst, market)
+
+
+def resolve_market_trade_date(
+    market: Optional[str] = None,
+    now_kst: Optional[datetime] = None,
+    *,
+    mode: str = "live",
+    explicit_trade_date: Optional[str] = None,
+    stale_context_max_age_hours: float = 36.0,
+    context_source: Optional[str] = None,
+    context_trade_date: Optional[str] = None,
+    context_generated_at_kst: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Unify live vs historical/replay trade_date resolution.
+
+    live:
+      - America/New_York (US) or KST (KR) current/recent session
+      - Does NOT inherit trade_date from balance/screener/output files
+      - Stale PIPELINE_TRADE_DATE / prior pipeline context is discarded when mismatched
+    historical/replay:
+      - explicit_trade_date (or PIPELINE_TRADE_DATE) allowed
+    """
+    m = (market or os.getenv("MARKET", "KOSPI")).upper().strip()
+    if now_kst is None:
+        now_kst = datetime.now(KST)
+    elif now_kst.tzinfo is None:
+        now_kst = now_kst.replace(tzinfo=KST)
+    else:
+        now_kst = now_kst.astimezone(KST)
+
+    now_et = now_kst.astimezone(_ET)
+    live_td = _compute_live_trade_date(now_kst, m)
+    mode_norm = str(mode or "live").strip().lower()
+    if mode_norm in ("hist", "history", "historical", "replay", "backtest"):
+        mode_norm = "historical"
+
+    env_td = (os.getenv("PIPELINE_TRADE_DATE") or "").strip()
+    explicit = str(explicit_trade_date or "").strip()
+    context_td = str(context_trade_date or "").strip()
+
+    stale_context_detected = False
+    fallback_reason = ""
+    resolution_mode = mode_norm
+    resolved = live_td
+
+    def _parse_age_hours(ts_raw: Optional[str]) -> Optional[float]:
+        if not ts_raw:
+            return None
+        try:
+            ts = datetime.fromisoformat(str(ts_raw).replace("Z", "+00:00"))
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=KST)
+            return (now_kst - ts.astimezone(KST)).total_seconds() / 3600.0
+        except Exception:
+            return None
+
+    context_age_hours = _parse_age_hours(context_generated_at_kst)
+
+    if mode_norm == "historical":
+        candidate = explicit or env_td or context_td
+        if re.fullmatch(r"\d{8}", candidate or ""):
+            resolved = candidate
+            resolution_mode = "historical_explicit"
+            fallback_reason = "explicit_or_env_trade_date"
+        else:
+            resolved = live_td
+            resolution_mode = "historical_fallback_live"
+            fallback_reason = "missing_explicit_trade_date"
+    else:
+        # live: never take trade_date from stale prior context / env alone
+        if re.fullmatch(r"\d{8}", explicit or ""):
+            if explicit == live_td:
+                resolved = explicit
+                resolution_mode = "live_explicit_match"
+            else:
+                # Only allow mismatched explicit in live if caller truly meant historical
+                resolved = live_td
+                resolution_mode = "live_ignore_mismatched_explicit"
+                stale_context_detected = True
+                fallback_reason = f"explicit_trade_date={explicit} != live={live_td}"
+        elif re.fullmatch(r"\d{8}", env_td or ""):
+            if env_td == live_td:
+                resolved = env_td
+                resolution_mode = "live_env_match"
+            else:
+                resolved = live_td
+                resolution_mode = "live_recomputed"
+                stale_context_detected = True
+                fallback_reason = f"stale_PIPELINE_TRADE_DATE={env_td}"
+        elif re.fullmatch(r"\d{8}", context_td or "") and context_td != live_td:
+            age = context_age_hours
+            if age is None or age >= float(stale_context_max_age_hours):
+                resolved = live_td
+                resolution_mode = "live_recomputed"
+                stale_context_detected = True
+                fallback_reason = (
+                    f"stale_pipeline_context={context_td} age_h={age}"
+                )
+            else:
+                # Fresh but mismatched: still prefer live for SP500/US correctness
+                resolved = live_td
+                resolution_mode = "live_recomputed"
+                stale_context_detected = True
+                fallback_reason = f"context_trade_date={context_td} != live={live_td}"
+        else:
+            resolved = live_td
+            resolution_mode = "live_calendar"
+
+    return {
+        "resolved_trade_date": resolved,
+        "trade_date": resolved,
+        "resolution_mode": resolution_mode,
+        "mode": mode_norm,
+        "now_kst": now_kst.isoformat(),
+        "now_et": now_et.isoformat(),
+        "now_et_date": now_et.strftime("%Y%m%d"),
+        "live_trade_date": live_td,
+        "context_source": context_source or "resolve_market_trade_date",
+        "context_age_hours": context_age_hours,
+        "stale_context_detected": stale_context_detected,
+        "fallback_reason": fallback_reason,
+        "market": m,
+    }
+
+
 def resolve_pipeline_context(
     now: Optional[datetime] = None,
     market: Optional[str] = None,
     config: Optional[dict] = None,
-) -> Dict[str, str]:
+    *,
+    mode: str = "live",
+    explicit_trade_date: Optional[str] = None,
+) -> Dict[str, Any]:
     """
     파이프라인/스크리너 실행 컨텍스트.
     - session: am | pm
-    - trade_date: 산출물 접미사용 거래일
+    - trade_date: 산출물 접미사용 거래일 (live는 현재/최근 US 세션)
     - kst_date: KST 달력일
+    - resolved_trade_date / resolution_mode / stale_context_detected 등
     """
     m = (market or os.getenv("MARKET", "KOSPI")).upper().strip()
     if now is None:
@@ -532,11 +663,26 @@ def resolve_pipeline_context(
         now = now.astimezone(KST)
 
     session = _resolve_pipeline_session(now, m, config)
-    trade_date = _resolve_pipeline_trade_date(now, m)
+    td_info = resolve_market_trade_date(
+        m,
+        now,
+        mode=mode,
+        explicit_trade_date=explicit_trade_date,
+        context_source="resolve_pipeline_context",
+        context_trade_date=(os.getenv("PIPELINE_TRADE_DATE") or "").strip() or None,
+    )
+    if td_info.get("stale_context_detected"):
+        logging.getLogger(__name__).warning(
+            "stale pipeline trade_date ignored: %s → using %s (%s)",
+            td_info.get("fallback_reason"),
+            td_info.get("resolved_trade_date"),
+            td_info.get("resolution_mode"),
+        )
     return {
         "session": session,
-        "trade_date": trade_date,
+        "trade_date": td_info["resolved_trade_date"],
         "kst_date": now.strftime("%Y%m%d"),
+        **td_info,
     }
 
 

@@ -648,52 +648,178 @@ def load_daily_balance_pair(
     return None, close_balance, None
 
 
-def capture_balance_snapshot(snapshot_type: str) -> Optional[Dict]:
-    """잔액 스냅샷 캡처 (open/close)"""
+def capture_balance_snapshot(
+    snapshot_type: str,
+    *,
+    rebuild: bool = False,
+) -> Optional[Dict]:
+    """잔액 스냅샷 캡처 (open/close).
+
+    Source priority:
+    1) KIS account_snapshot_{market}_{trade_date}*.json (valid)
+    2) Same trade_date valid=true KIS-derived cached snapshot
+    Forbidden: copying past dated balance JSON as current; DB position-only substitute.
+    Past daily balance files are not overwritten unless rebuild=True / --rebuild-daily-balance.
+    """
     try:
-        # 계좌 스냅샷 생성
-        import subprocess
-        result = subprocess.run(
-            ["python", "/app/src/account.py"],
-            capture_output=True,
-            text=True,
-            check=True,
-            encoding="utf-8",
-        )
-        
-        # 최신 스냅샷 로드
-        cash_map, holdings, summary_path, balance_path = get_account_snapshot_cached(
-            summary_pattern="summary_*.json",
-            balance_pattern="balance_*.json", 
-            ttl_sec=5
-        )
-        
-        holdings_detail = _holdings_detail_from_rows(holdings)
-        total_balance, cash, holdings_value = _portfolio_totals_from_cash_map(
-            cash_map, holdings
-        )
-        if holdings_value <= 0 and total_balance > cash:
-            holdings_value = total_balance - cash
-        kis_summary = _kis_metrics_from_row(cash_map)
+        from utils import resolve_pipeline_context, is_us_market as _is_us
+        from account_snapshot import extract_account_file_date
+
+        ctx = resolve_pipeline_context(market=MARKET, mode="live")
+        trade_date = ctx.get("trade_date") or datetime.now(KST).strftime("%Y%m%d")
+        session = ctx.get("session") or "pm"
+
+        # Prefer live KIS account snapshot artifact
+        snap_candidates = [
+            OUTPUT_DIR / f"account_snapshot_{MARKET}_{trade_date}_{session}.json",
+            OUTPUT_DIR / f"account_snapshot_{MARKET}_{trade_date}.json",
+            OUTPUT_DIR / f"account_snapshot_latest_{MARKET}.json",
+        ]
+        kis_payload = None
+        source_snapshot_file = None
+        for cand in snap_candidates:
+            if not cand.exists():
+                continue
+            try:
+                with open(cand, "r", encoding="utf-8") as f:
+                    payload = json.load(f)
+            except Exception:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            if payload.get("valid") is False:
+                continue
+            payload_td = str(payload.get("trade_date") or "").strip()
+            if cand.name.startswith("account_snapshot_latest_"):
+                if payload_td and payload_td != trade_date:
+                    logger.warning(
+                        "skip stale latest account_snapshot trade_date=%s want=%s",
+                        payload_td,
+                        trade_date,
+                    )
+                    continue
+            elif payload_td and payload_td != trade_date:
+                continue
+            kis_payload = payload
+            source_snapshot_file = str(cand)
+            break
+
+        if kis_payload is None:
+            # Trigger fresh KIS snapshot via account.py then trader-style endpoint if needed
+            import subprocess
+            try:
+                subprocess.run(
+                    ["python", "/app/src/account.py"],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    encoding="utf-8",
+                    timeout=60,
+                )
+            except Exception as e:
+                logger.warning("account.py refresh for daily balance failed: %s", e)
+
+            cash_map, holdings, summary_path, balance_path = get_account_snapshot_cached(
+                summary_pattern="summary_*.json",
+                balance_pattern="balance_*.json",
+                ttl_sec=5,
+                exact_trade_date=trade_date,
+            )
+            file_meta = extract_account_file_date(balance_path)
+            if file_meta.get("account_file_date") and file_meta["account_file_date"] != trade_date:
+                logger.error(
+                    "[ACCOUNT_FILE_STALE] refusing stale balance as daily source "
+                    "file_date=%s trade_date=%s — no stale fallback",
+                    file_meta.get("account_file_date"),
+                    trade_date,
+                )
+                return None
+
+            holdings_detail = _holdings_detail_from_rows(holdings)
+            total_balance, cash, holdings_value = _portfolio_totals_from_cash_map(
+                cash_map, holdings
+            )
+            if holdings_value <= 0 and total_balance > cash:
+                holdings_value = total_balance - cash
+            kis_summary = _kis_metrics_from_row(cash_map)
+            source = "kis_account_file_same_date"
+            source_snapshot_file = str(balance_path) if balance_path else None
+            snapshot_ts = datetime.now(KST).isoformat()
+        else:
+            cash_usd = float(kis_payload.get("available_cash_usd") or 0)
+            holdings_value = float(kis_payload.get("holdings_value_usd") or 0)
+            total_balance = float(kis_payload.get("total_asset_usd") or (cash_usd + holdings_value))
+            cash = cash_usd
+            tickers = kis_payload.get("tickers") or []
+            holdings_detail = [
+                {"ticker": t, "qty": None, "value": None} for t in tickers
+            ]
+            # Prefer sellable evidence for qty when present
+            sellable = kis_payload.get("sellable_qty_by_ticker") or {}
+            if sellable:
+                holdings_detail = [
+                    {"ticker": t, "qty": sellable.get(t), "value": None}
+                    for t in tickers
+                ]
+            kis_summary = {
+                "ord_psbl_frcr_amt": cash_usd,
+                "tot_evlu_amt_usd": total_balance,
+                "tot_evlu_amt_krw": float(kis_payload.get("total_asset_krw") or 0),
+                "bass_exrt": None,
+                "krw_cash": float(kis_payload.get("krw_cash") or 0),
+            }
+            source = "kis_account_snapshot"
+            snapshot_ts = (
+                kis_payload.get("snapshot_ts_kst")
+                or kis_payload.get("generated_at_kst")
+                or datetime.now(KST).isoformat()
+            )
+            summary_path = None
+            balance_path = None
 
         now = datetime.now(KST)
-        snap_date = now.strftime("%Y%m%d")
-        # US 장시작(23:25): 다음 KST 아침 종료일에 세션 귀속 (요약 시 open/close 짝 맞춤)
+        snap_date = trade_date
         session_close_date = snap_date
         if is_us_market(MARKET) and snapshot_type == "open":
-            nxt = now.date() + timedelta(days=1)
+            # Keep US open session pairing logic using KST clock date for pairing
+            kst_today = now.date()
+            nxt = kst_today + timedelta(days=1)
             for _ in range(5):
                 if is_market_open_day(nxt, MARKET):
                     session_close_date = nxt.strftime("%Y%m%d")
                     break
                 nxt += timedelta(days=1)
 
-        # 스냅샷 데이터 구성
+        broker_only_count = 0
+        try:
+            reconcile_path = OUTPUT_DIR / f"order_reconcile_latest_{MARKET}.json"
+            if reconcile_path.exists():
+                with open(reconcile_path, "r", encoding="utf-8") as f:
+                    recon = json.load(f) or {}
+                broker_only_count = int(
+                    (recon.get("db_reconcile") or {}).get("broker_only_count") or 0
+                )
+                for finding in recon.get("findings") or []:
+                    if finding.get("title") == "BROKER_TRADE_MISSING_IN_DB":
+                        broker_only_count = max(broker_only_count, 1)
+        except Exception:
+            pass
+
+        position_reconciled = broker_only_count == 0
         snapshot = {
             "date": snap_date,
+            "trade_date": trade_date,
             "session_close_date": session_close_date,
             "timestamp": now.isoformat(),
+            "snapshot_ts_kst": snapshot_ts,
+            "generated_at_kst": now.isoformat(),
             "type": snapshot_type,
+            "source": source,
+            "source_snapshot_file": source_snapshot_file,
+            "valid": True,
+            "position_reconciled": position_reconciled,
+            "broker_only_order_count": broker_only_count,
+            "db_vs_kis_position_match": position_reconciled,
             "total_balance": total_balance,
             "cash": cash,
             "holdings_value": holdings_value,
@@ -701,27 +827,35 @@ def capture_balance_snapshot(snapshot_type: str) -> Optional[Dict]:
             "holdings_detail": holdings_detail,
             "kis_summary": kis_summary,
             "summary_file": str(summary_path) if summary_path else None,
-            "balance_file": str(balance_path) if balance_path else None
+            "balance_file": str(balance_path) if balance_path else None,
         }
-        
-        # 파일 저장 (US open: session_close_date 키로도 저장 → 06:15 요약과 짝)
+
         save_dates = {snap_date}
         if is_us_market(MARKET) and snapshot_type == "open" and session_close_date != snap_date:
             save_dates.add(session_close_date)
         for save_date in save_dates:
             filename = f"balance_{snapshot_type}_{save_date}.json"
             filepath = BALANCE_STORAGE_PATH / filename
+            if filepath.exists() and not rebuild:
+                logger.info(
+                    "daily balance exists, skip overwrite (use --rebuild-daily-balance): %s",
+                    filepath,
+                )
+                continue
             snap_copy = {**snapshot, "file_date": save_date}
-            with open(filepath, "w", encoding="utf-8") as f:
+            BALANCE_STORAGE_PATH.mkdir(parents=True, exist_ok=True)
+            tmp = filepath.with_suffix(".tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(snap_copy, f, ensure_ascii=False, indent=2)
+            tmp.replace(filepath)
             logger.info(
-                "잔액 스냅샷 저장: %s (capture=%s session_close=%s)",
+                "잔액 스냅샷 저장: %s source=%s trade_date=%s",
                 filepath,
-                snap_date,
-                session_close_date,
+                source,
+                trade_date,
             )
         return snapshot
-        
+
     except Exception as e:
         logger.error(f"잔액 스냅샷 캡처 실패: {type(e).__name__}: {str(e)}")
         logger.debug("잔액 스냅샷 캡처 상세 오류:", exc_info=True)
@@ -1758,6 +1892,17 @@ if __name__ == "__main__":
     parser.add_argument("--capture-close", action="store_true", help="장종료 잔액 캡처")
     parser.add_argument("--send-summary", action="store_true", help="일일 요약 전송")
     parser.add_argument("--no-background-risk", action="store_true", help="백그라운드 RiskManager 비활성화")
+    parser.add_argument(
+        "--rebuild-daily-balance",
+        action="store_true",
+        help="기존 daily balance 파일을 덮어쓰고 재생성",
+    )
+    parser.add_argument(
+        "--rebuild-type",
+        choices=["open", "close", "both"],
+        default="both",
+        help="--rebuild-daily-balance 대상",
+    )
     args = parser.parse_args()
     
     print(f"인수 파싱 완료: {args}")
@@ -1765,7 +1910,11 @@ if __name__ == "__main__":
     # 백그라운드 RiskManager 인스턴스
     background_risk_manager = None
     
-    if args.capture_open:
+    if args.rebuild_daily_balance:
+        types = ["open", "close"] if args.rebuild_type == "both" else [args.rebuild_type]
+        for t in types:
+            capture_balance_snapshot(t, rebuild=True)
+    elif args.capture_open:
         capture_balance_snapshot("open")
     elif args.capture_close:
         capture_balance_snapshot("close")

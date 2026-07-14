@@ -13,9 +13,10 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+from decimal import Decimal, InvalidOperation
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional, Tuple, Set
 
 from settings import settings
 import os
@@ -87,6 +88,22 @@ def _safe_int(x: Any, default: int = 0) -> int:
         return default
 
 
+def _safe_decimal(x: Any, default: Optional[Decimal] = None) -> Optional[Decimal]:
+    if x is None or x == "":
+        return default
+    try:
+        return Decimal(str(x).replace(",", "").strip())
+    except (InvalidOperation, ValueError, TypeError):
+        return default
+
+
+def _decimal_to_json(val: Optional[Decimal]) -> Any:
+    if val is None:
+        return None
+    # Keep as string for exactness in evidence; float for DB callers via float()
+    return str(val)
+
+
 def _normalize_domestic_order_row(row: Any) -> Optional[Dict[str, Any]]:
     """KIS 국내주식 주문 row(Series/dict)를 내부 표준 dict로 정규화."""
     try:
@@ -126,17 +143,33 @@ def _normalize_domestic_order_row(row: Any) -> Optional[Dict[str, Any]]:
 
 
 def _normalize_overseas_order_row(row: Any) -> Optional[Dict[str, Any]]:
-    """KIS 해외주식 주문 row(Series/dict)를 내부 표준 dict로 정규화."""
+    """KIS 해외주식 주문 row — Decimal 정밀도 유지, CCNL 필드 전체 보존."""
     try:
         order_id = str(row.get("odno", "") or "").strip()
         if not order_id:
             return None
-        qty = _safe_int(row.get("ft_ord_qty", row.get("ord_qty", 0)))
-        executed_qty = _safe_int(row.get("ft_ccld_qty", row.get("tot_ccld_qty", 0)))
+
+        qty_dec = _safe_decimal(row.get("ft_ord_qty", row.get("ord_qty", 0)), Decimal(0)) or Decimal(0)
+        exe_dec = _safe_decimal(row.get("ft_ccld_qty", row.get("tot_ccld_qty", 0)), Decimal(0)) or Decimal(0)
+        qty = int(qty_dec)
+        executed_qty = int(exe_dec)
+
         ticker = norm_ticker(str(row.get("pdno", "") or ""), os.getenv("MARKET", "SP500"))
         side_cd = str(row.get("sll_buy_dvsn_cd", row.get("sll_buy_dvsn", "")) or "")
+        side_name = str(row.get("sll_buy_dvsn_cd_name", "") or "")
         side = "buy" if side_cd == "02" else "sell"
-        order_time = str(row.get("ord_tmd", "") or "")
+
+        order_date = str(row.get("ord_dt", "") or "").strip()
+        domestic_order_date = str(row.get("dmst_ord_dt", "") or "").strip()
+        order_time = str(
+            row.get("ord_tmd") or row.get("thco_ord_tmd") or ""
+        ).strip()
+
+        order_price = _safe_decimal(row.get("ft_ord_unpr3", row.get("ord_unpr", 0)))
+        executed_price = _safe_decimal(row.get("ft_ccld_unpr3", row.get("avg_unpr", 0)))
+        executed_amount = _safe_decimal(row.get("ft_ccld_amt3", 0))
+        unfilled_qty_dec = _safe_decimal(row.get("nccs_qty", 0), Decimal(0)) or Decimal(0)
+
         rvse = str(row.get("rvse_cncl_dvsn", row.get("rvse_cncl_dvsn_cd", "")) or "").strip()
         prcs = str(row.get("prcs_stat_name", "") or "")
         cancelled = rvse in ("02", "2") or ("취소" in prcs and executed_qty <= 0)
@@ -154,13 +187,32 @@ def _normalize_overseas_order_row(row: Any) -> Optional[Dict[str, Any]]:
 
         return {
             "order_id": order_id,
-            "ticker": ticker,
-            "side": side,
-            "quantity": qty,
-            "executed_qty": executed_qty,
-            "status": status,
-            "cancelled": cancelled,
+            "original_order_id": str(row.get("orgn_odno", "") or "").strip(),
+            "order_date": order_date,
+            "domestic_order_date": domestic_order_date,
             "order_time": order_time,
+            "ticker": ticker,
+            "product_name": str(row.get("prdt_name", "") or ""),
+            "side": side,
+            "side_code": side_cd,
+            "side_name": side_name,
+            "quantity": qty,
+            "order_price": order_price,
+            "order_price_str": _decimal_to_json(order_price),
+            "executed_qty": executed_qty,
+            "executed_price": executed_price,
+            "executed_price_str": _decimal_to_json(executed_price),
+            "executed_amount": executed_amount,
+            "executed_amount_str": _decimal_to_json(executed_amount),
+            "unfilled_qty": int(unfilled_qty_dec),
+            "status": status,
+            "status_name": prcs,
+            "rejection_reason": str(row.get("rjct_rson_name", "") or ""),
+            "cancelled": cancelled,
+            "exchange": str(row.get("ovrs_excg_cd", "") or "").strip().upper(),
+            "currency": str(row.get("tr_crcy_cd", "") or "").strip().upper(),
+            "media": str(row.get("mdia_dvsn_name", "") or ""),
+            "market_name": str(row.get("tr_mket_name", "") or ""),
         }
     except Exception:
         return None
@@ -326,8 +378,20 @@ def _fetch_overseas_daily_orders(
         )
 
     by_id: Dict[str, Dict[str, Any]] = {}
+    raw_row_count = len(orders)
     for o in orders:
-        by_id[o["order_id"]] = o
+        oid = o["order_id"]
+        # Prefer row with higher executed_qty when duplicates
+        prev = by_id.get(oid)
+        if prev is None or _safe_int(o.get("executed_qty", 0)) >= _safe_int(prev.get("executed_qty", 0)):
+            by_id[oid] = o
+
+    unique_order_count = len(by_id)
+    duplicate_order_id_count = max(0, raw_row_count - unique_order_count)
+    filled_unique = sum(
+        1 for o in by_id.values()
+        if _safe_int(o.get("executed_qty", 0)) > 0 and not o.get("cancelled")
+    )
 
     tr_id = _kis_tr_id_ccnl(env)
     all_failed = bool(exchanges) and all(status_by_exchange.get(e) == "FAILED" for e in exchanges)
@@ -337,7 +401,12 @@ def _fetch_overseas_daily_orders(
         "observed_tr_ids": [tr_id],
         "exchange_coverage": [e for e in exchanges if status_by_exchange.get(e) in ("OK", "EMPTY")],
         "status_by_exchange": status_by_exchange,
-        "order_count": len(orders),
+        # order_count kept for backward compat = raw rows
+        "order_count": raw_row_count,
+        "raw_row_count": raw_row_count,
+        "unique_order_count": unique_order_count,
+        "duplicate_order_id_count": duplicate_order_id_count,
+        "filled_unique_order_count": filled_unique,
         "filled_order_count": filled,
         "partial_order_count": partial,
         "canceled_order_count": canceled,
@@ -602,7 +671,332 @@ def order_reconcile_evidence_paths(
     return dated, latest
 
 
+def get_db_order_ids(recorder=None) -> Set[str]:
+    """All non-empty order_id values currently in trade_records."""
+    rec = recorder or get_recorder()
+    ids: Set[str] = set()
+    try:
+        if hasattr(rec, "get_known_order_ids"):
+            return set(rec.get_known_order_ids())
+        import sqlite3
+        with sqlite3.connect(rec.db_path) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT DISTINCT order_id FROM trade_records "
+                "WHERE order_id IS NOT NULL AND TRIM(order_id) != ''"
+            )
+            for (oid,) in cur.fetchall():
+                s = str(oid or "").strip()
+                if s:
+                    ids.add(s)
+    except Exception as e:
+        logger.warning("get_db_order_ids failed: %s", e)
+    return ids
+
+
+def detect_broker_only_orders(
+    kis_orders: Dict[str, Dict[str, Any]],
+    db_order_ids: Optional[Set[str]] = None,
+    *,
+    recorder=None,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    KIS CCNL unique order_id − DB trade_records order_id = broker_only.
+    Returns (broker_only_orders, findings). Does NOT mutate DB.
+    """
+    known = db_order_ids if db_order_ids is not None else get_db_order_ids(recorder)
+    broker_only: List[Dict[str, Any]] = []
+    findings: List[Dict[str, Any]] = []
+
+    for oid, kis_o in (kis_orders or {}).items():
+        if oid in known:
+            continue
+        broker_only.append(kis_o)
+        findings.append({
+            "title": "BROKER_TRADE_MISSING_IN_DB",
+            "severity": "ERROR",
+            "category": "DATA_INTEGRITY",
+            "details": {
+                "order_id": oid,
+                "order_date": kis_o.get("order_date"),
+                "order_time": kis_o.get("order_time"),
+                "ticker": kis_o.get("ticker"),
+                "product_name": kis_o.get("product_name"),
+                "side": kis_o.get("side"),
+                "quantity": kis_o.get("quantity"),
+                "executed_qty": kis_o.get("executed_qty"),
+                "order_price": _decimal_to_json(kis_o.get("order_price"))
+                if isinstance(kis_o.get("order_price"), Decimal)
+                else kis_o.get("order_price_str") or kis_o.get("order_price"),
+                "executed_price": _decimal_to_json(kis_o.get("executed_price"))
+                if isinstance(kis_o.get("executed_price"), Decimal)
+                else kis_o.get("executed_price_str") or kis_o.get("executed_price"),
+                "executed_amount": _decimal_to_json(kis_o.get("executed_amount"))
+                if isinstance(kis_o.get("executed_amount"), Decimal)
+                else kis_o.get("executed_amount_str") or kis_o.get("executed_amount"),
+                "exchange": kis_o.get("exchange") or kis_o.get("ovrs_excg_cd"),
+                "currency": kis_o.get("currency"),
+                "media": kis_o.get("media"),
+                "db_lookup_result": "missing",
+            },
+        })
+    return broker_only, findings
+
+
+def _backfill_eligibility(kis_o: Dict[str, Any]) -> Tuple[bool, str]:
+    """All conditions required for safe --backfill-broker-only upsert."""
+    if str(kis_o.get("status") or "").lower() != "executed":
+        return False, "status_not_executed"
+    if not str(kis_o.get("order_id") or "").strip():
+        return False, "missing_order_id"
+    if not str(kis_o.get("ticker") or "").strip():
+        return False, "missing_ticker"
+    if not str(kis_o.get("side") or "").strip():
+        return False, "missing_side"
+    exe_qty = _safe_int(kis_o.get("executed_qty", 0))
+    if exe_qty <= 0:
+        return False, "executed_qty_le_0"
+    exe_px = kis_o.get("executed_price")
+    if isinstance(exe_px, Decimal):
+        ok_px = exe_px > 0
+        px_val = exe_px
+    else:
+        px_val = _safe_decimal(exe_px, Decimal(0)) or Decimal(0)
+        ok_px = px_val > 0
+    if not ok_px:
+        return False, "executed_price_le_0"
+    if not str(kis_o.get("order_date") or "").strip():
+        return False, "missing_order_date"
+    return True, ""
+
+
+def _gross_pnl_for_backfill(
+    recorder,
+    *,
+    ticker: str,
+    side: str,
+    qty: int,
+    executed_price: Decimal,
+) -> Optional[Decimal]:
+    """Gross P&L only (no commission/tax estimate). SELL vs last BUY."""
+    if side != "sell":
+        return None
+    try:
+        trades = recorder.get_trade_records(ticker=ticker)
+        buys = [t for t in trades if str(t.action).upper() == "BUY" and (t.quantity or 0) > 0]
+        if not buys:
+            return None
+        last_buy = buys[-1]
+        buy_px = Decimal(str(last_buy.price or 0))
+        if buy_px <= 0:
+            return None
+        return (executed_price - buy_px) * Decimal(qty)
+    except Exception:
+        return None
+
+
+def backfill_broker_only_orders(
+    broker_only: List[Dict[str, Any]],
+    *,
+    recorder=None,
+    dry_run: bool = False,
+) -> Dict[str, Any]:
+    """
+    Idempotent upsert for eligible broker-only executed orders.
+    Incomplete rows → BROKER_TRADE_BACKFILL_INCOMPLETE, no DB change.
+    """
+    rec = recorder or get_recorder()
+    now_kst = datetime.now(KST).isoformat()
+    inserted = 0
+    updated = 0
+    skipped_incomplete = 0
+    incomplete_findings: List[Dict[str, Any]] = []
+    backfilled_ids: List[str] = []
+
+    for kis_o in broker_only:
+        ok, reason = _backfill_eligibility(kis_o)
+        if not ok:
+            skipped_incomplete += 1
+            incomplete_findings.append({
+                "title": "BROKER_TRADE_BACKFILL_INCOMPLETE",
+                "severity": "ERROR",
+                "category": "DATA_INTEGRITY",
+                "details": {
+                    "order_id": kis_o.get("order_id"),
+                    "ticker": kis_o.get("ticker"),
+                    "reason": reason,
+                    "status": kis_o.get("status"),
+                    "executed_qty": kis_o.get("executed_qty"),
+                    "executed_price": kis_o.get("executed_price_str") or str(kis_o.get("executed_price")),
+                    "order_date": kis_o.get("order_date"),
+                },
+            })
+            logger.warning(
+                "[BROKER_TRADE_BACKFILL_INCOMPLETE] order_id=%s reason=%s — DB unchanged",
+                kis_o.get("order_id"),
+                reason,
+            )
+            continue
+
+        exe_px = kis_o.get("executed_price")
+        if not isinstance(exe_px, Decimal):
+            exe_px = _safe_decimal(exe_px, Decimal(0)) or Decimal(0)
+        exe_amt = kis_o.get("executed_amount")
+        if not isinstance(exe_amt, Decimal):
+            exe_amt = _safe_decimal(exe_amt)
+        qty = _safe_int(kis_o.get("executed_qty") or kis_o.get("quantity") or 0)
+        side = str(kis_o.get("side") or "").lower()
+        ticker = str(kis_o.get("ticker") or "")
+        order_id = str(kis_o.get("order_id") or "").strip()
+
+        gross = _gross_pnl_for_backfill(
+            rec, ticker=ticker, side=side, qty=qty, executed_price=exe_px,
+        )
+        structured = {
+            "source": "order_reconciler",
+            "backfilled_from": "kis_ccnl",
+            "broker_only": True,
+            "media": kis_o.get("media") or "OpenAPI",
+            "recovered_at_kst": now_kst,
+            "gross_pnl_basis": True,
+            "net_pnl_complete": False,
+            "order_date": kis_o.get("order_date"),
+            "order_time": kis_o.get("order_time"),
+            "exchange": kis_o.get("exchange"),
+            "currency": kis_o.get("currency") or "USD",
+            "executed_amount": _decimal_to_json(exe_amt) if exe_amt is not None else None,
+            "gross_pnl": _decimal_to_json(gross) if gross is not None else None,
+            "commission_known": False,
+            "tax_known": False,
+            # Do NOT invent strategy type (e.g. PartialProfit) when unknown
+        }
+
+        # profit_loss: store gross only with explicit flag; never fake net
+        pnl_value = float(gross) if gross is not None else 0.0
+
+        payload = {
+            "side": side,
+            "ticker": ticker,
+            "name": kis_o.get("product_name") or ticker,
+            "qty": qty,
+            "price": float(exe_px),
+            "trade_status": "executed",
+            "order_id": order_id,
+            "requested_qty": _safe_int(kis_o.get("quantity") or qty),
+            "executed_qty": qty,
+            "pnl_amount": pnl_value if side == "sell" else None,
+            "structured_context": structured,
+            "strategy_details": structured,
+            "reason_code": "BROKER_ONLY_BACKFILL",
+            "_debug_context": "order_reconciler.backfill_broker_only",
+        }
+
+        if dry_run:
+            logger.info(
+                "[BACKFILL_DRY_RUN] would upsert order_id=%s ticker=%s side=%s qty=%s px=%s gross=%s",
+                order_id,
+                ticker,
+                side,
+                qty,
+                exe_px,
+                gross,
+            )
+            backfilled_ids.append(order_id)
+            continue
+
+        # Detect insert vs update against the target recorder
+        known_before = order_id in get_db_order_ids(rec)
+
+        from recorder import TradeRecord
+        import json as _json
+
+        # Build TradeRecord and upsert on the SAME recorder instance
+        try:
+            structured_json = _json.dumps(structured, ensure_ascii=False)
+        except Exception:
+            structured_json = str(structured)
+
+        tr = TradeRecord(
+            timestamp=datetime.now(KST),
+            ticker=ticker,
+            action=side.upper(),
+            quantity=qty,
+            price=float(exe_px),
+            amount=float(exe_amt) if exe_amt is not None else float(exe_px) * qty,
+            commission=0.0,
+            tax=0.0,
+            total_cost=float(exe_amt) if exe_amt is not None else float(exe_px) * qty,
+            net_amount=float(exe_amt) if exe_amt is not None else float(exe_px) * qty,
+            profit_loss=pnl_value if side == "sell" else 0.0,
+            holding_period_days=0,
+            order_status="executed",
+            order_id=order_id,
+            requested_qty=_safe_int(kis_o.get("quantity") or qty),
+            executed_qty=qty,
+            last_status_update_ts=now_kst,
+            reason_code="BROKER_ONLY_BACKFILL",
+            structured_context=structured_json,
+        )
+        db_ok = bool(rec.upsert_trade_record_by_order_id(tr))
+        if not db_ok:
+            incomplete_findings.append({
+                "title": "BROKER_TRADE_BACKFILL_INCOMPLETE",
+                "severity": "ERROR",
+                "category": "DATA_INTEGRITY",
+                "details": {"order_id": order_id, "reason": "upsert_failed"},
+            })
+            continue
+        if known_before:
+            updated += 1
+        else:
+            inserted += 1
+        backfilled_ids.append(order_id)
+        try:
+            from broker_order_persist import clear_persist_failure_lock
+            clear_persist_failure_lock(ticker, side.upper(), order_id)
+        except Exception:
+            pass
+
+    return {
+        "backfill_inserted": inserted,
+        "backfill_updated": updated,
+        "backfill_skipped_incomplete": skipped_incomplete,
+        "backfill_order_ids": backfilled_ids,
+        "incomplete_findings": incomplete_findings,
+        "dry_run": dry_run,
+    }
+
+
+def detect_and_optionally_backfill_broker_only(
+    daily_orders: Dict[str, Dict[str, Any]],
+    *,
+    backfill: bool = False,
+    dry_run: bool = False,
+    recorder=None,
+) -> Dict[str, Any]:
+    rec = recorder or get_recorder()
+    broker_only, findings = detect_broker_only_orders(daily_orders, recorder=rec)
+    result: Dict[str, Any] = {
+        "broker_only_count": len(broker_only),
+        "broker_only_order_ids": [o.get("order_id") for o in broker_only],
+        "findings": findings,
+    }
+    if backfill and broker_only:
+        bf = backfill_broker_only_orders(broker_only, recorder=rec, dry_run=dry_run)
+        result.update(bf)
+        result["findings"] = findings + list(bf.get("incomplete_findings") or [])
+        # Refresh detect after backfill
+        if not dry_run:
+            remaining, remaining_findings = detect_broker_only_orders(
+                daily_orders, recorder=rec,
+            )
+            result["broker_only_remaining"] = len(remaining)
+            result["findings_after_backfill"] = remaining_findings
+    return result
+
+
 def save_order_reconcile_evidence(
+
     payload: Dict[str, Any],
     *,
     market: str,
@@ -621,9 +1015,17 @@ def save_order_reconcile_evidence(
         return None
 
 
-def reconcile_open_orders(*, since_hours: int = 24, limit: int = 500) -> Dict[str, int]:
+def reconcile_open_orders(
+    *,
+    since_hours: int = 24,
+    limit: int = 500,
+    backfill_broker_only: bool = False,
+    dry_run: bool = False,
+) -> Dict[str, Any]:
     """
     DB open(pending/partial) 주문을 KIS 조회 결과로 리컨실.
+    또한 KIS CCNL − DB order_id = broker_only 검출 (기본: DB 미수정).
+    --backfill-broker-only 시 자격 충족 executed 주문만 idempotent upsert.
     """
     setup_logging()
     logger.setLevel(logging.INFO)
@@ -871,7 +1273,7 @@ def reconcile_open_orders(*, since_hours: int = 24, limit: int = 500) -> Dict[st
     _db_dbg_log("reconciler.done_with_backfill", **summary)
 
     if is_us_market():
-        if ccnl_evidence is None:
+        if ccnl_evidence is None or daily_orders is None:
             daily_orders, ccnl_evidence = _fetch_daily_orders(
                 kis,
                 start_ymd=start_ymd,
@@ -890,6 +1292,26 @@ def reconcile_open_orders(*, since_hours: int = 24, limit: int = 500) -> Dict[st
                 1 for r in db_with_id if str(r.get("order_id")) in daily_orders
             )
         coverage = round(matched / len(db_with_id), 4) if db_with_id else 1.0
+
+        broker_result = detect_and_optionally_backfill_broker_only(
+            daily_orders or {},
+            backfill=backfill_broker_only,
+            dry_run=dry_run,
+            recorder=recorder,
+        )
+        summary["broker_only_count"] = broker_result.get("broker_only_count", 0)
+        summary["broker_only_order_ids"] = broker_result.get("broker_only_order_ids", [])
+        if backfill_broker_only:
+            summary["backfill_broker_inserted"] = broker_result.get("backfill_inserted", 0)
+            summary["backfill_broker_updated"] = broker_result.get("backfill_updated", 0)
+            summary["backfill_broker_skipped_incomplete"] = broker_result.get(
+                "backfill_skipped_incomplete", 0
+            )
+            summary["broker_only_remaining"] = broker_result.get(
+                "broker_only_remaining",
+                broker_result.get("broker_only_count", 0),
+            )
+
         evidence_payload = {
             "schema_version": KIS_EVIDENCE_SCHEMA_VERSION,
             "source": "kis_endpoint",
@@ -906,13 +1328,21 @@ def reconcile_open_orders(*, since_hours: int = 24, limit: int = 500) -> Dict[st
                 "updated_trade_records": updated,
                 "db_vs_ccnl_mismatch_count": still_missing_after_daily,
                 "order_id_coverage_rate": coverage,
+                "broker_only_count": broker_result.get("broker_only_count", 0),
+                "broker_only_order_ids": broker_result.get("broker_only_order_ids", []),
             },
-            "findings": [],
+            "findings": broker_result.get("findings") or [],
         }
         save_order_reconcile_evidence(
             evidence_payload,
             market=market,
             trade_date=end_ymd,
+        )
+        logger.info(
+            "broker-only detection: count=%s backfill=%s dry_run=%s",
+            broker_result.get("broker_only_count"),
+            backfill_broker_only,
+            dry_run,
         )
 
     return summary
@@ -923,12 +1353,27 @@ def main():
     parser.add_argument("--since-hours", type=int, default=24, help="리컨실 대상 조회 범위(시간)")
     parser.add_argument("--limit", type=int, default=500, help="최대 조회 건수")
     parser.add_argument("--backfill-only", action="store_true", help="orphan order_id backfill만 실행")
+    parser.add_argument(
+        "--backfill-broker-only",
+        action="store_true",
+        help="KIS에만 있는 executed 주문을 trade_records에 idempotent backfill",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="backfill 대상만 로그 (DB 변경 없음)",
+    )
     args = parser.parse_args()
 
-    if args.backfill_only:
+    if args.backfill_only and not args.backfill_broker_only:
         backfill_orphan_order_ids(since_hours=args.since_hours, limit=min(args.limit, 200))
     else:
-        reconcile_open_orders(since_hours=args.since_hours, limit=args.limit)
+        reconcile_open_orders(
+            since_hours=args.since_hours,
+            limit=args.limit,
+            backfill_broker_only=args.backfill_broker_only,
+            dry_run=args.dry_run,
+        )
 
 
 if __name__ == "__main__":
