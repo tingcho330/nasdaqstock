@@ -778,15 +778,18 @@ def capture_balance_snapshot(
             balance_path = None
 
         now = datetime.now(KST)
+        # Canonical US daily balance key = pipeline live trade_date only (one file).
         snap_date = trade_date
-        session_close_date = snap_date
+        # Optional KST-calendar alias for open pairing with next morning close summaries.
+        kst_alias_date: Optional[str] = None
         if is_us_market(MARKET) and snapshot_type == "open":
-            # Keep US open session pairing logic using KST clock date for pairing
             kst_today = now.date()
             nxt = kst_today + timedelta(days=1)
             for _ in range(5):
                 if is_market_open_day(nxt, MARKET):
-                    session_close_date = nxt.strftime("%Y%m%d")
+                    cand = nxt.strftime("%Y%m%d")
+                    if cand != trade_date:
+                        kst_alias_date = cand
                     break
                 nxt += timedelta(days=1)
 
@@ -797,7 +800,10 @@ def capture_balance_snapshot(
                 with open(reconcile_path, "r", encoding="utf-8") as f:
                     recon = json.load(f) or {}
                 broker_only_count = int(
-                    (recon.get("db_reconcile") or {}).get("broker_only_count") or 0
+                    (recon.get("db_reconcile") or {}).get("broker_only_order_count")
+                    or (recon.get("db_reconcile") or {}).get("broker_only_count")
+                    or recon.get("broker_only_order_count")
+                    or 0
                 )
                 for finding in recon.get("findings") or []:
                     if finding.get("title") == "BROKER_TRADE_MISSING_IN_DB":
@@ -809,7 +815,7 @@ def capture_balance_snapshot(
         snapshot = {
             "date": snap_date,
             "trade_date": trade_date,
-            "session_close_date": session_close_date,
+            "session_close_date": trade_date,
             "timestamp": now.isoformat(),
             "snapshot_ts_kst": snapshot_ts,
             "generated_at_kst": now.isoformat(),
@@ -817,6 +823,8 @@ def capture_balance_snapshot(
             "source": source,
             "source_snapshot_file": source_snapshot_file,
             "valid": True,
+            "legacy_alias": False,
+            "canonical": True,
             "position_reconciled": position_reconciled,
             "broker_only_order_count": broker_only_count,
             "db_vs_kis_position_match": position_reconciled,
@@ -830,10 +838,22 @@ def capture_balance_snapshot(
             "balance_file": str(balance_path) if balance_path else None,
         }
 
-        save_dates = {snap_date}
-        if is_us_market(MARKET) and snapshot_type == "open" and session_close_date != snap_date:
-            save_dates.add(session_close_date)
-        for save_date in save_dates:
+        # Canonical file: balance_{open|close}_{trade_date}.json only
+        writes: List[Tuple[str, Dict]] = [(snap_date, {**snapshot, "file_date": snap_date})]
+        if kst_alias_date:
+            writes.append((
+                kst_alias_date,
+                {
+                    **snapshot,
+                    "file_date": kst_alias_date,
+                    "legacy_alias": True,
+                    "canonical": False,
+                    "alias_of_trade_date": trade_date,
+                    "session_close_date": kst_alias_date,
+                },
+            ))
+
+        for save_date, snap_copy in writes:
             filename = f"balance_{snapshot_type}_{save_date}.json"
             filepath = BALANCE_STORAGE_PATH / filename
             if filepath.exists() and not rebuild:
@@ -842,17 +862,17 @@ def capture_balance_snapshot(
                     filepath,
                 )
                 continue
-            snap_copy = {**snapshot, "file_date": save_date}
             BALANCE_STORAGE_PATH.mkdir(parents=True, exist_ok=True)
             tmp = filepath.with_suffix(".tmp")
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(snap_copy, f, ensure_ascii=False, indent=2)
             tmp.replace(filepath)
             logger.info(
-                "잔액 스냅샷 저장: %s source=%s trade_date=%s",
+                "잔액 스냅샷 저장: %s source=%s trade_date=%s alias=%s",
                 filepath,
                 source,
                 trade_date,
+                snap_copy.get("legacy_alias"),
             )
         return snapshot
 

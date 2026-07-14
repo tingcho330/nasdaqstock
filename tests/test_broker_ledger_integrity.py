@@ -130,17 +130,18 @@ def test_backfill_broker_only_creates_sell_idempotent(tmp_output, monkeypatch, t
 
     db_path = tmp_path / "trading_data.db"
     rec = DataRecorder(str(db_path))
+    # DB still has order-price style BUY (1695) — fill must come from CCNL
     buy = TradeRecord(
         timestamp=datetime(2026, 7, 8, 23, 0, tzinfo=KST),
         ticker="SNDK",
         action="BUY",
         quantity=1,
-        price=1692.9724,
-        amount=1692.9724,
+        price=1695.0,
+        amount=1695.0,
         commission=0.0,
         tax=0.0,
-        total_cost=1692.9724,
-        net_amount=1692.9724,
+        total_cost=1695.0,
+        net_amount=1695.0,
         profit_loss=0.0,
         holding_period_days=0,
         order_status="executed",
@@ -150,6 +151,21 @@ def test_backfill_broker_only_creates_sell_idempotent(tmp_output, monkeypatch, t
     )
     rec.upsert_trade_record_by_order_id(buy)
 
+    buy_norm = _normalize_overseas_order_row({
+        "odno": "0030975669",
+        "ord_dt": "20260708",
+        "ord_tmd": "230000",
+        "pdno": "SNDK",
+        "sll_buy_dvsn_cd": "02",
+        "ft_ord_qty": "1",
+        "ft_ord_unpr3": "1695",
+        "ft_ccld_qty": "1",
+        "ft_ccld_unpr3": "1692.9724",
+        "ft_ccld_amt3": "1692.9724",
+        "prcs_stat_name": "완료",
+        "ovrs_excg_cd": "NASD",
+        "mdia_dvsn_name": "OpenAPI",
+    })
     sell_norm = _normalize_overseas_order_row({
         "odno": "0031276871",
         "ord_dt": "20260709",
@@ -167,42 +183,87 @@ def test_backfill_broker_only_creates_sell_idempotent(tmp_output, monkeypatch, t
         "tr_crcy_cd": "USD",
         "mdia_dvsn_name": "OpenAPI",
     })
-    # ensure executed status
     assert sell_norm["status"] == "executed"
+    kis_all = {"0030975669": buy_norm, "0031276871": sell_norm}
 
-    r1 = backfill_broker_only_orders([sell_norm], recorder=rec, dry_run=False)
+    recovered = "2026-07-14T13:24:52+09:00"
+    r1 = backfill_broker_only_orders(
+        [sell_norm],
+        recorder=rec,
+        dry_run=False,
+        all_kis_orders=kis_all,
+        recovered_at_kst=recovered,
+    )
     assert r1["backfill_inserted"] == 1
     assert "0031276871" in r1["backfill_order_ids"]
 
     rows = rec.get_trade_records(ticker="SNDK")
     sells = [t for t in rows if t.action.upper() == "SELL"]
     assert len(sells) == 1
-    ctx = json.loads(sells[0].structured_context or "{}")
+    sell = sells[0]
+    assert abs(float(sell.price) - 1833.9032) < 1e-6
+    assert sell.timestamp.isoformat().startswith("2026-07-09T23:31:56")
+    ctx = json.loads(sell.structured_context or "{}")
     assert ctx.get("broker_only") is True
     assert ctx.get("net_pnl_complete") is False
+    assert ctx.get("gross_pnl_complete") is True
+    assert ctx.get("recovered_at_kst") == recovered
+    assert ctx.get("effective_trade_timestamp", "").startswith("2026-07-09T23:31:56")
     assert abs(float(ctx.get("gross_pnl")) - 140.9308) < 0.0001
+    assert abs(float(sell.profit_loss) - 140.9308) < 0.0001
+    assert ctx.get("price_column_semantics") == "executed_price"
+    assert abs(float(ctx.get("order_price")) - 1827) < 1e-6
+
+    buys = [t for t in rows if t.action.upper() == "BUY"]
+    assert abs(float(buys[0].price) - 1692.9724) < 1e-6
 
     # re-run → no duplicate
-    r2 = backfill_broker_only_orders([sell_norm], recorder=rec, dry_run=False)
+    r2 = backfill_broker_only_orders(
+        [sell_norm], recorder=rec, dry_run=False, all_kis_orders=kis_all,
+        recovered_at_kst=recovered,
+    )
     assert r2["backfill_inserted"] == 0
     assert r2["backfill_updated"] == 1
     sells2 = [t for t in rec.get_trade_records(ticker="SNDK") if t.action.upper() == "SELL"]
     assert len(sells2) == 1
+    # recovered_at preserved on correction
+    ctx2 = json.loads(sells2[0].structured_context or "{}")
+    assert ctx2.get("recovered_at_kst") == recovered
 
-    remaining, _ = detect_broker_only_orders(
-        {"0030975669": {"order_id": "0030975669"}, "0031276871": sell_norm},
-        recorder=rec,
-    )
+    remaining, _ = detect_broker_only_orders(kis_all, recorder=rec)
     assert remaining == []
 
-    # position flat: 1 buy + 1 sell
-    buys = sum(t.quantity for t in rec.get_trade_records(ticker="SNDK") if t.action.upper() == "BUY")
+    buys_qty = sum(t.quantity for t in rec.get_trade_records(ticker="SNDK") if t.action.upper() == "BUY")
     sells_qty = sum(
         (t.executed_qty or t.quantity)
         for t in rec.get_trade_records(ticker="SNDK")
         if t.action.upper() == "SELL"
     )
-    assert buys - sells_qty == 0
+    assert buys_qty - sells_qty == 0
+
+
+def test_backfill_incomplete_missing_order_time(tmp_output, monkeypatch, tmp_path):
+    from order_reconciler import backfill_broker_only_orders
+    from recorder import DataRecorder
+    from decimal import Decimal
+
+    rec = DataRecorder(str(tmp_path / "t2.db"))
+    incomplete = {
+        "order_id": "009998",
+        "order_date": "20260709",
+        "order_time": "",
+        "ticker": "SNDK",
+        "side": "sell",
+        "status": "executed",
+        "quantity": 1,
+        "executed_qty": 1,
+        "executed_price": Decimal("1833.9032"),
+    }
+    before = len(rec.get_known_order_ids())
+    r = backfill_broker_only_orders([incomplete], recorder=rec)
+    assert r["backfill_skipped_incomplete"] == 1
+    assert r["incomplete_findings"][0]["details"]["reason"] == "missing_order_time"
+    assert len(rec.get_known_order_ids()) == before
 
 
 def test_backfill_incomplete_missing_price(tmp_output, monkeypatch, tmp_path):
@@ -213,6 +274,7 @@ def test_backfill_incomplete_missing_price(tmp_output, monkeypatch, tmp_path):
     incomplete = {
         "order_id": "009999",
         "order_date": "20260709",
+        "order_time": "233156",
         "ticker": "SNDK",
         "side": "sell",
         "status": "executed",
@@ -455,8 +517,219 @@ def test_ccnl_normalize_preserves_decimal_fields():
     assert isinstance(o["executed_price"], Decimal)
 
 
+def test_migrate_sndk_backfill_row_idempotent(tmp_path):
+    """Existing wrong recovery-timestamp row → real fill time + fill-to-fill gross."""
+    from order_reconciler import migrate_sndk_backfill_row, SNDK_FIX_EVIDENCE
+    from recorder import DataRecorder, TradeRecord
+
+    rec = DataRecorder(str(tmp_path / "sndk_fix.db"))
+    recovered = SNDK_FIX_EVIDENCE["recovered_at_kst"]
+    buy = TradeRecord(
+        timestamp=datetime(2026, 7, 8, 23, 0, tzinfo=KST),
+        ticker="SNDK",
+        action="BUY",
+        quantity=1,
+        price=1695.0,  # order price (wrong semantics)
+        amount=1695.0,
+        commission=0.0,
+        tax=0.0,
+        total_cost=1695.0,
+        net_amount=1695.0,
+        profit_loss=0.0,
+        holding_period_days=0,
+        order_status="executed",
+        order_id="0030975669",
+        requested_qty=1,
+        executed_qty=1,
+    )
+    sell = TradeRecord(
+        timestamp=datetime(2026, 7, 14, 13, 24, 52, tzinfo=KST),  # recovery wall clock
+        ticker="SNDK",
+        action="SELL",
+        quantity=1,
+        price=1833.9032,
+        amount=1833.9032,
+        commission=0.0,
+        tax=0.0,
+        total_cost=1833.9032,
+        net_amount=1833.9032,
+        profit_loss=138.9032,  # order-price based gross
+        holding_period_days=0,
+        order_status="executed",
+        order_id="0031276871",
+        requested_qty=1,
+        executed_qty=1,
+        reason_code="BROKER_ONLY_BACKFILL",
+        structured_context=json.dumps({
+            "broker_only": True,
+            "recovered_at_kst": recovered,
+            "gross_pnl": 138.9032,
+            "net_pnl_complete": False,
+        }),
+    )
+    assert rec.upsert_trade_record_by_order_id(buy)
+    assert rec.upsert_trade_record_by_order_id(sell)
+
+    r1 = migrate_sndk_backfill_row(recorder=rec, dry_run=False)
+    assert "0031276871" in r1["repaired_order_ids"]
+    assert r1["sell_row_count"] == 1
+
+    sells = [t for t in rec.get_trade_records(ticker="SNDK") if t.action.upper() == "SELL"]
+    assert len(sells) == 1
+    s = sells[0]
+    assert abs(float(s.price) - 1833.9032) < 1e-6
+    assert abs(float(s.profit_loss) - 140.9308) < 1e-4
+    assert s.timestamp.isoformat().startswith("2026-07-09T23:31:56")
+    ctx = json.loads(s.structured_context or "{}")
+    assert ctx["recovered_at_kst"] == recovered
+    assert ctx["effective_trade_timestamp"].startswith("2026-07-09T23:31:56")
+    assert abs(float(ctx["gross_pnl"]) - 140.9308) < 1e-4
+    assert ctx["gross_pnl_complete"] is True
+    assert ctx["net_pnl_complete"] is False
+
+    buys = [t for t in rec.get_trade_records(ticker="SNDK") if t.action.upper() == "BUY"]
+    assert abs(float(buys[0].price) - 1692.9724) < 1e-6
+    bctx = json.loads(buys[0].structured_context or "{}")
+    assert bctx.get("price_column_semantics") == "executed_price"
+    assert abs(float(bctx.get("order_price")) - 1695.0) < 1e-6
+
+    r2 = migrate_sndk_backfill_row(recorder=rec, dry_run=False)
+    assert r2.get("already_correct") is True
+    assert len([t for t in rec.get_trade_records(ticker="SNDK") if t.order_id == "0031276871"]) == 1
+
+
+def test_performance_review_buckets_by_effective_trade_timestamp(tmp_path):
+    from performance_review import load_trade_rows
+    from recorder import DataRecorder, TradeRecord
+    from order_reconciler import migrate_sndk_backfill_row, SNDK_FIX_EVIDENCE
+
+    db = tmp_path / "rev.db"
+    rec = DataRecorder(str(db))
+    recovered = SNDK_FIX_EVIDENCE["recovered_at_kst"]
+    buy = TradeRecord(
+        timestamp=datetime(2026, 7, 8, 23, 0, tzinfo=KST),
+        ticker="SNDK", action="BUY", quantity=1, price=1695.0,
+        amount=1695.0, commission=0, tax=0, total_cost=1695.0, net_amount=1695.0,
+        profit_loss=0, holding_period_days=0, order_status="executed",
+        order_id="0030975669", requested_qty=1, executed_qty=1,
+    )
+    sell = TradeRecord(
+        timestamp=datetime(2026, 7, 14, 13, 24, 52, tzinfo=KST),
+        ticker="SNDK", action="SELL", quantity=1, price=1833.9032,
+        amount=1833.9032, commission=0, tax=0, total_cost=1833.9032, net_amount=1833.9032,
+        profit_loss=138.9032, holding_period_days=0, order_status="executed",
+        order_id="0031276871", requested_qty=1, executed_qty=1,
+        structured_context=json.dumps({
+            "broker_only": True,
+            "recovered_at_kst": recovered,
+            "order_date": "20260709",
+            "order_time": "233156",
+        }),
+    )
+    rec.upsert_trade_record_by_order_id(buy)
+    rec.upsert_trade_record_by_order_id(sell)
+    migrate_sndk_backfill_row(recorder=rec)
+
+    rows_09 = load_trade_rows(db, "20260709", "20260709")
+    sell_09 = [r for r in rows_09 if r.get("order_id") == "0031276871"]
+    assert len(sell_09) == 1
+    assert abs(float(sell_09[0]["profit_loss"]) - 140.9308) < 1e-4
+
+    rows_14 = load_trade_rows(db, "20260714", "20260714")
+    sell_14 = [r for r in rows_14 if r.get("order_id") == "0031276871"]
+    assert sell_14 == []
+
+
+def test_reconcile_evidence_stable_schema_zero_broker_only(tmp_output, tmp_path, monkeypatch):
+    from order_reconciler import detect_and_optionally_backfill_broker_only
+    from recorder import DataRecorder
+
+    rec = DataRecorder(str(tmp_path / "empty.db"))
+    result = detect_and_optionally_backfill_broker_only(
+        {}, backfill=False, dry_run=False, recorder=rec, repair_existing=False,
+    )
+    assert result["broker_only_order_count"] == 0
+    assert result["broker_only_orders"] == []
+    assert result["broker_only_backfilled_count"] == 0
+    assert result["broker_only_incomplete_count"] == 0
+
+
+def test_daily_balance_excludes_legacy_alias(tmp_output, monkeypatch):
+    from performance_review import collect_artifacts
+
+    bal_dir = tmp_output / "daily_balances"
+    bal_dir.mkdir(parents=True)
+    (bal_dir / "balance_open_20260714.json").write_text(json.dumps({
+        "trade_date": "20260714",
+        "date": "20260714",
+        "type": "open",
+        "canonical": True,
+        "legacy_alias": False,
+        "total_balance": 10000,
+        "valid": True,
+    }), encoding="utf-8")
+    (bal_dir / "balance_open_20260715.json").write_text(json.dumps({
+        "trade_date": "20260714",
+        "date": "20260715",
+        "type": "open",
+        "canonical": False,
+        "legacy_alias": True,
+        "alias_of_trade_date": "20260714",
+        "total_balance": 10000,
+        "valid": True,
+    }), encoding="utf-8")
+
+    art = collect_artifacts(
+        "SP500", "20260714", "20260714", "pm", tmp_output, include_logs=False,
+    )
+    names = [p.name for p in art.daily_balance_paths]
+    assert "balance_open_20260714.json" in names
+    assert "balance_open_20260715.json" not in names
+
+
+def test_broker_trade_timestamp_kst():
+    from order_reconciler import broker_trade_timestamp_kst
+    dt = broker_trade_timestamp_kst("20260709", "233156")
+    assert dt is not None
+    assert dt.isoformat() == "2026-07-09T23:31:56+09:00"
+    assert broker_trade_timestamp_kst("20260709", "") is None
+    assert broker_trade_timestamp_kst("", "233156") is None
+
+
+def test_gross_pnl_not_invented_without_buy_fill(tmp_path):
+    from order_reconciler import backfill_broker_only_orders, _normalize_overseas_order_row
+    from recorder import DataRecorder
+
+    rec = DataRecorder(str(tmp_path / "nobuy.db"))
+    sell_norm = _normalize_overseas_order_row({
+        "odno": "0031276871",
+        "ord_dt": "20260709",
+        "ord_tmd": "233156",
+        "pdno": "SNDK",
+        "sll_buy_dvsn_cd": "01",
+        "ft_ord_qty": "1",
+        "ft_ord_unpr3": "1827",
+        "ft_ccld_qty": "1",
+        "ft_ccld_unpr3": "1833.9032",
+        "ft_ccld_amt3": "1833.9032",
+        "prcs_stat_name": "완료",
+        "ovrs_excg_cd": "NASD",
+        "mdia_dvsn_name": "OpenAPI",
+    })
+    r = backfill_broker_only_orders(
+        [sell_norm], recorder=rec, dry_run=False, all_kis_orders={"0031276871": sell_norm},
+    )
+    assert r["backfill_inserted"] == 1
+    sell = [t for t in rec.get_trade_records(ticker="SNDK") if t.action.upper() == "SELL"][0]
+    ctx = json.loads(sell.structured_context or "{}")
+    assert ctx["gross_pnl_complete"] is False
+    assert ctx.get("gross_pnl") is None
+    assert float(sell.profit_loss) == 0.0
+    assert ctx["net_pnl_complete"] is False
+
+
 def test_performance_incomplete_when_broker_only(tmp_output, monkeypatch):
-    from performance_review import _summarize_trades, _apply_broker_integrity_findings, ReviewArtifacts, ReviewFinding
+    from performance_review import _summarize_trades, _apply_broker_integrity_findings, ReviewArtifacts
 
     rows = [{
         "action": "SELL",

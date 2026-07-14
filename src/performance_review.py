@@ -551,11 +551,48 @@ def _glob_for_date(prefix: str, date: str, output_dir: Path) -> Optional[Path]:
     return p if p.exists() else None
 
 
+def effective_trade_timestamp_iso(row: Dict[str, Any]) -> str:
+    """Prefer broker order_date+time / structured effective_trade_timestamp over recovery ts."""
+    ctx: Dict[str, Any] = {}
+    raw = row.get("structured_context") or ""
+    if isinstance(raw, dict):
+        ctx = raw
+    elif isinstance(raw, str) and raw.strip().startswith("{"):
+        try:
+            ctx = json.loads(raw)
+        except Exception:
+            ctx = {}
+
+    eff = str(ctx.get("effective_trade_timestamp") or "").strip()
+    if eff:
+        return eff
+
+    od = str(ctx.get("order_date") or "").strip()
+    ot = str(ctx.get("order_time") or "").strip()
+    if od and ot:
+        try:
+            from order_reconciler import broker_trade_timestamp_kst
+            dt = broker_trade_timestamp_kst(od, ot)
+            if dt is not None:
+                return dt.isoformat()
+        except Exception:
+            pass
+
+    return str(row.get("timestamp") or "")
+
+
 def load_trade_rows(db_path: Path, start: str, end: str) -> List[Dict[str, Any]]:
+    """Load trades whose effective_trade_timestamp falls in [start, end] (inclusive dates).
+
+    Recovery/backfill wall-clock timestamps must not place rows into the wrong day.
+    """
     if not db_path.exists():
         return []
-    start_dt = _parse_date(start).strftime("%Y-%m-%d")
-    end_dt = (_parse_date(end) + timedelta(days=1)).strftime("%Y-%m-%d")
+    start_d = _parse_date(start).date()
+    end_d = _parse_date(end).date()
+    # Broad DB fetch: recovery wall-clock may land days after the true fill date
+    sql_start = (start_d - timedelta(days=45)).strftime("%Y-%m-%d")
+    sql_end = (end_d + timedelta(days=45)).strftime("%Y-%m-%d")
     rows: List[Dict[str, Any]] = []
     try:
         with sqlite3.connect(db_path) as conn:
@@ -576,11 +613,32 @@ def load_trade_rows(db_path: Path, start: str, end: str) -> List[Dict[str, Any]]
                 f"SELECT {', '.join(select_cols)} FROM trade_records "
                 "WHERE timestamp >= ? AND timestamp < ? ORDER BY timestamp"
             )
-            for row in conn.execute(q, (start_dt, end_dt)):
+            for row in conn.execute(q, (sql_start, sql_end)):
                 rows.append(dict(row))
     except Exception as e:
         logger.warning("DB trade_records 로드 실패: %s", e)
-    return rows
+        return []
+
+    filtered: List[Dict[str, Any]] = []
+    for row in rows:
+        eff = effective_trade_timestamp_iso(row)
+        row = {**row, "effective_trade_timestamp": eff}
+        try:
+            dt = datetime.fromisoformat(eff.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=KST)
+            day = dt.astimezone(KST).date()
+        except Exception:
+            # fallback: raw timestamp date prefix
+            ts = str(row.get("timestamp") or "")
+            try:
+                day = datetime.fromisoformat(ts.replace("Z", "+00:00")).date()
+            except Exception:
+                continue
+        if start_d <= day <= end_d:
+            filtered.append(row)
+    filtered.sort(key=lambda r: str(r.get("effective_trade_timestamp") or r.get("timestamp") or ""))
+    return filtered
 
 
 def _load_json(path: Optional[Path]) -> Any:
@@ -1414,6 +1472,19 @@ def collect_artifacts(
     summary_path = _glob_for_date("summary", end_date, output_dir) or _glob_latest("summary_*.json", output_dir)
 
     daily_balance_paths = sorted(output_dir.glob("daily_balances/balance_*_*.json"))
+    # Exclude KST legacy aliases so the same trade_date is not double-counted
+    canonical_daily: List[Path] = []
+    for p in daily_balance_paths:
+        try:
+            payload = _load_json(p) or {}
+            if payload.get("legacy_alias") is True:
+                continue
+            if payload.get("canonical") is False:
+                continue
+            canonical_daily.append(p)
+        except Exception:
+            canonical_daily.append(p)
+    daily_balance_paths = canonical_daily
     account_snapshot_paths = sorted(output_dir.glob("account_snapshot_*.json"))
     order_reconcile_paths = sorted(output_dir.glob("order_reconcile_*.json"))
     pipeline_state_path = output_dir / "pipeline_state.json"
@@ -2530,6 +2601,7 @@ def _summarize_trades(trade_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     wins = [r for r in sells if _safe_float(r.get("profit_loss")) > 0]
     gross_pnl = 0.0
     net_complete = True
+    gross_complete = True
     broker_only_unresolved = 0
     for r in sells:
         ctx = {}
@@ -2548,11 +2620,15 @@ def _summarize_trades(trade_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
                 pass
         else:
             gross_pnl += _safe_float(r.get("profit_loss"))
+        if ctx.get("gross_pnl_complete") is False:
+            gross_complete = False
         if ctx.get("broker_only") and not ctx.get("net_pnl_complete", True):
             net_complete = False
             broker_only_unresolved += 1
         if ctx.get("gross_pnl_basis") and not ctx.get("net_pnl_complete", False):
             net_complete = False
+        if ctx.get("broker_only") and ctx.get("gross_pnl_complete") is False:
+            broker_only_unresolved += 1
 
     return {
         "trade_count": len(trade_rows),
@@ -2560,6 +2636,7 @@ def _summarize_trades(trade_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "win_rate": round(len(wins) / len(sells), 4) if sells else 0.0,
         "net_pnl": round(sum(_safe_float(r.get("profit_loss")) for r in sells), 2),
         "gross_pnl": round(gross_pnl, 4),
+        "gross_pnl_complete": gross_complete,
         "net_pnl_complete": net_complete,
         "broker_only_incomplete_count": broker_only_unresolved,
     }
@@ -2603,15 +2680,19 @@ def _apply_broker_integrity_findings(
 
     if trade_perf.get("broker_only_incomplete_count") or (
         trade_perf.get("net_pnl_complete") is False
-    ):
+    ) or (trade_perf.get("gross_pnl_complete") is False):
         status = "PERFORMANCE_DATA_INCOMPLETE"
         if not any(f.title == "PERFORMANCE_DATA_INCOMPLETE" for f in findings):
             findings.append(make_finding(
                 "PERFORMANCE_DATA_INCOMPLETE",
                 "ERROR",
                 "performance",
-                f"gross_pnl={trade_perf.get('gross_pnl')} net_complete={trade_perf.get('net_pnl_complete')}",
-                "수수료·세금 미확보 또는 broker-only 미복구로 최종 성과 확정 불가",
+                (
+                    f"gross_pnl={trade_perf.get('gross_pnl')} "
+                    f"gross_complete={trade_perf.get('gross_pnl_complete')} "
+                    f"net_complete={trade_perf.get('net_pnl_complete')}"
+                ),
+                "수수료·세금 미확보 또는 broker fill gross 미완성으로 최종 성과 확정 불가",
                 "broker-only backfill 및 수수료 원장 확보 후 재리뷰",
             ))
 
