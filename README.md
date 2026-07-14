@@ -268,9 +268,11 @@ Git에는 `output/.gitkeep`만 추적합니다. `cleanup_output.py`는 `performa
 | `order_reconciler` (06:10 등) | DB open ↔ KIS — **US:** `inquire-nccs` → `inquire-ccnl` / **KR:** `inquire-orders` → `inquire-daily-ccld` → **`executed`** 갱신 |
 | broker-only 검출 | CCNL unique `order_id` − DB `order_id` → `BROKER_TRADE_MISSING_IN_DB` (기본 **DB 미수정**) |
 | `--backfill-broker-only` | executed + qty/price/date 충족분만 idempotent upsert. 수수료·세금·전략타입 **추정 금지**. `gross_pnl`만 `structured_context` |
+| `--repair-ledger-from-ccnl` | 기존 DB 행을 KIS CCNL 체결 사실로 **UPDATE-only** 보정 (FIFO gross). 기본 **dry-run**; `--apply-repair` 필요. 새 DB/INSERT 금지 |
 | orphan 방지 | `pending`이면서 `order_id` 없으면 INSERT 생략 · 동일 `order_id` 재실행 시 중복 INSERT 없음 |
 
-리컨실 시 open 주문의 **체결가·`profit_loss`는 자동 갱신하지 않음**. broker-only backfill은 KIS CCNL 체결가·gross P&L만 기록 (`net_pnl_complete=false`).
+리컨실 시 open 주문의 **체결가·`profit_loss`는 자동 갱신하지 않음**. broker-only backfill은 KIS CCNL 체결가·gross P&L만 기록 (`net_pnl_complete=false`).  
+운영 DB 자동 migration은 **하지 않음** (import/컨테이너 기동/일반 reconciler 경로 금지). 원장 보정은 아래 CLI만 사용.
 
 ```bash
 # 수동 리컨실 (Docker)
@@ -281,6 +283,22 @@ docker compose exec integrated_manager python /app/src/order_reconciler.py \
   --since-hours 240 --backfill-broker-only --dry-run
 docker compose exec integrated_manager python /app/src/order_reconciler.py \
   --since-hours 240 --backfill-broker-only
+
+# CCNL ledger repair (기본 dry-run — DB mtime/checksum 불변)
+docker compose exec integrated_manager python /app/src/order_reconciler.py \
+  --repair-ledger-from-ccnl \
+  --ticker INTC \
+  --from 20260601 \
+  --to 20260714 \
+  --dry-run
+
+# 실제 적용 (backup 생성 + transaction)
+docker compose exec integrated_manager python /app/src/order_reconciler.py \
+  --repair-ledger-from-ccnl \
+  --ticker INTC \
+  --from 20260601 \
+  --to 20260714 \
+  --apply-repair
 
 # daily balance 강제 재생성
 docker compose exec integrated_manager python /app/run_integrated_manager.py \

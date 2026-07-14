@@ -99,6 +99,8 @@ STANDARD_FINDINGS = {
     "SELL_DB_PERSIST_FAILED",
     "BUY_DB_PERSIST_FAILED",
     "PERFORMANCE_DATA_INCOMPLETE",
+    "GROSS_COMPLETE_NET_INCOMPLETE",
+    "BACKFILLED_SELL_SELLABLE_EVIDENCE_UNAVAILABLE",
     "ARTIFACT_DATE_STALE",
     "LATEST_ARTIFACT_DATE_MISMATCH",
     "ARTIFACT_EMPTY_LIST",
@@ -160,9 +162,10 @@ def normalize_finding_category(title: str, category: Optional[str] = None) -> st
         "SELL_DB_PERSIST_FAILED",
         "BUY_DB_PERSIST_FAILED",
         "PERFORMANCE_DATA_INCOMPLETE",
+        "GROSS_COMPLETE_NET_INCOMPLETE",
     ):
         return "DATA_INTEGRITY"
-    if t == "LEGACY_SELL_WITHOUT_SELLABLE_EVIDENCE":
+    if t in ("LEGACY_SELL_WITHOUT_SELLABLE_EVIDENCE", "BACKFILLED_SELL_SELLABLE_EVIDENCE_UNAVAILABLE"):
         return "RISK"
     return "OPERATIONS"
 
@@ -566,6 +569,23 @@ def effective_trade_timestamp_iso(row: Dict[str, Any]) -> str:
     eff = str(ctx.get("effective_trade_timestamp") or "").strip()
     if eff:
         return eff
+
+    # Prefer dmst_ord_dt + thco/ord_tmd when present in context
+    try:
+        from ledger_repair import effective_trade_timestamp_from_ccnl
+        dt, _ = effective_trade_timestamp_from_ccnl({
+            "dmst_ord_dt": ctx.get("dmst_ord_dt") or ctx.get("domestic_order_date"),
+            "ord_dt": ctx.get("ord_dt") or ctx.get("order_date"),
+            "thco_ord_tmd": ctx.get("thco_ord_tmd"),
+            "ord_tmd": ctx.get("ord_tmd") or ctx.get("order_time"),
+            "order_date": ctx.get("order_date"),
+            "order_time": ctx.get("order_time"),
+            "domestic_order_date": ctx.get("domestic_order_date"),
+        })
+        if dt is not None:
+            return dt.isoformat()
+    except Exception:
+        pass
 
     od = str(ctx.get("order_date") or "").strip()
     ot = str(ctx.get("order_time") or "").strip()
@@ -2270,6 +2290,20 @@ def _parse_structured_context(row: Dict[str, Any]) -> Dict[str, Any]:
     return {}
 
 
+def _is_broker_only_backfilled_sell(ctx: Dict[str, Any], *, reason_code: str = "") -> bool:
+    if str(reason_code or "").strip() == "BROKER_ONLY_BACKFILL":
+        return True
+    if ctx.get("broker_only") is True and str(ctx.get("backfilled_from") or "") == "kis_ccnl":
+        return True
+    if (
+        str(ctx.get("source") or "") == "order_reconciler"
+        and str(ctx.get("backfilled_from") or "") == "kis_ccnl"
+        and ctx.get("broker_only") is True
+    ):
+        return True
+    return False
+
+
 def _sellable_evidence_introduced_at(cfg: Dict[str, Any]) -> datetime:
     raw = str(
         cfg.get("sellable_qty_evidence_introduced_at")
@@ -2473,7 +2507,28 @@ def review_orders(
                 if order_dt is None:
                     continue
                 introduced_at = _sellable_evidence_introduced_at(cfg)
-                if order_dt < introduced_at:
+                if _is_broker_only_backfilled_sell(
+                    row_ctx,
+                    reason_code=str(row_ctx.get("reason_code") or row.get("reason_code") or ""),
+                ):
+                    review.findings.append(make_finding(
+                        "BACKFILLED_SELL_SELLABLE_EVIDENCE_UNAVAILABLE",
+                        "INFO",
+                        "order",
+                        _sell_order_finding_evidence(
+                            ticker=ticker,
+                            order_id=order_id,
+                            timestamp=order_ts,
+                            order_status=db_status,
+                            reason="backfilled_sell_without_sellable_evidence",
+                            aux=aux,
+                        ),
+                        "broker-only backfill SELL은 live sellable evidence가 없을 수 있음",
+                        "일반 live SELL sellable 누락과 분리 · gross completeness 영향 없음",
+                        category="RISK",
+                        **ev_kw,
+                    ))
+                elif order_dt < introduced_at:
                     review.findings.append(make_finding(
                         "LEGACY_SELL_WITHOUT_SELLABLE_EVIDENCE",
                         "INFO",
@@ -2599,45 +2654,92 @@ def build_kis_endpoint_review(
 def _summarize_trades(trade_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     sells = [r for r in trade_rows if str(r.get("action", "")).upper() == "SELL"]
     wins = [r for r in sells if _safe_float(r.get("profit_loss")) > 0]
-    gross_pnl = 0.0
+    known_gross = 0.0
     net_complete = True
     gross_complete = True
     broker_only_unresolved = 0
+    gross_complete_n = 0
+    gross_incomplete_n = 0
+    net_complete_n = 0
+    net_incomplete_n = 0
+    gross_incomplete_orders: List[str] = []
+    net_incomplete_orders: List[str] = []
+
     for r in sells:
-        ctx = {}
-        raw = r.get("structured_context") or ""
-        if isinstance(raw, str) and raw.strip().startswith("{"):
+        ctx = _parse_structured_context(r)
+        oid = str(r.get("order_id") or "")
+        g_complete = ctx.get("gross_pnl_complete")
+        # Missing flag treated as complete only when we have a known gross_pnl/profit
+        if g_complete is False:
+            gross_complete = False
+            gross_incomplete_n += 1
+            if oid:
+                gross_incomplete_orders.append(oid)
+        else:
+            # treat as complete when flag True or absent with usable pnl
+            if g_complete is True or ctx.get("gross_pnl") is not None or _safe_float(r.get("profit_loss")) != 0:
+                gross_complete_n += 1
+            elif g_complete is None and ctx.get("gross_pnl") is None and _safe_float(r.get("profit_loss")) == 0:
+                # ambiguous — if explicitly incomplete reason, count incomplete
+                if ctx.get("incomplete_reason"):
+                    gross_complete = False
+                    gross_incomplete_n += 1
+                    if oid:
+                        gross_incomplete_orders.append(oid)
+                else:
+                    gross_complete_n += 1
+            else:
+                gross_complete_n += 1
+
+        # known gross: never treat profit_loss=0 + gross_pnl_complete=false as real 0
+        if g_complete is False:
+            pass
+        elif ctx.get("gross_pnl") is not None:
             try:
-                ctx = json.loads(raw)
-            except Exception:
-                ctx = {}
-        elif isinstance(raw, dict):
-            ctx = raw
-        if ctx.get("gross_pnl") is not None:
-            try:
-                gross_pnl += float(ctx.get("gross_pnl"))
+                known_gross += float(ctx.get("gross_pnl"))
             except Exception:
                 pass
         else:
-            gross_pnl += _safe_float(r.get("profit_loss"))
-        if ctx.get("gross_pnl_complete") is False:
-            gross_complete = False
-        if ctx.get("broker_only") and not ctx.get("net_pnl_complete", True):
+            known_gross += _safe_float(r.get("profit_loss"))
+
+        n_complete = ctx.get("net_pnl_complete")
+        if n_complete is True:
+            net_complete_n += 1
+        else:
             net_complete = False
+            net_incomplete_n += 1
+            if oid:
+                net_incomplete_orders.append(oid)
+
+        if ctx.get("broker_only") and not ctx.get("net_pnl_complete", True):
             broker_only_unresolved += 1
         if ctx.get("gross_pnl_basis") and not ctx.get("net_pnl_complete", False):
             net_complete = False
         if ctx.get("broker_only") and ctx.get("gross_pnl_complete") is False:
             broker_only_unresolved += 1
 
+    if sells and gross_incomplete_n == 0:
+        gross_complete = True
+    if not sells:
+        gross_complete = True
+        net_complete = True
+
     return {
         "trade_count": len(trade_rows),
         "sell_count": len(sells),
+        "sell_trade_count": len(sells),
         "win_rate": round(len(wins) / len(sells), 4) if sells else 0.0,
         "net_pnl": round(sum(_safe_float(r.get("profit_loss")) for r in sells), 2),
-        "gross_pnl": round(gross_pnl, 4),
+        "gross_pnl": round(known_gross, 4),
+        "known_gross_pnl": round(known_gross, 4),
         "gross_pnl_complete": gross_complete,
         "net_pnl_complete": net_complete,
+        "gross_complete_sell_count": gross_complete_n,
+        "gross_incomplete_sell_count": gross_incomplete_n,
+        "net_complete_sell_count": net_complete_n,
+        "net_incomplete_sell_count": net_incomplete_n,
+        "gross_incomplete_orders": gross_incomplete_orders,
+        "net_incomplete_orders": net_incomplete_orders,
         "broker_only_incomplete_count": broker_only_unresolved,
     }
 
@@ -2648,7 +2750,7 @@ def _apply_broker_integrity_findings(
     trade_perf: Dict[str, Any],
 ) -> str:
     """Propagate broker-only / stale findings; return review status label."""
-    status = "OK"
+    status = "PERFORMANCE_COMPLETE"
     reconcile_sel = load_order_reconcile_evidence(artifacts)
     recon = {}
     if reconcile_sel and getattr(reconcile_sel, "payload", None):
@@ -2659,6 +2761,13 @@ def _apply_broker_integrity_findings(
                 recon = json.load(f) or {}
         except Exception:
             recon = {}
+
+    broker_only_count = int(
+        (recon.get("db_reconcile") or {}).get("broker_only_order_count")
+        or recon.get("broker_only_detected_count")
+        or recon.get("broker_only_order_count")
+        or 0
+    )
 
     for item in recon.get("findings") or []:
         title = normalize_finding_title(str(item.get("title") or ""))
@@ -2672,15 +2781,18 @@ def _apply_broker_integrity_findings(
             "order_reconcile",
             json.dumps(details, ensure_ascii=False)[:400] if details else title,
             item.get("impact") or "broker/DB 원장 불일치",
-            item.get("recommendation") or "order_reconciler --backfill-broker-only",
+            item.get("recommendation") or "order_reconciler --repair-ledger-from-ccnl",
             category=item.get("category") or normalize_finding_category(title),
         ))
         if title == "BROKER_TRADE_MISSING_IN_DB":
             status = "PERFORMANCE_DATA_INCOMPLETE"
 
-    if trade_perf.get("broker_only_incomplete_count") or (
-        trade_perf.get("net_pnl_complete") is False
-    ) or (trade_perf.get("gross_pnl_complete") is False):
+    gross_ok = bool(trade_perf.get("gross_pnl_complete"))
+    net_ok = bool(trade_perf.get("net_pnl_complete"))
+    trade_perf["gross_performance_status"] = "COMPLETE" if gross_ok else "INCOMPLETE"
+    trade_perf["net_performance_status"] = "COMPLETE" if net_ok else "INCOMPLETE"
+
+    if not gross_ok or int(trade_perf.get("gross_incomplete_sell_count") or 0) > 0:
         status = "PERFORMANCE_DATA_INCOMPLETE"
         if not any(f.title == "PERFORMANCE_DATA_INCOMPLETE" for f in findings):
             findings.append(make_finding(
@@ -2688,13 +2800,31 @@ def _apply_broker_integrity_findings(
                 "ERROR",
                 "performance",
                 (
-                    f"gross_pnl={trade_perf.get('gross_pnl')} "
-                    f"gross_complete={trade_perf.get('gross_pnl_complete')} "
-                    f"net_complete={trade_perf.get('net_pnl_complete')}"
+                    f"known_gross_pnl={trade_perf.get('known_gross_pnl')} "
+                    f"gross_incomplete={trade_perf.get('gross_incomplete_orders')}"
                 ),
-                "수수료·세금 미확보 또는 broker fill gross 미완성으로 최종 성과 확정 불가",
-                "broker-only backfill 및 수수료 원장 확보 후 재리뷰",
+                "하나 이상의 SELL gross P&L 미완성",
+                "order_reconciler --repair-ledger-from-ccnl 후 재리뷰",
             ))
+    elif status == "PERFORMANCE_DATA_INCOMPLETE":
+        # broker-only missing etc. already set
+        pass
+    elif gross_ok and not net_ok:
+        status = "GROSS_COMPLETE_NET_INCOMPLETE"
+        if not any(f.title == "GROSS_COMPLETE_NET_INCOMPLETE" for f in findings):
+            findings.append(make_finding(
+                "GROSS_COMPLETE_NET_INCOMPLETE",
+                "WARN",
+                "performance",
+                (
+                    f"known_gross_pnl={trade_perf.get('known_gross_pnl')} "
+                    f"net_incomplete={trade_perf.get('net_incomplete_sell_count')}"
+                ),
+                "gross는 확정, 수수료·세금으로 net 미확정",
+                "수수료·세금 원장 확보 후 net P&L 확정",
+            ))
+    else:
+        status = "PERFORMANCE_COMPLETE"
 
     # Stale daily balances excluded from performance math markers
     for p in artifacts.daily_balance_paths:
@@ -2705,8 +2835,14 @@ def _apply_broker_integrity_findings(
             continue
         if bal.get("valid") is False:
             continue
-        # Mark ACCOUNT_FILE_STALE from reconcile/logs only — skip ticker mismatch noise
     return status
+
+
+def performance_report_date_tag(period: str, start_date: str, end_date: str) -> str:
+    """Distinct filenames for single-day vs range reviews."""
+    if start_date == end_date:
+        return end_date
+    return f"{start_date}_{end_date}"
 
 
 def run_performance_review(
@@ -2771,10 +2907,19 @@ def run_performance_review(
             "period": period,
             "start_date": start_date,
             "end_date": end_date,
+            "date_from": start_date,
+            "date_to": end_date,
+            "review_date": end_date if start_date == end_date else f"{start_date}_{end_date}",
+            "review_scope": (
+                "single_day" if start_date == end_date
+                else ("weekly" if period == "weekly" else "date_range")
+            ),
+            "report_key": f"{market}_{period}_{performance_report_date_tag(period, start_date, end_date)}",
             "session": session,
             "strict_kis_endpoints": strict_kis,
             "include_logs": include_logs,
             "generated_at": datetime.now(KST).isoformat(),
+            "generated_at_kst": datetime.now(KST).isoformat(),
             "review_error": review_error,
         },
         artifact_group={
@@ -2795,16 +2940,40 @@ def run_performance_review(
 
     critical = [f for f in all_findings if f.severity == "CRITICAL"]
     errors = [f for f in all_findings if f.severity == "ERROR"]
+    warns = [f for f in all_findings if f.severity == "WARN"]
     result.summary_text = (
         f"KIS endpoint health={kis_review.endpoint_health_score:.0f}/100; "
-        f"findings={len(all_findings)} (CRITICAL={len(critical)}, ERROR={len(errors)})"
+        f"findings={len(all_findings)} (CRITICAL={len(critical)}, ERROR={len(errors)}); "
+        f"review_status={trade_perf.get('review_status')}"
     )
     if review_error:
         result.summary_text += f"; error={review_error[:120]}"
-    result.action_items = [f"[{f.severity}] {f.title}: {f.recommendation}" for f in critical + errors][:10]
+
+    action_items: List[str] = []
+    for f in critical + errors + warns:
+        # Skip broker-only backfill actions when already zero
+        if f.title == "BROKER_TRADE_MISSING_IN_DB":
+            action_items.append(f"[{f.severity}] {f.title}: {f.recommendation}")
+            continue
+        if "broker-only backfill" in (f.recommendation or "").lower():
+            # only keep if reconcile still reports broker-only > 0
+            continue
+        action_items.append(f"[{f.severity}] {f.title}: {f.recommendation}")
+    # Prefer net incomplete guidance when applicable
+    if trade_perf.get("review_status") == "GROSS_COMPLETE_NET_INCOMPLETE":
+        action_items = [
+            a for a in action_items
+            if "broker-only" not in a.lower()
+        ]
+        action_items.insert(0, "[WARN] GROSS_COMPLETE_NET_INCOMPLETE: 수수료·세금 원장 확보 후 net P&L 확정")
+    result.action_items = action_items[:10]
+
+    date_tag = performance_report_date_tag(period, start_date, end_date)
+    output_filename = f"performance_review_{market}_{period}_{date_tag}.json"
+    result.context["output_filename"] = output_filename
 
     try:
-        write_reports(result, review_out, market, period, end_date, json_only=json_only)
+        write_reports(result, review_out, market, period, date_tag, json_only=json_only)
     except Exception as e:
         logger.exception("Performance review report write failed: %s", e)
 
@@ -2873,7 +3042,18 @@ def kis_review_to_json_summary(ker: KisEndpointReview) -> Dict[str, Any]:
 
 
 def result_to_dict(result: PerformanceReviewResult) -> Dict[str, Any]:
+    ctx = result.context or {}
     return _redact_sensitive({
+        # Root metadata (stable schema)
+        "review_scope": ctx.get("review_scope"),
+        "review_date": ctx.get("review_date"),
+        "date_from": ctx.get("date_from") or ctx.get("start_date"),
+        "date_to": ctx.get("date_to") or ctx.get("end_date"),
+        "period": ctx.get("period"),
+        "market": ctx.get("market"),
+        "report_key": ctx.get("report_key"),
+        "generated_at_kst": ctx.get("generated_at_kst") or ctx.get("generated_at"),
+        "output_filename": ctx.get("output_filename"),
         "context": result.context,
         "artifact_group": result.artifact_group,
         "trade_performance": result.trade_performance,

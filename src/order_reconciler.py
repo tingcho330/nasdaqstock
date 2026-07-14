@@ -162,9 +162,10 @@ def _normalize_overseas_order_row(row: Any) -> Optional[Dict[str, Any]]:
 
         order_date = str(row.get("ord_dt", "") or "").strip()
         domestic_order_date = str(row.get("dmst_ord_dt", "") or "").strip()
-        order_time = str(
-            row.get("ord_tmd") or row.get("thco_ord_tmd") or ""
-        ).strip()
+        ord_tmd = str(row.get("ord_tmd", "") or "").strip()
+        thco_ord_tmd = str(row.get("thco_ord_tmd", "") or "").strip()
+        order_time = ord_tmd or thco_ord_tmd
+
 
         order_price = _safe_decimal(row.get("ft_ord_unpr3", row.get("ord_unpr", 0)))
         executed_price = _safe_decimal(row.get("ft_ccld_unpr3", row.get("avg_unpr", 0)))
@@ -190,14 +191,19 @@ def _normalize_overseas_order_row(row: Any) -> Optional[Dict[str, Any]]:
             "order_id": order_id,
             "original_order_id": str(row.get("orgn_odno", "") or "").strip(),
             "order_date": order_date,
+            "ord_dt": order_date,
             "domestic_order_date": domestic_order_date,
+            "dmst_ord_dt": domestic_order_date,
             "order_time": order_time,
+            "ord_tmd": ord_tmd,
+            "thco_ord_tmd": thco_ord_tmd,
             "ticker": ticker,
             "product_name": str(row.get("prdt_name", "") or ""),
             "side": side,
             "side_code": side_cd,
             "side_name": side_name,
             "quantity": qty,
+            "requested_qty": qty,
             "order_price": order_price,
             "order_price_str": _decimal_to_json(order_price),
             "executed_qty": executed_qty,
@@ -765,10 +771,16 @@ def _backfill_eligibility(kis_o: Dict[str, Any]) -> Tuple[bool, str]:
         ok_px = px_val > 0
     if not ok_px:
         return False, "executed_price_le_0"
-    if not str(kis_o.get("order_date") or "").strip():
-        return False, "missing_order_date"
-    if not str(kis_o.get("order_time") or "").strip():
-        return False, "missing_order_time"
+    try:
+        from ledger_repair import effective_trade_timestamp_from_ccnl
+        dt, reason = effective_trade_timestamp_from_ccnl(kis_o)
+        if dt is None:
+            return False, reason or "TIMESTAMP_EVIDENCE_INCOMPLETE"
+    except Exception:
+        if not str(kis_o.get("order_date") or "").strip():
+            return False, "missing_order_date"
+        if not str(kis_o.get("order_time") or "").strip():
+            return False, "missing_order_time"
     return True, ""
 
 
@@ -919,6 +931,13 @@ def backfill_broker_only_orders(
             continue
 
         trade_ts = broker_trade_timestamp_kst(kis_o.get("order_date"), kis_o.get("order_time"))
+        try:
+            from ledger_repair import effective_trade_timestamp_from_ccnl
+            eff, _reason = effective_trade_timestamp_from_ccnl(kis_o)
+            if eff is not None:
+                trade_ts = eff
+        except Exception:
+            pass
         if trade_ts is None:
             skipped_incomplete += 1
             incomplete_findings.append({
@@ -1614,11 +1633,16 @@ def detect_and_optionally_backfill_broker_only(
     backfill: bool = False,
     dry_run: bool = False,
     recorder=None,
-    repair_existing: bool = True,
+    repair_existing: bool = False,
 ) -> Dict[str, Any]:
+    """
+    Detect broker-only orders. Optionally backfill missing rows.
+    Does NOT auto-repair existing DB rows from CCNL — use --repair-ledger-from-ccnl.
+    """
     rec = recorder or get_recorder()
     broker_only, findings = detect_broker_only_orders(daily_orders, recorder=rec)
     result: Dict[str, Any] = {
+        "broker_only_detected_count": len(broker_only),
         "broker_only_order_count": len(broker_only),
         "broker_only_count": len(broker_only),  # backward compat
         "broker_only_orders": [
@@ -1636,22 +1660,20 @@ def detect_and_optionally_backfill_broker_only(
         "broker_only_order_ids": [o.get("order_id") for o in broker_only],
         "broker_only_backfilled_count": 0,
         "broker_only_incomplete_count": 0,
+        "ccnl_corrected_order_count": 0,
+        "executed_price_corrected_count": 0,
+        "quantity_corrected_count": 0,
+        "sell_pnl_corrected_count": 0,
         "findings": findings,
     }
 
-    if repair_existing:
-        # Correct already-persisted broker-only / fill-mismatched rows (e.g. SNDK SELL)
-        # even when broker_only set is empty after a prior incomplete backfill,
-        # and even when the CCNL window returns no rows (hardcoded SNDK evidence).
+    # Explicit opt-in only (deprecated path; prefer --repair-ledger-from-ccnl)
+    if repair_existing and daily_orders:
         repair = repair_backfilled_trades_from_ccnl(
             daily_orders or {}, recorder=rec, dry_run=dry_run,
         )
         result["repair"] = repair
-        if repair.get("repaired_order_ids"):
-            result["broker_only_backfilled_count"] = max(
-                int(result.get("broker_only_backfilled_count") or 0),
-                len(repair.get("repaired_order_ids") or []),
-            )
+        result["ccnl_corrected_order_count"] = len(repair.get("repaired_order_ids") or [])
 
     if backfill and broker_only:
         bf = backfill_broker_only_orders(
@@ -1672,7 +1694,7 @@ def detect_and_optionally_backfill_broker_only(
             )
             result["broker_only_remaining"] = len(remaining)
             result["findings_after_backfill"] = remaining_findings
-            # refresh stable counts after backfill
+            result["broker_only_detected_count"] = len(remaining)
             result["broker_only_order_count"] = len(remaining)
             result["broker_only_orders"] = [
                 {
@@ -1995,7 +2017,7 @@ def reconcile_open_orders(
             backfill=backfill_broker_only,
             dry_run=dry_run,
             recorder=recorder,
-            repair_existing=bool(backfill_broker_only),
+            repair_existing=False,  # never auto-migrate; use --repair-ledger-from-ccnl
         )
         summary["broker_only_count"] = broker_result.get("broker_only_order_count", 0)
         summary["broker_only_order_ids"] = broker_result.get("broker_only_order_ids", [])
@@ -2027,6 +2049,11 @@ def reconcile_open_orders(
                 "db_vs_ccnl_mismatch_count": still_missing_after_daily,
                 "order_id_coverage_rate": coverage,
                 # Stable schema even when count=0
+                "broker_only_detected_count": int(
+                    broker_result.get("broker_only_detected_count")
+                    or broker_result.get("broker_only_order_count")
+                    or 0
+                ),
                 "broker_only_order_count": int(
                     broker_result.get("broker_only_order_count") or 0
                 ),
@@ -2037,10 +2064,27 @@ def reconcile_open_orders(
                 "broker_only_incomplete_count": int(
                     broker_result.get("broker_only_incomplete_count") or 0
                 ),
+                "ccnl_corrected_order_count": int(
+                    broker_result.get("ccnl_corrected_order_count") or 0
+                ),
+                "executed_price_corrected_count": int(
+                    broker_result.get("executed_price_corrected_count") or 0
+                ),
+                "quantity_corrected_count": int(
+                    broker_result.get("quantity_corrected_count") or 0
+                ),
+                "sell_pnl_corrected_count": int(
+                    broker_result.get("sell_pnl_corrected_count") or 0
+                ),
                 # backward-compat aliases
                 "broker_only_count": int(broker_result.get("broker_only_order_count") or 0),
                 "broker_only_order_ids": list(broker_result.get("broker_only_order_ids") or []),
             },
+            "broker_only_detected_count": int(
+                broker_result.get("broker_only_detected_count")
+                or broker_result.get("broker_only_order_count")
+                or 0
+            ),
             "broker_only_order_count": int(
                 broker_result.get("broker_only_order_count") or 0
             ),
@@ -2050,6 +2094,18 @@ def reconcile_open_orders(
             ),
             "broker_only_incomplete_count": int(
                 broker_result.get("broker_only_incomplete_count") or 0
+            ),
+            "ccnl_corrected_order_count": int(
+                broker_result.get("ccnl_corrected_order_count") or 0
+            ),
+            "executed_price_corrected_count": int(
+                broker_result.get("executed_price_corrected_count") or 0
+            ),
+            "quantity_corrected_count": int(
+                broker_result.get("quantity_corrected_count") or 0
+            ),
+            "sell_pnl_corrected_count": int(
+                broker_result.get("sell_pnl_corrected_count") or 0
             ),
             "findings": broker_result.get("findings") or [],
         }
@@ -2069,7 +2125,7 @@ def reconcile_open_orders(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="DB pending/partial 주문 리컨실")
+    parser = argparse.ArgumentParser(description="DB pending/partial 주문 리컨실 / CCNL ledger repair")
     parser.add_argument("--since-hours", type=int, default=24, help="리컨실 대상 조회 범위(시간)")
     parser.add_argument("--limit", type=int, default=500, help="최대 조회 건수")
     parser.add_argument("--backfill-only", action="store_true", help="orphan order_id backfill만 실행")
@@ -2079,11 +2135,60 @@ def main():
         help="KIS에만 있는 executed 주문을 trade_records에 idempotent backfill",
     )
     parser.add_argument(
+        "--repair-ledger-from-ccnl",
+        action="store_true",
+        help="기존 DB 행을 KIS CCNL 체결가로 UPDATE-only repair (기본 dry-run)",
+    )
+    parser.add_argument("--ticker", type=str, help="--repair-ledger-from-ccnl 대상 티커")
+    parser.add_argument("--from", dest="date_from", metavar="YYYYMMDD", help="repair 시작일")
+    parser.add_argument("--to", dest="date_to", metavar="YYYYMMDD", help="repair 종료일")
+    parser.add_argument(
+        "--apply-repair",
+        action="store_true",
+        help="ledger repair 실제 DB 적용 (없으면 dry-run)",
+    )
+    parser.add_argument("--db-path", type=str, help="trading_data.db 경로")
+    parser.add_argument("--evidence-path", type=str, help="ledger repair evidence JSON 경로")
+    parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="backfill 대상만 로그 (DB 변경 없음)",
+        help="DB 변경 없음 (repair 기본값; backfill과 함께 사용 가능)",
     )
     args = parser.parse_args()
+
+    if args.repair_ledger_from_ccnl:
+        if args.dry_run and args.apply_repair:
+            raise SystemExit("ERROR: --dry-run and --apply-repair are mutually exclusive")
+        if not args.ticker or not args.date_from or not args.date_to:
+            raise SystemExit(
+                "ERROR: --repair-ledger-from-ccnl requires --ticker, --from, --to"
+            )
+        from ledger_repair import repair_ledger_from_ccnl, default_trading_db_path
+
+        apply = bool(args.apply_repair)
+        mode = "apply" if apply else "dry_run"
+        db_path = Path(args.db_path) if args.db_path else default_trading_db_path()
+        print(f"[LEDGER_REPAIR] mode={mode} ticker={args.ticker} "
+              f"from={args.date_from} to={args.date_to} db={db_path}")
+        result = repair_ledger_from_ccnl(
+            ticker=args.ticker,
+            date_from=args.date_from,
+            date_to=args.date_to,
+            apply=apply,
+            db_path=db_path,
+            evidence_path=Path(args.evidence_path) if args.evidence_path else None,
+            market=os.getenv("MARKET", "SP500"),
+        )
+        if result.get("error"):
+            print(f"[LEDGER_REPAIR] ERROR: {result['error']}")
+            raise SystemExit(1)
+        print(
+            f"[LEDGER_REPAIR] done mode={result['mode']} "
+            f"needing={result.get('rows_needing_update')} "
+            f"updated={result.get('rows_updated')} "
+            f"evidence={result.get('evidence_path')}"
+        )
+        return
 
     if args.backfill_only and not args.backfill_broker_only:
         backfill_orphan_order_ids(since_hours=args.since_hours, limit=min(args.limit, 200))

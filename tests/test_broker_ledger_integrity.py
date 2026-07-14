@@ -262,7 +262,10 @@ def test_backfill_incomplete_missing_order_time(tmp_output, monkeypatch, tmp_pat
     before = len(rec.get_known_order_ids())
     r = backfill_broker_only_orders([incomplete], recorder=rec)
     assert r["backfill_skipped_incomplete"] == 1
-    assert r["incomplete_findings"][0]["details"]["reason"] == "missing_order_time"
+    assert r["incomplete_findings"][0]["details"]["reason"] in (
+        "missing_order_time",
+        "TIMESTAMP_EVIDENCE_INCOMPLETE",
+    )
     assert len(rec.get_known_order_ids()) == before
 
 
