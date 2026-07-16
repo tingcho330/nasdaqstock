@@ -8,6 +8,7 @@
 """
 
 import os
+import re
 import json
 import logging
 import subprocess
@@ -40,6 +41,7 @@ from utils import (
     fmt_money_signed,
     _parse_summary_payload,
     resolve_pipeline_context,
+    resolve_market_session_identity,
     pipeline_artifact_path,
     format_pipeline_artifact,
 )
@@ -595,78 +597,278 @@ def _portfolio_totals_from_snapshot(snap: Dict) -> Tuple[int, int, float]:
     return total, cash, hv
 
 
-def _iter_open_snapshot_dates(close_date: str) -> List[str]:
+# ───────────────── daily balance 파일 레이아웃 ─────────────────
+# canonical (신규 primary): daily_balances/canonical/balance_{type}_trade_{trade_date}.json
+# legacy (읽기 전용 fallback): daily_balances/balance_{type}_{YYYYMMDD}.json
+#   └ 파일명 날짜가 trade_date일 수도, KST session_close alias일 수도 있으므로
+#     반드시 metadata.trade_date 기준으로만 선택한다.
+_BALANCE_FILENAME_RE = re.compile(r"^balance_(open|close)_(\d{8})\.json$")
+
+
+def _canonical_balance_dir() -> Path:
+    return BALANCE_STORAGE_PATH / "canonical"
+
+
+def _canonical_balance_path(snapshot_type: str, trade_date: str) -> Path:
+    return _canonical_balance_dir() / f"balance_{snapshot_type}_trade_{trade_date}.json"
+
+
+def _legacy_balance_path(snapshot_type: str, file_date: str) -> Path:
+    return BALANCE_STORAGE_PATH / f"balance_{snapshot_type}_{file_date}.json"
+
+
+def _load_balance_json(path: Path) -> Optional[Dict]:
+    try:
+        if not path.is_file():
+            return None
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        return payload if isinstance(payload, dict) else None
+    except Exception as e:
+        logger.warning("daily balance 로드 실패 %s: %s", path, e)
+        return None
+
+
+def _snapshot_is_valid(payload: Dict) -> bool:
+    return payload.get("valid", True) is not False
+
+
+def _snapshot_trade_date(payload: Dict, path: Optional[Path] = None) -> Optional[str]:
+    """metadata.trade_date 우선. 구버전 파일은 date → 파일명 순 폴백."""
+    td = str(payload.get("trade_date") or "").strip()
+    if td:
+        return td
+    td = str(payload.get("date") or "").strip()
+    if td:
+        return td
+    if path is not None:
+        m = _BALANCE_FILENAME_RE.match(path.name)
+        if m:
+            return m.group(2)
+    return None
+
+
+def _legacy_candidate_sort(candidates: List[Tuple[Dict, Path]]) -> List[Tuple[Dict, Path]]:
+    """동일 trade_date 후보 우선순위: canonical > non-alias > kis_account_snapshot > 최신."""
+    ordered = sorted(
+        candidates,
+        key=lambda it: str(
+            it[0].get("generated_at_kst") or it[0].get("timestamp") or ""
+        ),
+        reverse=True,
+    )
+    ordered.sort(
+        key=lambda it: (
+            0 if it[0].get("canonical") is True else 1,
+            0 if it[0].get("legacy_alias") is not True else 1,
+            0 if it[0].get("source") == "kis_account_snapshot" else 1,
+        )
+    )
+    return ordered
+
+
+def find_balance_snapshot(
+    trade_date: str,
+    snapshot_type: str,
+) -> Tuple[Optional[Dict], Optional[Path], str]:
     """
-    종료일(close)에 맞는 장시작(open) 스냅샷 파일 날짜 후보.
-    US: balance_open_time(KST, 기본 23:55) 캡처 → balance_open_{전일}.json + balance_close_{당일}.json
-    KR: 동일 일자 open/close
+    target trade_date의 스냅샷 조회 — (snapshot, path, resolution).
+
+    1) canonical/balance_{type}_trade_{trade_date}.json
+    2) legacy daily_balances/*.json 을 metadata 기준으로 스캔
+       (파일명 날짜 연산 금지 — valid=true, type 일치, trade_date 일치만 후보)
+    resolution: canonical | legacy_exact | legacy_metadata | missing
     """
-    d = datetime.strptime(close_date, "%Y%m%d").date()
-    seen: set = set()
-    out: List[str] = []
+    cand = _canonical_balance_path(snapshot_type, trade_date)
+    payload = _load_balance_json(cand)
+    if payload is not None:
+        if (
+            _snapshot_is_valid(payload)
+            and str(payload.get("type") or snapshot_type) == snapshot_type
+            and _snapshot_trade_date(payload, cand) == trade_date
+        ):
+            return payload, cand, "canonical"
+        logger.warning(
+            "canonical daily balance invalid/mismatch, legacy fallback: %s", cand
+        )
 
-    def _add(ds: str) -> None:
-        if ds not in seen:
-            seen.add(ds)
-            out.append(ds)
+    candidates: List[Tuple[Dict, Path]] = []
+    for p in sorted(BALANCE_STORAGE_PATH.glob(f"balance_{snapshot_type}_*.json")):
+        if not _BALANCE_FILENAME_RE.match(p.name):
+            continue
+        pl = _load_balance_json(p)
+        if pl is None or not _snapshot_is_valid(pl):
+            continue
+        if str(pl.get("type") or snapshot_type) != snapshot_type:
+            continue
+        if _snapshot_trade_date(pl, p) != trade_date:
+            continue
+        candidates.append((pl, p))
 
-    if is_us_market(MARKET):
-        _add((d - timedelta(days=1)).strftime("%Y%m%d"))
-        probe = d - timedelta(days=1)
-        for _ in range(10):
-            if is_market_open_day(probe, MARKET):
-                _add(probe.strftime("%Y%m%d"))
-                break
-            probe -= timedelta(days=1)
-        probe2 = previous_trading_day(d - timedelta(days=1), MARKET)
-        _add(probe2.strftime("%Y%m%d"))
-    _add(close_date)
-    probe = d
-    for _ in range(10):
-        probe -= timedelta(days=1)
-        _add(probe.strftime("%Y%m%d"))
-    return out
+    if not candidates:
+        return None, None, "missing"
+
+    ordered = _legacy_candidate_sort(candidates)
+    pl, p = ordered[0]
+    resolution = (
+        "legacy_exact"
+        if p.name == f"balance_{snapshot_type}_{trade_date}.json"
+        else "legacy_metadata"
+    )
+    logger.info(
+        "daily balance legacy fallback 선택: type=%s trade_date=%s file=%s "
+        "(canonical=%s legacy_alias=%s source=%s, 이유=metadata.trade_date 일치)",
+        snapshot_type,
+        trade_date,
+        p.name,
+        pl.get("canonical"),
+        pl.get("legacy_alias"),
+        pl.get("source"),
+    )
+    return pl, p, resolution
 
 
-def load_daily_balance_pair(
-    session_close_date: str,
-) -> Tuple[Optional[Dict], Optional[Dict], Optional[str]]:
-    """(open_snapshot, close_snapshot, open_file_date) — close는 session_close_date 고정."""
-    close_balance = load_balance_snapshot(session_close_date, "close")
-    if not close_balance:
-        return None, None, None
-    for open_date in _iter_open_snapshot_dates(session_close_date):
-        open_balance = load_balance_snapshot(open_date, "open")
-        if open_balance:
-            if open_date != session_close_date:
-                logger.info(
-                    "일일 요약 open 스냅샷: close=%s ← open_%s (US 세션)",
-                    session_close_date,
-                    open_date,
-                )
-            return open_balance, close_balance, open_date
-    return None, close_balance, None
+def _validate_balance_pair(
+    open_snap: Optional[Dict],
+    close_snap: Optional[Dict],
+    target_trade_date: str,
+    open_path: Optional[Path] = None,
+    close_path: Optional[Path] = None,
+) -> List[str]:
+    """open/close pair 정합성 — 반드시 같은 trade_date + type/valid 일치."""
+    errors: List[str] = []
+    if open_snap is not None:
+        if str(open_snap.get("type") or "open") != "open":
+            errors.append(f"open.type={open_snap.get('type')}")
+        if not _snapshot_is_valid(open_snap):
+            errors.append("open.valid=false")
+        otd = _snapshot_trade_date(open_snap, open_path)
+        if otd != target_trade_date:
+            errors.append(f"open.trade_date={otd} != target={target_trade_date}")
+    if close_snap is not None:
+        if str(close_snap.get("type") or "close") != "close":
+            errors.append(f"close.type={close_snap.get('type')}")
+        if not _snapshot_is_valid(close_snap):
+            errors.append("close.valid=false")
+        ctd = _snapshot_trade_date(close_snap, close_path)
+        if ctd != target_trade_date:
+            errors.append(f"close.trade_date={ctd} != target={target_trade_date}")
+    if open_snap is not None and close_snap is not None:
+        otd = _snapshot_trade_date(open_snap, open_path)
+        ctd = _snapshot_trade_date(close_snap, close_path)
+        if otd != ctd:
+            errors.append(f"open.trade_date={otd} != close.trade_date={ctd}")
+    return errors
+
+
+def load_daily_balance_pair(target_trade_date: str) -> Dict:
+    """
+    target trade_date의 open/close pair — metadata.trade_date 기준으로만 pairing.
+
+    금지: 파일명에서 ±1일 연산으로 open 선택, session_close_date만 같은 pairing.
+    불일치 시 DAILY_BALANCE_PAIR_TRADE_DATE_MISMATCH를 ERROR로 기록한다.
+    """
+    open_snap, open_path, open_res = find_balance_snapshot(target_trade_date, "open")
+    close_snap, close_path, close_res = find_balance_snapshot(target_trade_date, "close")
+    errors = _validate_balance_pair(
+        open_snap, close_snap, target_trade_date, open_path, close_path
+    )
+    if errors:
+        logger.error(
+            "DAILY_BALANCE_PAIR_TRADE_DATE_MISMATCH trade_date=%s: %s",
+            target_trade_date,
+            "; ".join(errors),
+        )
+    return {
+        "trade_date": target_trade_date,
+        "open": open_snap,
+        "close": close_snap,
+        "open_path": open_path,
+        "close_path": close_path,
+        "open_resolution": open_res,
+        "close_resolution": close_res,
+        "errors": errors,
+        "pair_ok": bool(open_snap and close_snap and not errors),
+    }
 
 
 def capture_balance_snapshot(
     snapshot_type: str,
     *,
     rebuild: bool = False,
-) -> Optional[Dict]:
-    """잔액 스냅샷 캡처 (open/close).
+    trade_date: Optional[str] = None,
+) -> Dict:
+    """잔액 스냅샷 캡처 (open/close) — 구조화 결과 반환.
+
+    Returns:
+        {"status": "existing_valid" | "created" | "failed",
+         "trade_date": ..., "path": ..., "source": ..., "snapshot": ..., "reason": ...}
 
     Source priority:
     1) KIS account_snapshot_{market}_{trade_date}*.json (valid)
     2) Same trade_date valid=true KIS-derived cached snapshot
-    Forbidden: copying past dated balance JSON as current; DB position-only substitute.
+    Forbidden:
+    - copying past dated balance JSON as current; DB position-only substitute
+    - 과거 trade_date 스냅샷을 현재 계좌 상태로 재생성 (historical recapture)
     Past daily balance files are not overwritten unless rebuild=True / --rebuild-daily-balance.
     """
+    def _result(status: str, **kw) -> Dict:
+        base = {
+            "status": status,
+            "trade_date": kw.pop("trade_date", None),
+            "path": kw.pop("path", None),
+            "source": kw.pop("source", None),
+        }
+        base.update(kw)
+        return base
+
     try:
-        from utils import resolve_pipeline_context, is_us_market as _is_us
         from account_snapshot import extract_account_file_date
 
+        identity = resolve_market_session_identity(
+            MARKET, explicit_trade_date=trade_date
+        )
+        target_td = identity["trade_date"]
+
+        # 이미 valid 스냅샷이 있으면 재캡처하지 않는다 (canonical 우선, metadata fallback)
+        if not rebuild:
+            existing, existing_path, existing_res = find_balance_snapshot(
+                target_td, snapshot_type
+            )
+            if existing is not None:
+                logger.info(
+                    "%s_SNAPSHOT_PRESENT: trade_date=%s file=%s resolution=%s → 캡처 스킵",
+                    snapshot_type.upper(),
+                    target_td,
+                    existing_path,
+                    existing_res,
+                )
+                return _result(
+                    "existing_valid",
+                    trade_date=target_td,
+                    path=str(existing_path),
+                    source=existing.get("source"),
+                    snapshot=existing,
+                    resolution=existing_res,
+                )
+
+        # 과거 세션 스냅샷을 현재 계좌 상태로 만들지 않는다
+        if not identity["is_live_trade_date"]:
+            logger.error(
+                "[HISTORICAL_SNAPSHOT_RECAPTURE_FORBIDDEN] type=%s trade_date=%s "
+                "live_trade_date=%s — 현재 계좌 상태로 과거 스냅샷 재생성 금지",
+                snapshot_type,
+                target_td,
+                identity["live_trade_date"],
+            )
+            return _result(
+                "failed",
+                trade_date=target_td,
+                reason="historical_recapture_forbidden",
+            )
+
         ctx = resolve_pipeline_context(market=MARKET, mode="live")
-        trade_date = ctx.get("trade_date") or datetime.now(KST).strftime("%Y%m%d")
+        trade_date = target_td
         session = ctx.get("session") or "pm"
 
         # Prefer live KIS account snapshot artifact
@@ -733,7 +935,9 @@ def capture_balance_snapshot(
                     file_meta.get("account_file_date"),
                     trade_date,
                 )
-                return None
+                return _result(
+                    "failed", trade_date=trade_date, reason="account_file_stale"
+                )
 
             holdings_detail = _holdings_detail_from_rows(holdings)
             total_balance, cash, holdings_value = _portfolio_totals_from_cash_map(
@@ -778,20 +982,9 @@ def capture_balance_snapshot(
             balance_path = None
 
         now = datetime.now(KST)
-        # Canonical US daily balance key = pipeline live trade_date only (one file).
+        # Canonical daily balance key = trade_date only.
+        # KST alias 파일은 더 이상 생성하지 않는다 — pairing은 metadata.trade_date 기준.
         snap_date = trade_date
-        # Optional KST-calendar alias for open pairing with next morning close summaries.
-        kst_alias_date: Optional[str] = None
-        if is_us_market(MARKET) and snapshot_type == "open":
-            kst_today = now.date()
-            nxt = kst_today + timedelta(days=1)
-            for _ in range(5):
-                if is_market_open_day(nxt, MARKET):
-                    cand = nxt.strftime("%Y%m%d")
-                    if cand != trade_date:
-                        kst_alias_date = cand
-                    break
-                nxt += timedelta(days=1)
 
         broker_only_count = 0
         try:
@@ -812,10 +1005,43 @@ def capture_balance_snapshot(
             pass
 
         position_reconciled = broker_only_count == 0
+
+        # ── 통화·단위 명시 (US: USD primary / KR: KRW) ──
+        us = is_us_market(MARKET)
+        fx_rate = _parse_float_amount(kis_summary.get("bass_exrt")) or None
+        if us:
+            currency_meta = {
+                "base_currency": "USD",
+                "total_asset_usd": round(float(cash) + float(holdings_value), 2),
+                "available_cash_usd": round(float(cash), 2),
+                "holdings_value_usd": round(float(holdings_value), 2),
+                "total_asset_krw": _parse_amount(kis_summary.get("tot_evlu_amt_krw")) or None,
+                "available_cash_krw": _parse_amount(kis_summary.get("krw_cash")) or None,
+                "holdings_value_krw": None,
+                "fx_rate_used": fx_rate,
+                "fx_rate_timestamp": snapshot_ts if fx_rate else None,
+                "value_semantics": "usd_cash_plus_holdings",
+            }
+        else:
+            currency_meta = {
+                "base_currency": "KRW",
+                "total_asset_usd": None,
+                "available_cash_usd": None,
+                "holdings_value_usd": None,
+                "total_asset_krw": _parse_amount(total_balance),
+                "available_cash_krw": _parse_amount(cash),
+                "holdings_value_krw": _parse_amount(holdings_value),
+                "fx_rate_used": None,
+                "fx_rate_timestamp": None,
+                "value_semantics": "krw_total",
+            }
+
         snapshot = {
             "date": snap_date,
             "trade_date": trade_date,
-            "session_close_date": trade_date,
+            "session_open_date_kst": identity["session_open_date_kst"],
+            "session_close_date_kst": identity["session_close_date_kst"],
+            "session_close_date": identity["session_close_date_kst"],
             "timestamp": now.isoformat(),
             "snapshot_ts_kst": snapshot_ts,
             "generated_at_kst": now.isoformat(),
@@ -836,50 +1062,148 @@ def capture_balance_snapshot(
             "kis_summary": kis_summary,
             "summary_file": str(summary_path) if summary_path else None,
             "balance_file": str(balance_path) if balance_path else None,
+            **currency_meta,
         }
 
-        # Canonical file: balance_{open|close}_{trade_date}.json only
-        writes: List[Tuple[str, Dict]] = [(snap_date, {**snapshot, "file_date": snap_date})]
-        if kst_alias_date:
-            writes.append((
-                kst_alias_date,
-                {
-                    **snapshot,
-                    "file_date": kst_alias_date,
-                    "legacy_alias": True,
-                    "canonical": False,
-                    "alias_of_trade_date": trade_date,
-                    "session_close_date": kst_alias_date,
-                },
-            ))
-
-        for save_date, snap_copy in writes:
-            filename = f"balance_{snapshot_type}_{save_date}.json"
-            filepath = BALANCE_STORAGE_PATH / filename
+        # 신규 canonical: canonical/balance_{type}_trade_{trade_date}.json (primary)
+        # 호환용 legacy: balance_{type}_{trade_date}.json (기존 리더 호환, alias 아님)
+        canonical_path = _canonical_balance_path(snapshot_type, trade_date)
+        legacy_path = _legacy_balance_path(snapshot_type, trade_date)
+        writes: List[Tuple[Path, Dict]] = [
+            (canonical_path, {**snapshot, "file_date": snap_date}),
+            (legacy_path, {**snapshot, "file_date": snap_date}),
+        ]
+        for filepath, snap_copy in writes:
             if filepath.exists() and not rebuild:
                 logger.info(
                     "daily balance exists, skip overwrite (use --rebuild-daily-balance): %s",
                     filepath,
                 )
                 continue
-            BALANCE_STORAGE_PATH.mkdir(parents=True, exist_ok=True)
+            filepath.parent.mkdir(parents=True, exist_ok=True)
             tmp = filepath.with_suffix(".tmp")
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(snap_copy, f, ensure_ascii=False, indent=2)
             tmp.replace(filepath)
             logger.info(
-                "잔액 스냅샷 저장: %s source=%s trade_date=%s alias=%s",
+                "잔액 스냅샷 저장: %s source=%s trade_date=%s canonical=%s",
                 filepath,
                 source,
                 trade_date,
-                snap_copy.get("legacy_alias"),
+                snap_copy.get("canonical"),
             )
-        return snapshot
+        return _result(
+            "created",
+            trade_date=trade_date,
+            path=str(canonical_path),
+            source=source,
+            snapshot=snapshot,
+        )
 
     except Exception as e:
         logger.error(f"잔액 스냅샷 캡처 실패: {type(e).__name__}: {str(e)}")
         logger.debug("잔액 스냅샷 캡처 상세 오류:", exc_info=True)
-        return None
+        return _result("failed", trade_date=trade_date, reason=f"{type(e).__name__}: {e}")
+
+def migrate_daily_balance_layout(
+    trade_date: Optional[str] = None,
+    *,
+    apply: bool = False,
+) -> Dict:
+    """
+    legacy daily balance → 신규 canonical 레이아웃 마이그레이션.
+
+    - legacy 파일은 삭제하지 않는다 (복사만).
+    - metadata.trade_date 기준으로 후보를 선택한다 (파일명 날짜 무시).
+    - 현재 계좌를 다시 조회해 과거 snapshot을 만들지 않는다.
+    - apply=False(dry-run)면 파일을 변경하지 않는다.
+    """
+    groups: Dict[Tuple[str, str], List[Tuple[Dict, Path]]] = {}
+    for p in sorted(BALANCE_STORAGE_PATH.glob("balance_*_*.json")):
+        m = _BALANCE_FILENAME_RE.match(p.name)
+        if not m:
+            continue
+        pl = _load_balance_json(p)
+        if pl is None or not _snapshot_is_valid(pl):
+            continue
+        snap_type = str(pl.get("type") or m.group(1))
+        if snap_type not in ("open", "close"):
+            continue
+        td = _snapshot_trade_date(pl, p)
+        if not td or not re.fullmatch(r"\d{8}", td):
+            continue
+        if trade_date and td != trade_date:
+            continue
+        groups.setdefault((snap_type, td), []).append((pl, p))
+
+    actions: List[Dict] = []
+    for (snap_type, td), candidates in sorted(groups.items()):
+        dest = _canonical_balance_path(snap_type, td)
+        if dest.exists():
+            actions.append({
+                "action": "skip_exists",
+                "type": snap_type,
+                "trade_date": td,
+                "dest": str(dest),
+            })
+            continue
+        pl, src = _legacy_candidate_sort(candidates)[0]
+        try:
+            session_ident = resolve_market_session_identity(
+                MARKET, explicit_trade_date=td
+            )
+            session_open_kst = session_ident["session_open_date_kst"]
+            session_close_kst = session_ident["session_close_date_kst"]
+        except Exception:
+            session_open_kst = session_close_kst = td
+
+        migrated = dict(pl)
+        migrated.pop("alias_of_trade_date", None)
+        migrated.pop("alias_purpose", None)
+        migrated.update({
+            "trade_date": td,
+            "file_date": td,
+            "session_open_date_kst": session_open_kst,
+            "session_close_date_kst": session_close_kst,
+            "session_close_date": session_close_kst,
+            "canonical": True,
+            "legacy_alias": False,
+            "migrated_from": src.name,
+            "migrated_at_kst": datetime.now(KST).isoformat(),
+        })
+        action = {
+            "action": "copy" if apply else "would_copy",
+            "type": snap_type,
+            "trade_date": td,
+            "source": str(src),
+            "dest": str(dest),
+        }
+        if apply:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            tmp = dest.with_suffix(".tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(migrated, f, ensure_ascii=False, indent=2)
+            tmp.replace(dest)
+        actions.append(action)
+        logger.info(
+            "[MIGRATE_DAILY_BALANCE] %s type=%s trade_date=%s %s → %s",
+            action["action"],
+            snap_type,
+            td,
+            src.name,
+            dest.name,
+        )
+
+    result = {"dry_run": not apply, "actions": actions}
+    logger.info(
+        "[MIGRATE_DAILY_BALANCE] %s: %d개 대상 (copy=%d, skip=%d) — legacy 파일 삭제 없음",
+        "dry-run" if not apply else "apply",
+        len(actions),
+        sum(1 for a in actions if a["action"] in ("copy", "would_copy")),
+        sum(1 for a in actions if a["action"] == "skip_exists"),
+    )
+    return result
+
 
 def load_balance_snapshot(date: str, snapshot_type: str) -> Optional[Dict]:
     """저장된 잔액 스냅샷 로드"""
@@ -903,10 +1227,23 @@ def compare_balances(open_balance: Dict, close_balance: Dict) -> Dict:
             cm = _kis_metrics_from_snapshot(close_balance)
             open_total = om["tot_evlu_amt_krw"]
             close_total = cm["tot_evlu_amt_krw"]
-            open_cash = float(om["ord_psbl_frcr_amt"])
-            close_cash = float(cm["ord_psbl_frcr_amt"])
-            _, _, open_hv = _portfolio_totals_from_snapshot(open_balance)
-            _, _, close_hv = _portfolio_totals_from_snapshot(close_balance)
+
+            # USD 값은 동일 단위끼리만 비교: 명시적 *_usd 필드 우선, KIS metric 폴백
+            def _usd_cash(snap: Dict, metrics: Dict) -> float:
+                if snap.get("available_cash_usd") is not None:
+                    return _parse_float_amount(snap.get("available_cash_usd"))
+                return float(metrics["ord_psbl_frcr_amt"])
+
+            def _usd_hv(snap: Dict) -> float:
+                if snap.get("holdings_value_usd") is not None:
+                    return _parse_float_amount(snap.get("holdings_value_usd"))
+                _, _, hv = _portfolio_totals_from_snapshot(snap)
+                return hv
+
+            open_cash = _usd_cash(open_balance, om)
+            close_cash = _usd_cash(close_balance, cm)
+            open_hv = _usd_hv(open_balance)
+            close_hv = _usd_hv(close_balance)
 
             open_usd_total = _usd_portfolio_total(open_cash, open_hv)
             close_usd_total = _usd_portfolio_total(close_cash, close_hv)
@@ -946,8 +1283,10 @@ def compare_balances(open_balance: Dict, close_balance: Dict) -> Dict:
             daily_return_pct = (total_change / open_total) * 100 if open_total > 0 else 0
         
         # 보유종목 변화 분석
-        open_tickers = {h["ticker"] for h in open_balance["holdings_detail"]}
-        close_tickers = {h["ticker"] for h in close_balance["holdings_detail"]}
+        open_detail = open_balance.get("holdings_detail") or []
+        close_detail = close_balance.get("holdings_detail") or []
+        open_tickers = {h["ticker"] for h in open_detail}
+        close_tickers = {h["ticker"] for h in close_detail}
         
         sold_tickers = open_tickers - close_tickers
         bought_tickers = close_tickers - open_tickers
@@ -1023,6 +1362,74 @@ def compare_balances(open_balance: Dict, close_balance: Dict) -> Dict:
         logger.debug("잔액 비교 분석 상세 오류:", exc_info=True)
         return {}
 
+def _resolve_usd_comparison_values(snap: Dict) -> Tuple[Optional[Dict], Optional[str]]:
+    """
+    US 일일 요약 비교용 USD 자산값 — (values, error_reason).
+
+    - 신규 스냅샷: 명시적 total_asset_usd / available_cash_usd / holdings_value_usd 사용
+    - legacy 스냅샷: cash+holdings_value 합과 total_balance 정합성 검사 후 USD로 간주
+    - total_balance가 cash+holdings 대비 크게 어긋나면(통화 혼합 의심) ambiguous 처리
+    """
+    total_usd = snap.get("total_asset_usd")
+    if total_usd is not None:
+        cash_usd = _parse_float_amount(snap.get("available_cash_usd"))
+        hv_usd = _parse_float_amount(snap.get("holdings_value_usd"))
+        return (
+            {
+                "total": _parse_float_amount(total_usd),
+                "cash": cash_usd,
+                "hv": hv_usd,
+                "semantics": "explicit_usd",
+            },
+            None,
+        )
+
+    total = _parse_float_amount(snap.get("total_balance"))
+    cash = _parse_float_amount(snap.get("cash"))
+    hv = _parse_float_amount(snap.get("holdings_value"))
+    computed = round(cash + hv, 2)
+    if computed <= 0 and total <= 0:
+        return None, "no_asset_values"
+    if total > 0 and computed > 0 and (total > computed * 3 or computed > total * 3):
+        return (
+            None,
+            f"ambiguous_total_balance total_balance={total} cash+holdings={computed} "
+            "(통화 혼합 의심 — USD/KRW 명시 필드 없음)",
+        )
+    return (
+        {
+            "total": computed if computed > 0 else total,
+            "cash": cash,
+            "hv": hv,
+            "semantics": "legacy_assumed_usd",
+        },
+        None,
+    )
+
+
+def _close_capture_evidence_exists(session_close_date_kst: str) -> bool:
+    """balance_close 캡처가 해당 KST 날짜에 실행된 흔적(생성 timestamp) 확인."""
+    paths: List[Path] = []
+    if _canonical_balance_dir().is_dir():
+        paths.extend(sorted(_canonical_balance_dir().glob("balance_close_trade_*.json")))
+    paths.extend(sorted(BALANCE_STORAGE_PATH.glob("balance_close_*.json")))
+    for p in paths:
+        pl = _load_balance_json(p)
+        if not pl:
+            continue
+        gen = str(pl.get("generated_at_kst") or pl.get("timestamp") or "")
+        if gen[:10].replace("-", "") == session_close_date_kst:
+            return True
+    return False
+
+
+def _fmt_date_dash(yyyymmdd: str) -> str:
+    s = str(yyyymmdd or "")
+    if len(s) == 8:
+        return f"{s[:4]}-{s[4:6]}-{s[6:]}"
+    return s
+
+
 def _fmt_usd_cash_detail(metrics: Dict, prefix: str = "") -> str:
     """KIS 예수금 세분화 (close 스냅샷 기준 1줄 요약)."""
     if not metrics:
@@ -1048,40 +1455,160 @@ def _fmt_usd_cash_detail(metrics: Dict, prefix: str = "") -> str:
     return f"{prefix}{line}" if line else ""
 
 
-def send_daily_trading_summary():
-    """장종료시 당일 매매 내역을 디스코드로 전송"""
+def send_daily_trading_summary(target_trade_date: Optional[str] = None):
+    """장종료 후 당일 매매 요약 전송.
+
+    open/close pairing은 metadata.trade_date 기준(파일명 날짜 연산 금지).
+    상태: CLOSE_SNAPSHOT_PRESENT / CLOSE_SNAPSHOT_MISSING /
+          CLOSE_CAPTURE_SCHEDULE_MISSED / OPEN_SNAPSHOT_UNAVAILABLE /
+          DAILY_BALANCE_PAIR_TRADE_DATE_MISMATCH / DAILY_BALANCE_CURRENCY_MISMATCH
+    """
     try:
-        today = datetime.now(KST).strftime("%Y%m%d")
-        open_balance, close_balance, open_date = load_daily_balance_pair(today)
+        # 1) 공통 session identity — capture와 동일한 날짜 계산
+        identity = resolve_market_session_identity(
+            MARKET, explicit_trade_date=target_trade_date
+        )
+        trade_date = identity["trade_date"]
+        session_close_kst = identity["session_close_date_kst"]
+        logger.info(
+            "[DAILY_SUMMARY_SESSION] market=%s trade_date=%s "
+            "session_open_date_kst=%s session_close_date_kst=%s source=%s",
+            MARKET,
+            trade_date,
+            identity["session_open_date_kst"],
+            session_close_kst,
+            identity["resolution_source"],
+        )
+
+        # 2) metadata 기준 open/close pair 조회
+        pair = load_daily_balance_pair(trade_date)
+        open_balance = pair["open"]
+        close_balance = pair["close"]
         late_close_capture = False
 
-        if not close_balance:
-            logger.warning(
-                "%s 장종료 스냅샷 없음 → account 즉시 캡처 시도 (06:00 스케줄 누락·컨테이너 중단 가능)",
-                today,
+        # 3) close 스냅샷 상태 판정 — 존재하면 즉시 사용, capture 재시도 금지
+        if close_balance is not None:
+            logger.info(
+                "CLOSE_SNAPSHOT_PRESENT trade_date=%s file=%s resolution=%s",
+                trade_date,
+                pair["close_path"],
+                pair["close_resolution"],
             )
-            if capture_balance_snapshot("close"):
-                late_close_capture = True
-                open_balance, close_balance, open_date = load_daily_balance_pair(today)
+        else:
+            logger.warning(
+                "CLOSE_SNAPSHOT_MISSING trade_date=%s → recovery capture 시도",
+                trade_date,
+            )
+            cap = capture_balance_snapshot("close", trade_date=trade_date)
+            if cap.get("status") in ("existing_valid", "created") and cap.get("path"):
+                late_close_capture = cap["status"] == "created"
+                # 반환된 path를 재로드한다 — KST 날짜로 다른 파일을 다시 찾지 않는다
+                close_balance = _load_balance_json(Path(cap["path"]))
+                pair["close"] = close_balance
+                pair["close_path"] = Path(cap["path"])
+                pair["close_resolution"] = cap.get("resolution") or "recovered"
+            else:
+                # 스케줄 누락은 06:00 실행 evidence까지 없을 때만
+                if not _close_capture_evidence_exists(session_close_kst):
+                    logger.error(
+                        "CLOSE_CAPTURE_SCHEDULE_MISSED trade_date=%s "
+                        "(close 스냅샷 없음 + recovery 실패 + %s 실행 evidence 없음)",
+                        trade_date,
+                        session_close_kst,
+                    )
+                else:
+                    logger.error(
+                        "CLOSE_SNAPSHOT_MISSING trade_date=%s (recovery 실패, "
+                        "close 캡처 evidence는 존재 — 스케줄 누락 아님)",
+                        trade_date,
+                    )
 
         if not close_balance:
             _notify(
-                f"⚠️ {today} 일일 요약: 장종료 스냅샷 없음 "
-                f"({BALANCE_STORAGE_PATH}/balance_close_{today}.json). "
-                f"`docker compose exec integrated_manager python /app/run_integrated_manager.py --capture-close` 실행 후 재시도.",
+                f"⚠️ trade_date={trade_date} 일일 요약: 장종료 스냅샷 없음. "
+                f"`python /app/run_integrated_manager.py --capture-close --trade-date {trade_date}` 실행 후 "
+                f"`--send-summary --trade-date {trade_date}` 재시도.",
                 key="daily_summary_error",
             )
             return
+
+        # 4) open 스냅샷 — 과거 open은 현재 계좌로 재생성하지 않는다
         if not open_balance:
-            tried = ", ".join(_iter_open_snapshot_dates(today)[:5])
+            logger.error(
+                "OPEN_SNAPSHOT_UNAVAILABLE trade_date=%s — "
+                "현재 계좌 상태로 과거 open 재생성 금지",
+                trade_date,
+            )
             _notify(
-                f"⚠️ {today} 일일 요약: 장시작 스냅샷 없음 "
-                f"(balance_open_*.json, balance_open_time 캡처 확인 / 후보: {tried})",
+                f"⚠️ trade_date={trade_date} 일일 요약: 장시작 스냅샷 없음 "
+                f"(metadata.trade_date={trade_date}, type=open 인 daily balance 없음). "
+                "과거 open은 재생성하지 않습니다 (OPEN_SNAPSHOT_UNAVAILABLE).",
                 key="daily_summary_error",
             )
             return
-        
-        # 잔액 비교 분석
+
+        # 5) 같은 trade_date pair 검증 — 불일치 시 손익 계산 중단
+        pair_errors = _validate_balance_pair(
+            open_balance, close_balance, trade_date, pair["open_path"], pair["close_path"]
+        )
+        if pair_errors:
+            logger.error(
+                "DAILY_BALANCE_PAIR_TRADE_DATE_MISMATCH trade_date=%s: %s",
+                trade_date,
+                "; ".join(pair_errors),
+            )
+            _notify(
+                f"❌ trade_date={trade_date} 일일 요약 중단: open/close trade_date 불일치 "
+                f"({'; '.join(pair_errors)})",
+                key="daily_summary_error",
+            )
+            return
+
+        open_file_name = pair["open_path"].name if pair["open_path"] else None
+        close_file_name = pair["close_path"].name if pair["close_path"] else None
+        if close_balance.get("legacy_alias") is True or pair["close_resolution"] in (
+            "legacy_metadata",
+        ):
+            logger.info(
+                "CLOSE_SNAPSHOT_LEGACY_FALLBACK_USED trade_date=%s file=%s "
+                "legacy_alias=%s",
+                trade_date,
+                close_file_name,
+                close_balance.get("legacy_alias"),
+            )
+        logger.info(
+            "[DAILY_BALANCE_PAIR] trade_date=%s open=%s open_trade_date=%s "
+            "close=%s close_trade_date=%s legacy_open=%s canonical_close=%s",
+            trade_date,
+            pair["open_path"],
+            _snapshot_trade_date(open_balance, pair["open_path"]),
+            pair["close_path"],
+            _snapshot_trade_date(close_balance, pair["close_path"]),
+            open_balance.get("legacy_alias") is True,
+            close_balance.get("canonical") is True,
+        )
+
+        # 6) 동일 통화 기준 자산값 검증 (US: USD끼리만 비교)
+        if is_us_market(MARKET):
+            open_ccy, open_ccy_err = _resolve_usd_comparison_values(open_balance)
+            close_ccy, close_ccy_err = _resolve_usd_comparison_values(close_balance)
+            if open_ccy_err or close_ccy_err:
+                logger.error(
+                    "DAILY_BALANCE_CURRENCY_MISMATCH trade_date=%s open=%s close=%s "
+                    "— 증감·수익률·손익 계산 생략",
+                    trade_date,
+                    open_ccy_err,
+                    close_ccy_err,
+                )
+                _notify(
+                    f"❌ trade_date={trade_date} 일일 요약 중단 (DAILY_BALANCE_CURRENCY_MISMATCH): "
+                    f"open={open_ccy_err or 'ok'} / close={close_ccy_err or 'ok'} — "
+                    "단위 불명확한 total_balance로 수익률을 계산하지 않습니다.",
+                    key="daily_summary_error",
+                )
+                return
+
+        # 7) 잔액 비교 분석
         comparison = compare_balances(open_balance, close_balance)
         
         # 디스코드 임베드 생성
@@ -1258,18 +1785,25 @@ def send_daily_trading_summary():
                 "inline": False
             })
         
-        # 임베드 전송
-        session_note = (
-            f"open_{open_date} → close_{today}"
-            if open_date and open_date != today
-            else today
+        # 임베드 전송 — 미국 거래일과 KST 종료일을 명확히 구분해 표시
+        if is_us_market(MARKET):
+            title = f"📊 {_fmt_date_dash(trade_date)} 당일 매매 성과 (미국 거래일)"
+            session_line = (
+                f"🇺🇸 미국 거래일: {_fmt_date_dash(trade_date)} | "
+                f"🇰🇷 한국 기준 종료일: {_fmt_date_dash(session_close_kst)}"
+            )
+        else:
+            title = f"📊 {_fmt_date_dash(trade_date)} 당일 매매 성과"
+            session_line = f"거래일: {_fmt_date_dash(trade_date)}"
+        desc = (
+            f"{session_line}\n"
+            f"⏰ {open_balance['timestamp'][:19]} → {close_balance['timestamp'][:19]}"
         )
-        desc = f"⏰ {open_balance['timestamp'][:19]} → {close_balance['timestamp'][:19]}"
         if late_close_capture:
-            desc += " | ⚠️ close는 요약 시점 즉시 캡처(06:00 스냅샷 누락)"
+            desc += "\n⚠️ close는 요약 시점 recovery 캡처"
         embed = {
             "type": "rich",
-            "title": f"📊 {today} 당일 매매 성과 ({session_note})",
+            "title": title,
             "description": desc,
             "fields": fields,
             "color": (
@@ -1279,16 +1813,43 @@ def send_daily_trading_summary():
             ),
             "footer": {
                 "text": (
-                    f"보유종목: open {open_balance['holdings_count']}개 → "
-                    f"close {close_balance['holdings_count']}개"
+                    f"보유종목: open {open_balance.get('holdings_count', 0)}개 → "
+                    f"close {close_balance.get('holdings_count', 0)}개 | "
+                    f"open={open_file_name} close={close_file_name}"
                 )
             },
         }
-        
+
+        # summary metadata — 날짜 관계·선택된 스냅샷 기록
+        summary_meta = {
+            "trade_date": trade_date,
+            "session_open_date_kst": identity["session_open_date_kst"],
+            "session_close_date_kst": session_close_kst,
+            "open_snapshot_file": open_file_name,
+            "close_snapshot_file": close_file_name,
+            "open_snapshot_legacy_alias": open_balance.get("legacy_alias") is True,
+            "close_snapshot_canonical": close_balance.get("canonical") is True,
+            "open_resolution": pair["open_resolution"],
+            "close_resolution": pair["close_resolution"],
+            "late_close_capture": late_close_capture,
+            "generated_at_kst": datetime.now(KST).isoformat(),
+        }
+        try:
+            meta_path = BALANCE_STORAGE_PATH / f"daily_summary_meta_{trade_date}.json"
+            meta_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(meta_path, "w", encoding="utf-8") as f:
+                json.dump(summary_meta, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.warning("daily summary metadata 저장 실패: %s", e)
+
         if WEBHOOK_URL and is_valid_webhook(WEBHOOK_URL):
             send_discord_message(embeds=[embed])
-            logger.info(f"일일 매매 요약 전송 완료: {today}")
-        
+            logger.info(
+                "일일 매매 요약 전송 완료: trade_date=%s (KST 종료일 %s)",
+                trade_date,
+                session_close_kst,
+            )
+
     except Exception as e:
         logger.error(f"일일 매매 요약 전송 실패: {type(e).__name__}: {str(e)}")
         logger.debug("일일 매매 요약 전송 상세 오류:", exc_info=True)
@@ -1923,6 +2484,18 @@ if __name__ == "__main__":
         default="both",
         help="--rebuild-daily-balance 대상",
     )
+    parser.add_argument(
+        "--trade-date",
+        default=None,
+        help="대상 미국 거래일 YYYYMMDD (capture/send-summary/migration)",
+    )
+    parser.add_argument(
+        "--migrate-daily-balance-layout",
+        action="store_true",
+        help="legacy daily balance를 metadata 기준 canonical 레이아웃으로 복사",
+    )
+    parser.add_argument("--dry-run", action="store_true", help="migration 미리보기")
+    parser.add_argument("--apply", action="store_true", help="migration 실제 적용")
     args = parser.parse_args()
     
     print(f"인수 파싱 완료: {args}")
@@ -1930,16 +2503,21 @@ if __name__ == "__main__":
     # 백그라운드 RiskManager 인스턴스
     background_risk_manager = None
     
-    if args.rebuild_daily_balance:
+    if args.migrate_daily_balance_layout:
+        migrate_daily_balance_layout(
+            trade_date=args.trade_date,
+            apply=bool(args.apply and not args.dry_run),
+        )
+    elif args.rebuild_daily_balance:
         types = ["open", "close"] if args.rebuild_type == "both" else [args.rebuild_type]
         for t in types:
-            capture_balance_snapshot(t, rebuild=True)
+            capture_balance_snapshot(t, rebuild=True, trade_date=args.trade_date)
     elif args.capture_open:
-        capture_balance_snapshot("open")
+        capture_balance_snapshot("open", trade_date=args.trade_date)
     elif args.capture_close:
-        capture_balance_snapshot("close")
+        capture_balance_snapshot("close", trade_date=args.trade_date)
     elif args.send_summary:
-        send_daily_trading_summary()
+        send_daily_trading_summary(target_trade_date=args.trade_date)
     elif args.once:
         # 단발 실행
         logger.info("통합 매니저 단발 실행")

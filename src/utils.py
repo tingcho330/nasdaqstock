@@ -36,6 +36,7 @@ __all__ = [
     "next_session_open_kst",
     "resolve_pipeline_context",
     "resolve_market_trade_date",
+    "resolve_market_session_identity",
     "format_pipeline_artifact",
     "pipeline_artifact_path",
     "parse_pipeline_artifact_stem",
@@ -636,6 +637,69 @@ def resolve_market_trade_date(
         "stale_context_detected": stale_context_detected,
         "fallback_reason": fallback_reason,
         "market": m,
+    }
+
+
+def resolve_market_session_identity(
+    market: Optional[str] = None,
+    now_kst: Optional[datetime] = None,
+    explicit_trade_date: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    공통 US/KR 세션 identity.
+
+    capture-open / capture-close / send-summary 가 각자 날짜를 계산하지 않고
+    동일한 (trade_date, session_open_date_kst, session_close_date_kst)를 쓰기 위한
+    단일 소스.
+
+    US 예 — 2026-07-16 06:15 KST 실행:
+      trade_date              = 20260715  (ET 거래일)
+      session_open_date_kst   = 20260715  (개장 22:30/23:30 KST 달력일)
+      session_close_date_kst  = 20260716  (마감 05:00/06:00 KST 달력일 = trade_date+1)
+    KR: 세 날짜 모두 동일.
+
+    explicit_trade_date가 주어지면 그대로 사용한다(과거 세션 재처리용).
+    """
+    m = (market or os.getenv("MARKET", "KOSPI")).upper().strip()
+    if now_kst is None:
+        now_kst = datetime.now(KST)
+    elif now_kst.tzinfo is None:
+        now_kst = now_kst.replace(tzinfo=KST)
+    else:
+        now_kst = now_kst.astimezone(KST)
+    now_et = now_kst.astimezone(_ET)
+
+    explicit = str(explicit_trade_date or "").strip()
+    if explicit and not re.fullmatch(r"\d{8}", explicit):
+        raise ValueError(f"trade_date must be YYYYMMDD: {explicit!r}")
+
+    live_info = resolve_market_trade_date(m, now_kst, mode="live")
+    live_td = live_info["resolved_trade_date"]
+    if explicit and explicit != live_td:
+        trade_date = explicit
+        resolution_source = "explicit_trade_date"
+    else:
+        trade_date = explicit or live_td
+        resolution_source = "market_calendar"
+
+    d = datetime.strptime(trade_date, "%Y%m%d").date()
+    if is_us_market(m):
+        session_open_date_kst = trade_date
+        session_close_date_kst = (d + timedelta(days=1)).strftime("%Y%m%d")
+    else:
+        session_open_date_kst = trade_date
+        session_close_date_kst = trade_date
+
+    return {
+        "market": m,
+        "trade_date": trade_date,
+        "session_open_date_kst": session_open_date_kst,
+        "session_close_date_kst": session_close_date_kst,
+        "now_kst": now_kst.isoformat(),
+        "now_et": now_et.isoformat(),
+        "live_trade_date": live_td,
+        "is_live_trade_date": trade_date == live_td,
+        "resolution_source": resolution_source,
     }
 
 

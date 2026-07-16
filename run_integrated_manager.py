@@ -54,14 +54,31 @@ if __name__ == "__main__":
     parser.add_argument("--capture-close", action="store_true", help="장종료 잔액 캡처")
     parser.add_argument("--send-summary", action="store_true", help="일일 요약 전송")
     parser.add_argument("--no-background-risk", action="store_true", help="백그라운드 RiskManager 비활성화")
+    parser.add_argument(
+        "--trade-date",
+        default=None,
+        help="대상 미국 거래일 YYYYMMDD (capture/send-summary/migration)",
+    )
+    parser.add_argument(
+        "--migrate-daily-balance-layout",
+        action="store_true",
+        help="legacy daily balance를 metadata 기준 canonical 레이아웃으로 복사 (legacy 파일 삭제 없음)",
+    )
+    parser.add_argument("--dry-run", action="store_true", help="migration 미리보기 (파일 변경 없음)")
+    parser.add_argument("--apply", action="store_true", help="migration 실제 적용")
     args = parser.parse_args()
     
-    if args.capture_open:
-        integrated_manager.capture_balance_snapshot("open")
+    if args.migrate_daily_balance_layout:
+        integrated_manager.migrate_daily_balance_layout(
+            trade_date=args.trade_date,
+            apply=bool(args.apply and not args.dry_run),
+        )
+    elif args.capture_open:
+        integrated_manager.capture_balance_snapshot("open", trade_date=args.trade_date)
     elif args.capture_close:
-        integrated_manager.capture_balance_snapshot("close")
+        integrated_manager.capture_balance_snapshot("close", trade_date=args.trade_date)
     elif args.send_summary:
-        integrated_manager.send_daily_trading_summary()
+        integrated_manager.send_daily_trading_summary(target_trade_date=args.trade_date)
     elif args.once:
         # 단발 실행
         print("통합 매니저 단발 실행")
