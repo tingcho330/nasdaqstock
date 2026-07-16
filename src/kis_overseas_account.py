@@ -577,7 +577,33 @@ def load_kis_account_snapshot(
             2,
         )
         kis_usd_total = _f(summary.get("tot_evlu_amt_usd"))
+        available_cash_krw = round(_f(summary.get("available_cash_krw")), 2)
+        total_asset_krw = round(_f(summary.get("tot_evlu_amt_krw")), 2)
+        holdings_value_krw = round(_f(summary.get("holdings_value_krw")), 2)
+        krw_cash = round(_f(summary.get("krw_cash")), 2)
         computed_total_usd = round(available_cash_usd + holdings_value_usd, 2)
+
+        # Reject KRW-polluted tot_evlu_amt_usd (e.g. 829469 == available_cash_krw)
+        polluted = False
+        if kis_usd_total > 0:
+            if available_cash_krw > 0 and abs(kis_usd_total - available_cash_krw) < 1.0:
+                polluted = True
+            elif krw_cash > 0 and abs(kis_usd_total - krw_cash) < 1.0:
+                polluted = True
+            elif total_asset_krw > 0 and abs(kis_usd_total - total_asset_krw) < 1.0:
+                polluted = True
+            elif computed_total_usd > 0 and kis_usd_total > computed_total_usd * 3:
+                polluted = True
+        if polluted:
+            logger.warning(
+                "LEGACY_USD_FIELD_POLLUTED_BY_KRW: tot_evlu_amt_usd=%s ignored "
+                "(available_cash_krw=%s computed_usd=%s)",
+                kis_usd_total,
+                available_cash_krw,
+                computed_total_usd,
+            )
+            kis_usd_total = 0.0
+
         if kis_usd_total > 0:
             denom = max(computed_total_usd, 1.0)
             if abs(kis_usd_total - computed_total_usd) / denom <= 0.25:
@@ -587,17 +613,13 @@ def load_kis_account_snapshot(
         else:
             total_asset_usd = computed_total_usd
 
-        available_cash_krw = round(_f(summary.get("available_cash_krw")), 2)
-        total_asset_krw = round(_f(summary.get("tot_evlu_amt_krw")), 2)
-        holdings_value_krw = round(_f(summary.get("holdings_value_krw")), 2)
-        krw_cash = round(_f(summary.get("krw_cash")), 2)
-
         cash_map: Dict[str, Any] = {
             "currency": "USD",
             "available_cash": int(round(available_cash_usd)),
             "dnca_tot_amt": _i(summary.get("dnca_tot_amt")),
             "ord_psbl_frcr_amt": _i(summary.get("ord_psbl_frcr_amt")),
             "prvs_rcdl_excc_amt": _i(summary.get("prvs_rcdl_excc_amt")),
+            # tot_evlu_amt_usd stores authoritative computed total (not polluted KRW)
             "tot_evlu_amt_usd": int(round(total_asset_usd)),
             "available_cash_usd": available_cash_usd,
             "holdings_value_usd": holdings_value_usd,
@@ -607,6 +629,12 @@ def load_kis_account_snapshot(
             "total_asset_krw": total_asset_krw,
             "holdings_value_krw": holdings_value_krw,
             "krw_cash": krw_cash,
+            # funding capacity (NOT asset cash) — keep for display only
+            "usd_cash_total": _f(summary.get("usd_cash_total")),
+            "usd_withdrawable": _f(summary.get("usd_withdrawable")),
+            "usd_buy_margin": _f(summary.get("usd_buy_margin")),
+            "usd_sell_reuse": _f(summary.get("usd_sell_reuse")),
+            "bass_exrt": _f(summary.get("bass_exrt")),
         }
         cash_map["tot_evlu_amt"] = int(round(total_asset_usd))
 

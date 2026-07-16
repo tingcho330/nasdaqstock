@@ -21,11 +21,12 @@ from typing import Tuple, Dict, Any, List
 
 import pandas as pd
 
-from utils import setup_logging, OUTPUT_DIR, KST, is_us_market, fmt_money
+from utils import setup_logging, OUTPUT_DIR, KST, is_us_market, fmt_money, resolve_pipeline_context
 from kis_overseas_account import inquire_overseas_account
 from settings import settings
 from api.kis_auth import KIS
 from notifier import DiscordLogHandler, WEBHOOK_URL, send_discord_message
+import shutil
 
 # ───────── 로깅 ─────────
 setup_logging()
@@ -78,12 +79,12 @@ def build_summary_comments(us_mode: bool = False) -> dict:
             "frcr_buy_amt": "외화 매수 가능/예수금",
             "available_cash": "주문 가능 현금 (USD)",
             "available_cash_krw": "주문 가능 현금 (원화 환산, 표시용)",
-            "tot_evlu_amt_usd": "총 평가(USD, 가능 시)",
+            "tot_evlu_amt_usd": "총 평가(USD, 가능 시) — KRW alias 오염 시 사용 금지",
             "tot_evlu_amt_krw": "총 평가(원화 환산, 표시용)",
-            "usd_cash_total": "외화예수금 (USD, CTRP6504R output2)",
+            "usd_cash_total": "DEPRECATED 외화자금여력(USD)=출금가능+매수증거금 — 자산평가 금지",
             "usd_withdrawable": "외화 출금가능 (USD)",
             "usd_sell_reuse": "매도재사용금 (USD)",
-            "usd_buy_margin": "매수증거금 (USD)",
+            "usd_buy_margin": "매수증거금 (USD) — buying power, 자산현금 아님",
             "krw_cash": "원화예수금 (KRW)",
             "bass_exrt": "적용환율 (원/USD)",
             "ovrs_rlzt_pfls_amt": "해외 실현손익 (USD, TTTS3012R output2)",
@@ -244,7 +245,22 @@ def _make_empty_summary_df() -> pd.DataFrame:
 if __name__ == "__main__":
     try:
         today = get_today_tag()
-        _notify(f"계좌 조회 시작 (date={today})")
+        market = os.getenv("MARKET", "SP500")
+        us_mode_pre = is_us_market(market)
+        # US: live trade_date (ET session). KR: KST calendar tag.
+        if us_mode_pre:
+            try:
+                ctx = resolve_pipeline_context(market=market, mode="live")
+                trade_date = ctx.get("trade_date") or today
+                session = ctx.get("session") or "pm"
+            except Exception:
+                trade_date = today
+                session = "pm"
+        else:
+            trade_date = today
+            session = None
+
+        _notify(f"계좌 조회 시작 (date={today} trade_date={trade_date})")
 
         trading_env = settings._config.get("trading_environment", "prod")
         # kis_broker 설정이 없으면 빈 딕셔너리로 전달하여 yaml 파일 사용
@@ -258,8 +274,7 @@ if __name__ == "__main__":
         if not getattr(kis, "auth_token", None):
             raise ConnectionError("KIS API 인증 실패")
 
-        market = os.getenv("MARKET", "SP500")
-        us_mode = is_us_market(market)
+        us_mode = us_mode_pre
         logger.info(
             "'%s' 모드, MARKET=%s — 계좌 잔고 조회 (%s)",
             trading_env,
@@ -281,9 +296,12 @@ if __name__ == "__main__":
             summary_dict = None
 
         # 저장 경로
+        # - balance_{trade_date}.json : legacy latest-by-trade-date (덮어쓰기 가능)
+        # - balance_{market}_{trade_date}_{session}_{ts}.json : immutable session evidence
+        # - balance_latest_{market}.json : latest pointer
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-        balance_file = OUTPUT_DIR / f"balance_{today}.json"
-        summary_file = OUTPUT_DIR / f"summary_{today}.json"
+        balance_file = OUTPUT_DIR / f"balance_{trade_date}.json"
+        summary_file = OUTPUT_DIR / f"summary_{trade_date}.json"
 
         # ── degraded 보호 로직 ──
         existing_status = _load_status(summary_file)
@@ -326,14 +344,15 @@ if __name__ == "__main__":
         recs = df_summary.to_dict("records")
         pprint.pprint(recs[0] if recs else {})
 
-        # 저장(덮어쓰기) - 정상
+        # 저장 — legacy latest-by-trade-date + immutable versioned + latest pointer
         generated_at = datetime.now(KST).isoformat()
         bal_meta = {
             "status": "ok",
-            "trade_date": today,
+            "trade_date": trade_date,
             "generated_at_kst": generated_at,
             "source": "kis_account",
             "market": market,
+            "session": session,
             "valid": True,
             "holdings_source": "kis_inquire_balance" if not us_mode else "kis_overseas_balance",
             "cash_source": "kis_inquire_balance" if not us_mode else "kis_present_balance",
@@ -346,6 +365,21 @@ if __name__ == "__main__":
             df_summary,
             extra_fields=sum_extra,
         )
+
+        # Immutable versioned balance (never overwrite existing timestamped file)
+        try:
+            from daily_balance_values import versioned_balance_filename
+            sess = session or "live"
+            ver_name = versioned_balance_filename(market, trade_date, sess, generated_at)
+            ver_path = OUTPUT_DIR / "account_balance_sessions" / ver_name
+            ver_path.parent.mkdir(parents=True, exist_ok=True)
+            if not ver_path.exists():
+                shutil.copy2(balance_file, ver_path)
+                logger.info("immutable account balance evidence: %s", ver_path)
+            latest_ptr = OUTPUT_DIR / f"balance_latest_{market}.json"
+            shutil.copy2(balance_file, latest_ptr)
+        except Exception as e:
+            logger.warning("versioned balance copy skipped: %s", e)
 
         # 저장된 JSON 재파싱
         _, cash_d2, cash_tot, tot_eval, nxdy_excc = _extract_summary_fields_from_saved_json(summary_file)

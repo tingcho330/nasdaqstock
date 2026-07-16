@@ -118,7 +118,11 @@ def make_snap(
             "total_asset_usd": round(cash + hv, 2),
             "available_cash_usd": cash,
             "holdings_value_usd": hv,
-            "value_semantics": "usd_cash_plus_holdings",
+            "value_semantics": "base_currency_account_value",
+            "financial_values_valid": True,
+            "return_calculation_usable": True,
+            "currency_status": "normalized",
+            "usd_components_consistent": True,
         })
     return snap
 
@@ -380,19 +384,34 @@ class TestDailySummary:
         assert "+10.00%" in usd_field["value"]  # (1650-1500)/1500
 
     def test_summary_currency_mismatch_aborts(self, balance_dir, discord, caplog):
-        """테스트 13: ambiguous total_balance(통화 혼합 의심) → 계산 생략."""
-        # 운영 로그의 open_20260716: total_balance=829469, cash=2120, hv=955.87
-        write_legacy(
-            balance_dir, CLOSE_KST,
-            make_snap("open", TD, canonical=False, legacy_alias=True, alias_of=TD,
-                      explicit_usd=False, cash=2120.0, hv=955.87,
-                      total_balance=829469.0),
+        """ambiguous/polluted without reconstructable embedded → PARTIAL (no USD return)."""
+        open_snap = make_snap(
+            "open", TD, canonical=False, legacy_alias=True, alias_of=TD,
+            explicit_usd=False, cash=2120.0, hv=0.0, total_balance=829469.0,
         )
+        open_snap["kis_summary"] = {
+            "usd_cash_total": 2120.48,
+            "usd_buy_margin": 1564.61,
+            "tot_evlu_amt_usd": 829469.0,
+            "available_cash_krw": 829469,
+            "krw_cash": 1189783,
+            "tot_evlu_amt_krw": 4347907,
+            "bass_exrt": 1492.2,
+            "currency": "USD",
+            # deliberately omit usable ord_psbl / holdings
+        }
+        open_snap["holdings_detail"] = []
+        open_snap["holdings_value"] = 0
+        open_snap["available_cash_krw"] = 829469
+        write_legacy(balance_dir, CLOSE_KST, open_snap)
         write_legacy(balance_dir, TD, make_snap("close", TD, cash=556.0, hv=1131.74))
         with caplog.at_level("ERROR", logger="IntegratedManager"):
             im.send_daily_trading_summary(target_trade_date=TD)
-        assert discord["embeds"] == []
         assert "DAILY_BALANCE_CURRENCY_MISMATCH" in caplog.text
+        assert len(discord["embeds"]) == 1
+        assert "PARTIAL" in discord["embeds"][0]["title"]
+        for f in discord["embeds"][0]["fields"]:
+            assert "일일 수익률 (USD)" not in f["name"]
 
     def test_summary_pair_mismatch_aborts(self, balance_dir, discord, caplog, monkeypatch):
         """테스트 5: open/close trade_date 불일치 시 요약 중단."""

@@ -64,11 +64,30 @@ if __name__ == "__main__":
         action="store_true",
         help="legacy daily balance를 metadata 기준 canonical 레이아웃으로 복사 (legacy 파일 삭제 없음)",
     )
-    parser.add_argument("--dry-run", action="store_true", help="migration 미리보기 (파일 변경 없음)")
-    parser.add_argument("--apply", action="store_true", help="migration 실제 적용")
+    parser.add_argument(
+        "--repair-daily-balance-currency",
+        action="store_true",
+        help="embedded evidence로 daily balance USD/KRW 필드 보정",
+    )
+    parser.add_argument(
+        "--snapshot-type",
+        choices=["open", "close"],
+        default="open",
+        help="--repair-daily-balance-currency 대상",
+    )
+    parser.add_argument("--dry-run", action="store_true", help="migration/repair 미리보기 (파일 변경 없음)")
+    parser.add_argument("--apply", action="store_true", help="migration/repair 실제 적용")
     args = parser.parse_args()
     
-    if args.migrate_daily_balance_layout:
+    if args.repair_daily_balance_currency:
+        if not args.trade_date:
+            raise SystemExit("--repair-daily-balance-currency requires --trade-date YYYYMMDD")
+        integrated_manager.repair_daily_balance_currency(
+            args.trade_date,
+            snapshot_type=args.snapshot_type,
+            apply=bool(args.apply and not args.dry_run),
+        )
+    elif args.migrate_daily_balance_layout:
         integrated_manager.migrate_daily_balance_layout(
             trade_date=args.trade_date,
             apply=bool(args.apply and not args.dry_run),
