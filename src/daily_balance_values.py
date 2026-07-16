@@ -317,8 +317,10 @@ def normalize_account_values(
     status = currency_status
     if not financial_valid:
         status = "ambiguous"
-    elif currency_status == "reconstructed":
-        status = "reconstructed"
+    elif currency_status in ("reconstructed", "explicit"):
+        status = currency_status
+    elif financial_valid:
+        status = "explicit"
 
     provenance = {
         "available_cash_usd": avail_prov,

@@ -455,7 +455,7 @@ def discord(monkeypatch):
 
 
 class TestPartialSummaryOpenValidCloseAmbiguous:
-    def test_partial_null_schema_no_subtraction(self, balance_dir, tmp_path, discord):
+    def test_partial_null_schema_no_subtraction(self, balance_dir, tmp_path, discord, caplog):
         open_snap = {
             "date": TD,
             "trade_date": TD,
@@ -525,10 +525,22 @@ class TestPartialSummaryOpenValidCloseAmbiguous:
             json.dumps(close_snap), encoding="utf-8"
         )
 
-        result = im.send_daily_trading_summary(target_trade_date=TD)
+        notify_calls = []
+        monkeypatch = pytest.MonkeyPatch()
+        monkeypatch.setattr(im, "_notify", lambda *a, **k: notify_calls.append((a, k)))
+        try:
+            with caplog.at_level("INFO", logger="IntegratedManager"):
+                result = im.send_daily_trading_summary(target_trade_date=TD)
+        finally:
+            monkeypatch.undo()
+
         assert result["ok"] is True
         assert result["summary_status"] == "PARTIAL"
         assert result["return_metrics_available"] is False
+        assert "DAILY_BALANCE_CURRENCY_AMBIGUOUS" in caplog.text
+        assert "DAILY_SUMMARY_PARTIAL" in caplog.text
+        assert not any(r.levelname == "ERROR" for r in caplog.records)
+        assert notify_calls == []  # PARTIAL은 ERROR Discord 알림 대상 아님
         analysis = result["analysis"]
         assert analysis["total_change"] is None
         assert analysis["total_change_pct"] is None
@@ -542,15 +554,23 @@ class TestPartialSummaryOpenValidCloseAmbiguous:
         assert analysis["realized_pnl"] == 15.5  # 25.5 - 10.0
         assert "total_change" in analysis
         assert analysis["omitted_metrics"]
+        assert analysis["data_quality_findings"][0]["severity"] == "WARNING"
+        assert analysis["data_quality_findings"][0]["code"] == "DAILY_BALANCE_CURRENCY_AMBIGUOUS"
         assert len(discord["embeds"]) == 1
         embed = discord["embeds"][0]
         assert "PARTIAL" in embed["title"]
         assert "일일 자산 증감과 수익률 계산을 생략" in embed["description"]
+        assert "세션 매칭은 정상" in embed["description"]
         blob = json.dumps(embed, ensure_ascii=False)
         assert "일일 수익률 (USD)" not in blob
         assert "+0.00%" not in blob
         assert "실현 손익" in blob
         assert "NVDA" in blob or "매수" in blob
+        meta = json.loads((balance_dir / f"daily_summary_meta_{TD}.json").read_text())
+        assert meta["summary_status"] == "PARTIAL"
+        assert meta["total_change"] is None
+        assert meta["daily_asset_pnl"] is None
+        assert 0 not in (meta["total_change"], meta["daily_asset_pnl"], meta["investment_return_pct"])
 
     def test_build_partial_schema_keys(self):
         open_b = {"holdings_detail": [], "kis_summary": {}}
@@ -574,3 +594,114 @@ class TestPartialSummaryOpenValidCloseAmbiguous:
             assert out[key] is None
         assert out["status"] == "PARTIAL"
         assert out["return_metrics_available"] is False
+        assert out["data_quality_findings"][0]["code"] == "DAILY_BALANCE_CURRENCY_AMBIGUOUS"
+        assert out["data_quality_findings"][0]["severity"] == "WARNING"
+
+    def test_complete_when_both_valid(self, balance_dir, discord, caplog):
+        open_snap = {
+            "date": TD,
+            "trade_date": TD,
+            "type": "open",
+            "timestamp": "2026-07-15T22:45:00+09:00",
+            "base_currency": "USD",
+            "total_asset_usd": 1500.0,
+            "available_cash_usd": 1000.0,
+            "holdings_value_usd": 500.0,
+            "financial_values_valid": True,
+            "return_calculation_usable": True,
+            "currency_status": "explicit",
+            "cash": 1000.0,
+            "holdings_value": 500.0,
+            "total_balance": 1500.0,
+            "holdings_detail": [{"ticker": "MU", "qty": 1, "value": 500.0, "currency": "USD"}],
+            "kis_summary": {
+                "ord_psbl_frcr_amt": 1000,
+                "currency": "USD",
+                "tot_evlu_amt_krw": 2200000,
+                "bass_exrt": 1400.0,
+            },
+            "holdings_count": 1,
+        }
+        close_snap = {
+            **open_snap,
+            "type": "close",
+            "timestamp": "2026-07-16T06:00:00+09:00",
+            "total_asset_usd": 1650.0,
+            "available_cash_usd": 1100.0,
+            "holdings_value_usd": 550.0,
+            "cash": 1100.0,
+            "holdings_value": 550.0,
+            "total_balance": 1650.0,
+            "holdings_detail": [{"ticker": "MU", "qty": 1, "value": 550.0, "currency": "USD"}],
+            "kis_summary": {
+                "ord_psbl_frcr_amt": 1100,
+                "currency": "USD",
+                "tot_evlu_amt_krw": 2420000,
+                "bass_exrt": 1400.0,
+            },
+        }
+        (balance_dir / f"balance_open_{CLOSE_KST}.json").write_text(
+            json.dumps(open_snap), encoding="utf-8"
+        )
+        (balance_dir / f"balance_close_{TD}.json").write_text(
+            json.dumps(close_snap), encoding="utf-8"
+        )
+        with caplog.at_level("INFO", logger="IntegratedManager"):
+            result = im.send_daily_trading_summary(target_trade_date=TD)
+        assert result["summary_status"] == "COMPLETE"
+        assert result["return_metrics_available"] is True
+        assert result["analysis"]["asset_value_change"] == 150.0
+        # 외부 현금흐름 증거 없으면 투자수익률 미확정
+        assert result["analysis"]["investment_return_pct"] is None
+        assert result["analysis"]["return_calculation_status"] == "CASH_FLOW_EVIDENCE_INCOMPLETE"
+        assert "DAILY_SUMMARY_COMPLETE" in caplog.text
+        meta = json.loads((balance_dir / f"daily_summary_meta_{TD}.json").read_text())
+        assert meta["summary_status"] == "COMPLETE"
+        assert meta["investment_return_pct"] is None
+
+    def test_delivery_failure_is_error(self, balance_dir, discord, monkeypatch, caplog):
+        open_snap = {
+            "date": TD,
+            "trade_date": TD,
+            "type": "open",
+            "timestamp": "2026-07-15T22:45:00+09:00",
+            "base_currency": "USD",
+            "total_asset_usd": 1500.0,
+            "available_cash_usd": 1000.0,
+            "holdings_value_usd": 500.0,
+            "financial_values_valid": True,
+            "return_calculation_usable": True,
+            "currency_status": "explicit",
+            "cash": 1000.0,
+            "holdings_value": 500.0,
+            "total_balance": 1500.0,
+            "holdings_detail": [],
+            "kis_summary": {
+                "ord_psbl_frcr_amt": 1000,
+                "tot_evlu_amt_krw": 2200000,
+                "bass_exrt": 1400.0,
+            },
+            "holdings_count": 0,
+        }
+        close_snap = {
+            **open_snap,
+            "type": "close",
+            "timestamp": "2026-07-16T06:00:00+09:00",
+        }
+        (balance_dir / f"balance_open_{CLOSE_KST}.json").write_text(json.dumps(open_snap))
+        (balance_dir / f"balance_close_{TD}.json").write_text(json.dumps(close_snap))
+        monkeypatch.setattr(im, "WEBHOOK_URL", "https://discord.com/api/webhooks/1/x")
+        monkeypatch.setattr(im, "is_valid_webhook", lambda url: True)
+
+        def _boom(*a, **k):
+            raise RuntimeError("webhook down")
+
+        monkeypatch.setattr(im, "send_discord_message", _boom)
+        notify = []
+        monkeypatch.setattr(im, "_notify", lambda *a, **k: notify.append(a))
+        with caplog.at_level("ERROR", logger="IntegratedManager"):
+            result = im.send_daily_trading_summary(target_trade_date=TD)
+        assert result["summary_status"] == "FAILED"
+        assert result["status_code"] == "DAILY_SUMMARY_DELIVERY_FAILED"
+        assert "DAILY_SUMMARY_DELIVERY_FAILED" in caplog.text
+        assert notify  # ERROR 알림 대상

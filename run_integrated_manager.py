@@ -110,8 +110,9 @@ if __name__ == "__main__":
         )
         status = (summary or {}).get("summary_status", "UNKNOWN")
         print(f"summary_status={status}")
-        # PARTIAL/OK 모두 정상 종료 (exit 0). FAILED만 non-zero.
-        sys.exit(0 if status not in ("FAILED",) else 1)
+        # PARTIAL/COMPLETE 정상 종료(exit 0). FAILED만 non-zero.
+        ok_statuses = {"PARTIAL", "COMPLETE", "OK"}
+        sys.exit(0 if status in ok_statuses else 1)
     elif args.once:
         # 단발 실행
         print("통합 매니저 단발 실행")

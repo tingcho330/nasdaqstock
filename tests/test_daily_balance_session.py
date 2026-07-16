@@ -384,7 +384,7 @@ class TestDailySummary:
         assert "+10.00%" in usd_field["value"]  # (1650-1500)/1500
 
     def test_summary_currency_mismatch_aborts(self, balance_dir, discord, caplog):
-        """ambiguous/polluted without reconstructable embedded → PARTIAL (no USD return)."""
+        """ambiguous/polluted without reconstructable embedded → PARTIAL (WARNING, not ERROR)."""
         open_snap = make_snap(
             "open", TD, canonical=False, legacy_alias=True, alias_of=TD,
             explicit_usd=False, cash=2120.0, hv=0.0, total_balance=829469.0,
@@ -405,13 +405,27 @@ class TestDailySummary:
         open_snap["available_cash_krw"] = 829469
         write_legacy(balance_dir, CLOSE_KST, open_snap)
         write_legacy(balance_dir, TD, make_snap("close", TD, cash=556.0, hv=1131.74))
-        with caplog.at_level("ERROR", logger="IntegratedManager"):
-            im.send_daily_trading_summary(target_trade_date=TD)
-        assert "DAILY_BALANCE_CURRENCY_MISMATCH" in caplog.text
+        with caplog.at_level("INFO", logger="IntegratedManager"):
+            result = im.send_daily_trading_summary(target_trade_date=TD)
+        assert result["summary_status"] == "PARTIAL"
+        assert "DAILY_BALANCE_CURRENCY_AMBIGUOUS" in caplog.text
+        assert "DAILY_SUMMARY_PARTIAL" in caplog.text
+        # PARTIAL은 장애가 아님 — CURRENCY 관련 ERROR 없어야 함
+        err_currency = [
+            r for r in caplog.records
+            if r.levelname == "ERROR" and "CURRENCY" in r.getMessage()
+        ]
+        assert err_currency == []
         assert len(discord["embeds"]) == 1
         assert "PARTIAL" in discord["embeds"][0]["title"]
         for f in discord["embeds"][0]["fields"]:
             assert "일일 수익률 (USD)" not in f["name"]
+        meta = json.loads((balance_dir / f"daily_summary_meta_{TD}.json").read_text())
+        assert meta["summary_status"] == "PARTIAL"
+        assert meta["return_metrics_available"] is False
+        assert meta["total_change"] is None
+        assert meta["daily_asset_pnl"] is None
+        assert all(f.get("severity") == "WARNING" for f in meta["data_quality_findings"])
 
     def test_summary_pair_mismatch_aborts(self, balance_dir, discord, caplog, monkeypatch):
         """테스트 5: open/close trade_date 불일치 시 요약 중단."""
