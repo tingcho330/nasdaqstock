@@ -82,11 +82,19 @@ if __name__ == "__main__":
     if args.repair_daily_balance_currency:
         if not args.trade_date:
             raise SystemExit("--repair-daily-balance-currency requires --trade-date YYYYMMDD")
-        integrated_manager.repair_daily_balance_currency(
+        result = integrated_manager.repair_daily_balance_currency(
             args.trade_date,
             snapshot_type=args.snapshot_type,
             apply=bool(args.apply and not args.dry_run),
         )
+        print(
+            f"status={result.get('status')} gates_ok={result.get('gates_ok')} "
+            f"updated={result.get('updated')} "
+            f"arithmetic_candidate_total_asset_usd={result.get('arithmetic_candidate_total_asset_usd')} "
+            f"candidate_currency_unverified={result.get('candidate_currency_unverified')} "
+            f"rejected={result.get('rejected_fields')}"
+        )
+        sys.exit(0)
     elif args.migrate_daily_balance_layout:
         integrated_manager.migrate_daily_balance_layout(
             trade_date=args.trade_date,
@@ -97,7 +105,13 @@ if __name__ == "__main__":
     elif args.capture_close:
         integrated_manager.capture_balance_snapshot("close", trade_date=args.trade_date)
     elif args.send_summary:
-        integrated_manager.send_daily_trading_summary(target_trade_date=args.trade_date)
+        summary = integrated_manager.send_daily_trading_summary(
+            target_trade_date=args.trade_date
+        )
+        status = (summary or {}).get("summary_status", "UNKNOWN")
+        print(f"summary_status={status}")
+        # PARTIAL/OK 모두 정상 종료 (exit 0). FAILED만 non-zero.
+        sys.exit(0 if status not in ("FAILED",) else 1)
     elif args.once:
         # 단발 실행
         print("통합 매니저 단발 실행")

@@ -1231,30 +1231,57 @@ def repair_daily_balance_currency(
     """
     Embedded kis_summary + holdings_detail 로 historical currency repair.
 
-    - mutable source_snapshot_file (덮어쓰기된 balance_YYYYMMDD.json) 사용 금지
-    - dry-run(apply=False)은 파일 변경 없음
-    - apply 시 atomic write + before backup + evidence JSON
-    - close에 06:05 이후 account snapshot으로 06:00 값을 덮지 않음 (embedded only)
+    gates_ok=False 이면 금액을 절대 쓰지 않는다.
+    품질 메타(currency_status=ambiguous 등)만 별도로 기록할 수 있다.
     """
     from daily_balance_values import (
         apply_normalized_fields_to_snapshot,
+        apply_quality_metadata_only,
+        build_ambiguous_quality_metadata,
         propose_currency_repair_from_embedded,
+        sha256_file,
     )
 
+    mode = "apply" if apply else "dry_run"
     snap, path, resolution = find_balance_snapshot(trade_date, snapshot_type)
-    result: Dict[str, Any] = {
-        "trade_date": trade_date,
-        "snapshot_type": snapshot_type,
-        "dry_run": not apply,
-        "selected_target": str(path) if path else None,
-        "resolution": resolution,
-        "updated": 0,
-        "applied": False,
-    }
+
+    def _base_result(**extra) -> Dict[str, Any]:
+        base = {
+            "trade_date": trade_date,
+            "snapshot_type": snapshot_type,
+            "mode": mode,
+            "status": "failed",
+            "gates_ok": False,
+            "updated": 0,
+            "financial_value_updated": False,
+            "target_path": str(path) if path else None,
+            "selected_target": str(path) if path else None,
+            "resolution": resolution,
+            "proposed_changes": {},
+            "applied_changes": [],
+            "rejected_fields": [],
+            "unresolved_fields": [],
+            "currency_status_before": None,
+            "currency_status_after": None,
+            "arithmetic_candidate_total_asset_usd": None,
+            "candidate_currency_unverified": True,
+            "dry_run": not apply,
+            "applied": False,
+        }
+        base.update(extra)
+        return base
+
     if snap is None or path is None:
-        result["error"] = "SNAPSHOT_NOT_FOUND"
-        logger.error("currency repair: snapshot not found trade_date=%s type=%s", trade_date, snapshot_type)
+        result = _base_result(status="target_not_found", error="SNAPSHOT_NOT_FOUND")
+        logger.error(
+            "[CURRENCY_REPAIR]\nmode=%s\ntrade_date=%s\nsnapshot_type=%s\n"
+            "status=target_not_found\ngates_ok=false\nupdated=0",
+            mode, trade_date, snapshot_type,
+        )
         return result
+
+    currency_before = snap.get("currency_status")
+    sha_before = sha256_file(path)
 
     # Already repaired & usable → idempotent
     if (
@@ -1268,20 +1295,63 @@ def repair_daily_balance_currency(
         )
         <= 0.02
     ):
-        result["status"] = "already_valid"
-        result["proposed_total_asset_usd"] = snap.get("total_asset_usd")
+        result = _base_result(
+            status="already_valid",
+            gates_ok=True,
+            currency_status_before=currency_before,
+            currency_status_after=snap.get("currency_status"),
+            arithmetic_candidate_total_asset_usd=snap.get("total_asset_usd"),
+            candidate_currency_unverified=False,
+            proposed_changes={},
+            target_sha256_before=sha_before,
+            target_sha256_after=sha_before,
+        )
         logger.info(
-            "currency repair: already valid trade_date=%s type=%s total_asset_usd=%s → updated=0",
-            trade_date,
-            snapshot_type,
-            snap.get("total_asset_usd"),
+            "[CURRENCY_REPAIR]\nmode=%s\ntrade_date=%s\nsnapshot_type=%s\n"
+            "status=already_valid\ngates_ok=true\nupdated=0\n"
+            "total_asset_usd=%s",
+            mode, trade_date, snapshot_type, snap.get("total_asset_usd"),
         )
         return result
 
     proposal = propose_currency_repair_from_embedded(snap, market=MARKET)
     norm = proposal["normalized"]
-    result.update({
-        "embedded_evidence": {
+    rejected = proposal.get("rejected_fields") or []
+    rejected_reasons = [
+        str(r.get("reason") or r) if isinstance(r, dict) else str(r)
+        for r in rejected
+    ]
+    # unique preserve order
+    rejected_reasons = list(dict.fromkeys(rejected_reasons))
+    arith = proposal.get("arithmetic_candidate_total_asset_usd")
+    gates_ok = bool(proposal.get("gates_ok"))
+
+    proposed_changes: Dict[str, Any] = {}
+    if gates_ok:
+        proposed_changes = {
+            "total_asset_usd": proposal.get("proposed_total_asset_usd"),
+            "available_cash_usd": proposal.get("proposed_available_cash_usd"),
+            "holdings_value_usd": proposal.get("proposed_holdings_value_usd"),
+            "currency_status": "reconstructed",
+            "financial_values_valid": True,
+            "return_calculation_usable": True,
+        }
+
+    result = _base_result(
+        gates_ok=gates_ok,
+        currency_status_before=currency_before,
+        currency_status_after=currency_before,
+        rejected_fields=rejected_reasons,
+        unresolved_fields=rejected_reasons if not gates_ok else [],
+        arithmetic_candidate_total_asset_usd=arith,
+        candidate_currency_unverified=not gates_ok,
+        proposed_changes=proposed_changes,
+        # back-compat: only when gates_ok (confirmed proposal)
+        proposed_total_asset_usd=proposal.get("proposed_total_asset_usd") if gates_ok else None,
+        proposed_available_cash_usd=proposal.get("proposed_available_cash_usd") if gates_ok else None,
+        proposed_holdings_value_usd=proposal.get("proposed_holdings_value_usd") if gates_ok else None,
+        gates=proposal.get("gates"),
+        embedded_evidence={
             "ord_psbl_frcr_amt": (snap.get("kis_summary") or {}).get("ord_psbl_frcr_amt"),
             "usd_withdrawable": (snap.get("kis_summary") or {}).get("usd_withdrawable"),
             "usd_buy_margin": (snap.get("kis_summary") or {}).get("usd_buy_margin"),
@@ -1293,56 +1363,128 @@ def repair_daily_balance_currency(
                 if isinstance(h, dict)
             ),
         },
-        "rejected_fields": proposal["rejected_fields"],
-        "gates": proposal["gates"],
-        "gates_ok": proposal["gates_ok"],
-        "historical_time_match": proposal["historical_time_match"],
-        "proposed_total_asset_usd": proposal["proposed_total_asset_usd"],
-        "proposed_available_cash_usd": proposal["proposed_available_cash_usd"],
-        "proposed_holdings_value_usd": proposal["proposed_holdings_value_usd"],
-        "field_provenance": norm.get("field_provenance"),
-    })
-
-    logger.info(
-        "[CURRENCY_REPAIR] %s trade_date=%s type=%s target=%s "
-        "proposed_total=%s gates_ok=%s rejected=%s",
-        "dry-run" if not apply else "apply",
-        trade_date,
-        snapshot_type,
-        path.name,
-        proposal["proposed_total_asset_usd"],
-        proposal["gates_ok"],
-        [r.get("reason") for r in proposal["rejected_fields"]],
+        field_provenance=norm.get("field_provenance") if gates_ok else {},
+        target_sha256_before=sha_before,
+        target_sha256_after=sha_before,
+        note=(
+            "cash와 holdings의 산술 합계이나 USD 및 source integrity가 "
+            "확인되지 않아 적용하지 않음"
+            if not gates_ok and arith is not None
+            else None
+        ),
     )
 
-    if not proposal["gates_ok"] or not norm.get("financial_values_valid"):
-        result["status"] = "blocked"
-        result["error"] = "INSUFFICIENT_EMBEDDED_EVIDENCE"
-        # still write dry-run evidence
-        evidence_path = (
+    def _write_evidence(payload: Dict) -> str:
+        tag = "apply" if apply else "dry_run"
+        ep = (
             BALANCE_STORAGE_PATH / "evidence"
-            / f"currency_repair_{snapshot_type}_{trade_date}_{'apply' if apply else 'dryrun'}.json"
+            / f"daily_balance_currency_repair_{trade_date}_{snapshot_type}_{tag}.json"
         )
-        evidence_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(evidence_path, "w", encoding="utf-8") as f:
-            json.dump(result, f, ensure_ascii=False, indent=2)
-        result["evidence_path"] = str(evidence_path)
-        return result
+        ep.parent.mkdir(parents=True, exist_ok=True)
+        with open(ep, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        return str(ep)
 
-    if not apply:
-        result["status"] = "would_apply"
-        evidence_path = (
-            BALANCE_STORAGE_PATH / "evidence"
-            / f"currency_repair_{snapshot_type}_{trade_date}_dryrun.json"
-        )
-        evidence_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(evidence_path, "w", encoding="utf-8") as f:
-            json.dump(result, f, ensure_ascii=False, indent=2)
-        result["evidence_path"] = str(evidence_path)
+    # ── gates false: never write amount fields ──
+    if not gates_ok:
+        result["status"] = "evidence_insufficient"
         result["updated"] = 0
+        result["financial_value_updated"] = False
+        result["applied_changes"] = []
+        logger.info(
+            "[CURRENCY_REPAIR]\n"
+            "mode=%s\n"
+            "trade_date=%s\n"
+            "snapshot_type=%s\n"
+            "status=evidence_insufficient\n"
+            "gates_ok=false\n"
+            "updated=0\n"
+            "arithmetic_candidate_total_asset_usd=%s\n"
+            "candidate_currency_unverified=true\n"
+            "rejected=%s",
+            mode,
+            trade_date,
+            snapshot_type,
+            arith,
+            ",".join(rejected_reasons),
+        )
+
+        # Quality metadata only (금액 필드 불변). updated는 금액 기준이므로 항상 0.
+        if apply:
+            quality = build_ambiguous_quality_metadata(rejected_reasons)
+            already = (
+                snap.get("currency_status") == "ambiguous"
+                and snap.get("financial_values_valid") is False
+                and snap.get("return_calculation_usable") is False
+            )
+            amount_keys = ("total_balance", "cash", "holdings_value", "holdings_detail", "kis_summary")
+            amounts_before = {k: snap.get(k) for k in amount_keys}
+
+            if already:
+                result["status"] = "evidence_insufficient"
+                result["currency_status_after"] = "ambiguous"
+                result["target_sha256_after"] = sha_before
+            else:
+                targets = [path]
+                canon = _canonical_balance_path(snapshot_type, trade_date)
+                if canon.exists() and canon.resolve() != path.resolve():
+                    targets.append(canon)
+                legacy_twin = _legacy_balance_path(snapshot_type, trade_date)
+                if legacy_twin.exists() and legacy_twin.resolve() != path.resolve():
+                    twin = _load_balance_json(legacy_twin)
+                    if twin and _snapshot_trade_date(twin, legacy_twin) == trade_date:
+                        targets.append(legacy_twin)
+
+                for tpath in targets:
+                    cur = _load_balance_json(tpath) or snap
+                    amt = {k: cur.get(k) for k in amount_keys}
+                    merged = apply_quality_metadata_only(cur, quality)
+                    for k, v in amt.items():
+                        merged[k] = v
+                    tmp = tpath.with_suffix(".tmp")
+                    with open(tmp, "w", encoding="utf-8") as f:
+                        json.dump(merged, f, ensure_ascii=False, indent=2)
+                    tmp.replace(tpath)
+
+                after_snap = _load_balance_json(path) or {}
+                amounts_unchanged = (
+                    after_snap.get("total_balance") == amounts_before.get("total_balance")
+                    and after_snap.get("cash") == amounts_before.get("cash")
+                    and after_snap.get("holdings_value") == amounts_before.get("holdings_value")
+                )
+                result["status"] = "quality_metadata_updated"
+                result["updated"] = 0  # amount fields never updated
+                result["financial_value_updated"] = False
+                result["currency_status_after"] = "ambiguous"
+                result["applied_changes"] = ["quality_metadata"]
+                result["target_sha256_after"] = sha256_file(path)
+                result["amounts_unchanged"] = amounts_unchanged
+                logger.info(
+                    "[CURRENCY_REPAIR]\nmode=apply\ntrade_date=%s\nsnapshot_type=%s\n"
+                    "status=quality_metadata_updated\ngates_ok=false\n"
+                    "updated=0\nfinancial_value_updated=false\n"
+                    "currency_status_after=ambiguous\n"
+                    "rejected=%s",
+                    trade_date, snapshot_type, ",".join(rejected_reasons),
+                )
+
+        result["evidence_path"] = _write_evidence(result)
         return result
 
-    # apply: backup + atomic write to canonical + matching legacy files
+    # ── gates ok ──
+    if not apply:
+        result["status"] = "dry_run_proposal"
+        result["proposed_changes"] = proposed_changes
+        logger.info(
+            "[CURRENCY_REPAIR]\nmode=dry_run\ntrade_date=%s\nsnapshot_type=%s\n"
+            "status=dry_run_proposal\ngates_ok=true\nupdated=0\n"
+            "proposed_total_asset_usd=%s",
+            trade_date, snapshot_type, proposed_changes.get("total_asset_usd"),
+        )
+        result["evidence_path"] = _write_evidence(result)
+        return result
+
+    # apply amount repair
     repaired = apply_normalized_fields_to_snapshot(snap, norm)
     repaired["currency_repaired_at_kst"] = datetime.now(KST).isoformat()
     repaired["currency_repair_source"] = "embedded_kis_summary_holdings_detail"
@@ -1353,7 +1495,6 @@ def repair_daily_balance_currency(
     shutil.copy2(path, backup_path)
 
     targets = [path]
-    # also update legacy twin if different path with same trade_date
     legacy_twin = _legacy_balance_path(snapshot_type, trade_date)
     if legacy_twin.exists() and legacy_twin.resolve() != path.resolve():
         twin = _load_balance_json(legacy_twin)
@@ -1362,8 +1503,6 @@ def repair_daily_balance_currency(
     canon = _canonical_balance_path(snapshot_type, trade_date)
     if canon.exists() and canon.resolve() != path.resolve():
         targets.append(canon)
-
-    # also update any legacy alias file that points at same trade_date (e.g. open_20260716)
     for p in BALANCE_STORAGE_PATH.glob(f"balance_{snapshot_type}_*.json"):
         if p.resolve() in {t.resolve() for t in targets}:
             continue
@@ -1380,19 +1519,26 @@ def repair_daily_balance_currency(
             json.dump({**repaired, "file_date": repaired.get("file_date")}, f, ensure_ascii=False, indent=2)
         tmp.replace(tpath)
         updated += 1
-        logger.info("currency repair applied: %s total_asset_usd=%s", tpath, repaired.get("total_asset_usd"))
 
-    result["updated"] = updated
-    result["applied"] = True
-    result["status"] = "applied"
-    result["backup_path"] = str(backup_path)
-    evidence_path = (
-        BALANCE_STORAGE_PATH / "evidence"
-        / f"currency_repair_{snapshot_type}_{trade_date}_apply.json"
+    sha_after = sha256_file(path)
+    result.update({
+        "status": "applied",
+        "updated": updated,
+        "financial_value_updated": True,
+        "applied": True,
+        "applied_changes": list(proposed_changes.keys()),
+        "currency_status_after": "reconstructed",
+        "candidate_currency_unverified": False,
+        "backup_path": str(backup_path),
+        "target_sha256_after": sha_after,
+    })
+    logger.info(
+        "[CURRENCY_REPAIR]\nmode=apply\ntrade_date=%s\nsnapshot_type=%s\n"
+        "status=applied\ngates_ok=true\nupdated=%s\n"
+        "total_asset_usd=%s",
+        trade_date, snapshot_type, updated, repaired.get("total_asset_usd"),
     )
-    with open(evidence_path, "w", encoding="utf-8") as f:
-        json.dump(result, f, ensure_ascii=False, indent=2)
-    result["evidence_path"] = str(evidence_path)
+    result["evidence_path"] = _write_evidence(result)
     return result
 
 
@@ -1658,9 +1804,15 @@ def _resolve_usd_comparison_values(snap: Dict) -> Tuple[Optional[Dict], Optional
     US 일일 요약 비교용 USD 자산값 — (values, error_reason).
 
     return_calculation_usable=True 이고 financial_values_valid=True 인
-    explicit USD 구성요소만 허용. polluted total_balance / usd_cash_total 금지.
+    explicit USD 구성요소만 우선 허용.
+
+    Legacy 폴백(embedded normalize)은 source integrity gate를 통과할 때만.
+    SOURCE_SNAPSHOT_SHA_UNKNOWN / MUTATED 등이면 PARTIAL (산술 금지).
     """
-    from daily_balance_values import is_return_calculation_usable, normalize_account_values
+    from daily_balance_values import (
+        is_return_calculation_usable,
+        propose_currency_repair_from_embedded,
+    )
 
     if is_return_calculation_usable(snap):
         return (
@@ -1673,21 +1825,28 @@ def _resolve_usd_comparison_values(snap: Dict) -> Tuple[Optional[Dict], Optional
             None,
         )
 
-    # Attempt normalize from embedded evidence (does not mutate)
-    try:
-        norm = normalize_account_values(
-            {
-                "market": MARKET,
-                "currency": "USD",
-                "kis_summary": snap.get("kis_summary") or {},
-                "holdings_detail": snap.get("holdings_detail") or [],
-                "holdings_value": snap.get("holdings_value"),
-                "available_cash_krw": snap.get("available_cash_krw"),
-                "krw_cash": snap.get("krw_cash"),
-                "total_balance": snap.get("total_balance"),
-            },
-            market=MARKET,
+    # Explicitly marked unusable / ambiguous — do not invent USD totals
+    if snap.get("financial_values_valid") is False or snap.get("return_calculation_usable") is False:
+        reasons = snap.get("normalization_errors") or []
+        return None, (
+            f"currency_status={snap.get('currency_status')} "
+            f"rejected={list(reasons)[:4]} — DAILY_BALANCE_CURRENCY_MISMATCH"
         )
+    if snap.get("currency_status") == "ambiguous":
+        return None, "currency_status=ambiguous — DAILY_BALANCE_CURRENCY_MISMATCH"
+
+    # Legacy: embedded normalize only when repair gates would allow amount use
+    try:
+        prop = propose_currency_repair_from_embedded(snap, market=MARKET)
+        if prop.get("integrity_blocked") or not prop.get("gates_ok"):
+            reasons = prop.get("rejected_reasons") or [
+                r.get("reason") for r in (prop.get("rejected_fields") or [])
+            ]
+            return None, (
+                f"currency_status={prop.get('normalized', {}).get('currency_status')} "
+                f"rejected={list(reasons)[:4]} — DAILY_BALANCE_CURRENCY_MISMATCH"
+            )
+        norm = prop["normalized"]
         if norm.get("return_calculation_usable"):
             return (
                 {
@@ -1728,6 +1887,136 @@ def _fmt_date_dash(yyyymmdd: str) -> str:
     if len(s) == 8:
         return f"{s[:4]}-{s[4:6]}-{s[6:]}"
     return s
+
+
+PARTIAL_OMITTED_METRICS = [
+    "asset_value_change",
+    "total_change_pct",
+    "investment_return_pct",
+    "cash_change",
+    "holdings_change",
+    "daily_asset_pnl",
+]
+
+
+def _holdings_ticker_sets(open_balance: Dict, close_balance: Dict) -> Dict[str, List[str]]:
+    open_detail = open_balance.get("holdings_detail") or []
+    close_detail = close_balance.get("holdings_detail") or []
+    open_tickers = {h["ticker"] for h in open_detail if isinstance(h, dict) and h.get("ticker")}
+    close_tickers = {h["ticker"] for h in close_detail if isinstance(h, dict) and h.get("ticker")}
+    return {
+        "sold_tickers": list(open_tickers - close_tickers),
+        "bought_tickers": list(close_tickers - open_tickers),
+        "held_tickers": list(open_tickers & close_tickers),
+    }
+
+
+def _realized_gross_pnl_from_pair(open_balance: Dict, close_balance: Dict) -> float:
+    """KIS ovrs_rlzt delta (USD). Asset return과 무관하게 표시 가능."""
+    if not is_us_market(MARKET):
+        return 0.0
+    om = _kis_metrics_from_snapshot(open_balance)
+    cm = _kis_metrics_from_snapshot(close_balance)
+    open_rlzt = om.get("ovrs_rlzt_pfls_amt") or 0.0
+    close_rlzt = cm.get("ovrs_rlzt_pfls_amt") or 0.0
+    if close_rlzt > 0 or open_rlzt > 0:
+        return round(float(close_rlzt) - float(open_rlzt), 2)
+    return 0.0
+
+
+def _currency_reject_reasons(snap: Dict) -> List[str]:
+    errs = snap.get("normalization_errors")
+    if isinstance(errs, list) and errs:
+        return [str(e) for e in errs]
+    rejected = snap.get("rejected_fields") or []
+    out: List[str] = []
+    for r in rejected:
+        if isinstance(r, dict):
+            out.append(str(r.get("reason") or r))
+        else:
+            out.append(str(r))
+    if out:
+        return list(dict.fromkeys(out))
+    try:
+        from daily_balance_values import propose_currency_repair_from_embedded
+        prop = propose_currency_repair_from_embedded(snap, market=MARKET)
+        return list(dict.fromkeys(prop.get("rejected_reasons") or []))
+    except Exception:
+        return ["CURRENCY_AMBIGUOUS"]
+
+
+def build_partial_daily_summary(
+    open_balance: Dict,
+    close_balance: Dict,
+    trade_date: str,
+    *,
+    open_vals: Optional[Dict] = None,
+    close_vals: Optional[Dict] = None,
+    open_err: Optional[str] = None,
+    close_err: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    open valid + close ambiguous 등에서 수익률 산술을 수행하지 않는 고정 schema.
+    금지: close_total - open_total, None - float, float(None), 0으로 위장.
+    """
+    tickers = _holdings_ticker_sets(open_balance, close_balance)
+    reasons: List[str] = []
+    if close_err or close_vals is None:
+        reasons.extend(_currency_reject_reasons(close_balance))
+    if open_err or open_vals is None:
+        reasons.extend(_currency_reject_reasons(open_balance))
+    reasons = list(dict.fromkeys([r for r in reasons if r])) or ["CURRENCY_AMBIGUOUS"]
+
+    open_total = open_vals["total"] if open_vals else None
+    close_total = close_vals["total"] if close_vals else None
+
+    return {
+        "status": "PARTIAL",
+        "summary_status": "PARTIAL",
+        "return_metrics_available": False,
+        "partial_summary": True,
+        "base_currency": "USD",
+        "date": trade_date,
+        "open_total_asset": open_total,
+        "close_total_asset": close_total,
+        "asset_value_change": None,
+        "total_change": None,
+        "total_change_pct": None,
+        "investment_return_pct": None,
+        "cash_change": None,
+        "holdings_change": None,
+        "daily_asset_pnl": None,
+        "daily_return_pct": None,
+        "daily_return_usd_pct": None,
+        "usd_change": None,
+        "omitted_metrics": list(PARTIAL_OMITTED_METRICS),
+        "data_quality_findings": [
+            {
+                "code": "CLOSE_BALANCE_CURRENCY_AMBIGUOUS"
+                if (close_err or close_vals is None)
+                else "OPEN_BALANCE_CURRENCY_AMBIGUOUS",
+                "severity": "WARN",
+                "reasons": reasons,
+            }
+        ],
+        "realized_pnl": _realized_gross_pnl_from_pair(open_balance, close_balance),
+        "unrealized_pnl": None,
+        "estimated_fees": None,
+        "sold_tickers": tickers["sold_tickers"],
+        "bought_tickers": tickers["bought_tickers"],
+        "held_tickers": tickers["held_tickers"],
+        "open_balance": open_total,
+        "close_balance": close_total,
+        "open_cash": open_vals["cash"] if open_vals else None,
+        "close_cash": close_vals["cash"] if close_vals else None,
+        "open_holdings_value": open_vals["hv"] if open_vals else None,
+        "close_holdings_value": close_vals["hv"] if close_vals else None,
+        "open_usd_total": open_total,
+        "close_usd_total": close_total,
+        "us_kis_summary": True,
+        "open_ccy_error": open_err,
+        "close_ccy_error": close_err,
+    }
 
 
 def _fmt_usd_cash_detail(metrics: Dict, prefix: str = "") -> str:
@@ -1830,7 +2119,7 @@ def send_daily_trading_summary(target_trade_date: Optional[str] = None):
                 f"`--send-summary --trade-date {trade_date}` 재시도.",
                 key="daily_summary_error",
             )
-            return
+            return {"ok": False, "summary_status": "CLOSE_MISSING", "return_metrics_available": False}
 
         # 4) open 스냅샷 — 과거 open은 현재 계좌로 재생성하지 않는다
         if not open_balance:
@@ -1845,7 +2134,7 @@ def send_daily_trading_summary(target_trade_date: Optional[str] = None):
                 "과거 open은 재생성하지 않습니다 (OPEN_SNAPSHOT_UNAVAILABLE).",
                 key="daily_summary_error",
             )
-            return
+            return {"ok": False, "summary_status": "OPEN_MISSING", "return_metrics_available": False}
 
         # 5) 같은 trade_date pair 검증 — 불일치 시 손익 계산 중단
         pair_errors = _validate_balance_pair(
@@ -1862,7 +2151,7 @@ def send_daily_trading_summary(target_trade_date: Optional[str] = None):
                 f"({'; '.join(pair_errors)})",
                 key="daily_summary_error",
             )
-            return
+            return {"ok": False, "summary_status": "PAIR_MISMATCH", "return_metrics_available": False}
 
         open_file_name = pair["open_path"].name if pair["open_path"] else None
         close_file_name = pair["close_path"].name if pair["close_path"] else None
@@ -1890,6 +2179,8 @@ def send_daily_trading_summary(target_trade_date: Optional[str] = None):
 
         # 6) 동일 통화 기준 자산값 검증 (US: USD끼리만 비교)
         skip_return_metrics = False
+        open_ccy = close_ccy = None
+        open_ccy_err = close_ccy_err = None
         if is_us_market(MARKET):
             open_ccy, open_ccy_err = _resolve_usd_comparison_values(open_balance)
             close_ccy, close_ccy_err = _resolve_usd_comparison_values(close_balance)
@@ -1904,100 +2195,150 @@ def send_daily_trading_summary(target_trade_date: Optional[str] = None):
                 skip_return_metrics = True
 
         # 7) 잔액 비교 분석 (usable pair만 full PnL)
-        comparison = {}
         if not skip_return_metrics:
             comparison = compare_balances(open_balance, close_balance)
+            comparison["status"] = "OK"
+            comparison["summary_status"] = "OK"
+            comparison["return_metrics_available"] = True
+            comparison["partial_summary"] = False
+            comparison.setdefault("total_change", comparison.get("total_change"))
+            comparison.setdefault("asset_value_change", comparison.get("usd_change", comparison.get("total_change")))
+            comparison.setdefault("total_change_pct", comparison.get("daily_return_pct"))
+            comparison.setdefault("investment_return_pct", comparison.get("daily_return_usd_pct"))
+            comparison.setdefault("daily_asset_pnl", comparison.get("usd_change", comparison.get("total_change")))
+            comparison.setdefault("omitted_metrics", [])
+            comparison.setdefault("data_quality_findings", [])
+            comparison.setdefault("open_total_asset", comparison.get("open_usd_total", comparison.get("open_balance")))
+            comparison.setdefault("close_total_asset", comparison.get("close_usd_total", comparison.get("close_balance")))
         else:
-            # PARTIAL: holdings change only, no asset return
-            comparison = {
-                "total_change": 0,
-                "daily_return_pct": 0.0,
-                "daily_return_usd_pct": 0.0,
-                "usd_change": 0.0,
-                "realized_pnl": 0.0,
-                "unrealized_pnl": 0.0,
-                "estimated_fees": 0.0,
-                "sold_tickers": [],
-                "bought_tickers": [],
-                "held_tickers": [],
-                "open_balance": 0,
-                "close_balance": 0,
-                "open_cash": open_balance.get("available_cash_usd") or open_balance.get("cash") or 0,
-                "close_cash": close_balance.get("available_cash_usd") or close_balance.get("cash") or 0,
-                "open_holdings_value": open_balance.get("holdings_value_usd") or open_balance.get("holdings_value") or 0,
-                "close_holdings_value": close_balance.get("holdings_value_usd") or close_balance.get("holdings_value") or 0,
-                "open_usd_total": 0,
-                "close_usd_total": 0,
-                "cash_change": 0,
-                "holdings_change": 0,
-                "us_kis_summary": True,
-                "partial_summary": True,
-            }
-        
-        # 디스코드 임베드 생성
-        total_change = comparison["total_change"]
-        daily_return = comparison["daily_return_pct"]
+            # PARTIAL: 산술 금지 — null schema, 0으로 위장하지 않음
+            comparison = build_partial_daily_summary(
+                open_balance,
+                close_balance,
+                trade_date,
+                open_vals=open_ccy,
+                close_vals=close_ccy,
+                open_err=open_ccy_err,
+                close_err=close_ccy_err,
+            )
+
+        return_metrics_available = bool(comparison.get("return_metrics_available", True))
+        summary_status = comparison.get("summary_status") or (
+            "PARTIAL" if skip_return_metrics else "OK"
+        )
+
+        # 디스코드 임베드 — 고정 schema 키만 사용 (KeyError 방지)
+        total_change = comparison.get("total_change")
+        daily_return = comparison.get("daily_return_pct")
         daily_return_usd = comparison.get("daily_return_usd_pct", daily_return)
-        realized_pnl = comparison["realized_pnl"]
-        unrealized_pnl = comparison["unrealized_pnl"]
-        estimated_fees = comparison["estimated_fees"]
-        
+        realized_pnl = comparison.get("realized_pnl")
+        unrealized_pnl = comparison.get("unrealized_pnl")
+        estimated_fees = comparison.get("estimated_fees")
+
         mkt = os.getenv("MARKET", "SP500")
         us_kis = comparison.get("us_kis_summary", is_us_market(mkt))
 
-        # Primary 수익률: US는 USD, KR은 원화/통화
         primary_return = daily_return_usd if us_kis else daily_return
-        primary_change = comparison.get("usd_change", total_change) if us_kis else total_change
-        change_emoji = "📈" if primary_change > 0 else "📉" if primary_change < 0 else "➡️"
-        krw_ref_emoji = "📈" if total_change > 0 else "📉" if total_change < 0 else "➡️"
+        primary_change = (
+            comparison.get("usd_change", total_change) if us_kis else total_change
+        )
+        if return_metrics_available and primary_change is not None:
+            change_emoji = "📈" if primary_change > 0 else "📉" if primary_change < 0 else "➡️"
+            krw_ref_emoji = (
+                "📈" if (total_change or 0) > 0
+                else "📉" if (total_change or 0) < 0
+                else "➡️"
+            )
+            embed_color = (
+                0x00ff00 if primary_change > 0
+                else 0xff0000 if primary_change < 0
+                else 0x808080
+            )
+        else:
+            change_emoji = "⚠️"
+            krw_ref_emoji = "⚠️"
+            embed_color = 0xF0A020  # amber — PARTIAL
 
-        open_total = comparison["open_balance"]
-        close_total = comparison["close_balance"]
-        open_hv = comparison.get("open_holdings_value", 0)
-        close_hv = comparison.get("close_holdings_value", 0)
-        open_cash = comparison.get("open_cash", open_balance.get("cash", 0))
-        close_cash = comparison.get("close_cash", close_balance.get("cash", 0))
-        open_usd_total = comparison.get("open_usd_total", 0)
-        close_usd_total = comparison.get("close_usd_total", 0)
+        open_total = comparison.get("open_balance")
+        close_total = comparison.get("close_balance")
+        open_hv = comparison.get("open_holdings_value")
+        close_hv = comparison.get("close_holdings_value")
+        open_cash = comparison.get("open_cash")
+        close_cash = comparison.get("close_cash")
+        open_usd_total = comparison.get("open_usd_total")
+        close_usd_total = comparison.get("close_usd_total")
 
-        if us_kis and skip_return_metrics:
+        if us_kis and not return_metrics_available:
+            findings = comparison.get("data_quality_findings") or []
+            reason_txt = ""
+            if findings:
+                r0 = findings[0]
+                reason_txt = ", ".join(r0.get("reasons") or [])
             fields = [
                 {
                     "name": "⚠️ PARTIAL — 자산 수익률 생략",
                     "value": (
-                        "open/close 통화·자산값이 불명확하거나 polluted KRW alias가 감지되어 "
-                        "일일 수익률·자산 증감을 계산하지 않습니다. "
-                        "`--repair-daily-balance-currency` 로 embedded evidence 보정을 검토하세요."
+                        "Close snapshot의 통화와 원본 무결성을 확인할 수 없어 "
+                        "일일 자산 증감과 수익률 계산을 생략했습니다."
+                        + (f"\nreasons: {reason_txt}" if reason_txt else "")
                     ),
                     "inline": False,
                 },
                 {
-                    "name": "📈 보유평가 (참고, 미검증)",
+                    "name": "💼 Open 총자산 (USD, 검증됨)"
+                    if open_usd_total is not None
+                    else "💼 Open 총자산",
                     "value": (
-                        f"{fmt_money(open_hv, mkt)} → {fmt_money(close_hv, mkt)}"
+                        fmt_money(open_usd_total, mkt)
+                        if open_usd_total is not None
+                        else "계산 생략"
                     ),
                     "inline": True,
                 },
                 {
-                    "name": "💵 현금 필드 (참고, 미검증)",
-                    "value": (
-                        f"{fmt_money(open_cash, mkt)} → {fmt_money(close_cash, mkt)}"
-                    ),
+                    "name": "💼 Close 총자산",
+                    "value": "계산 생략 (통화 ambiguous)",
                     "inline": True,
                 },
+                {
+                    "name": "📊 일일 자산 증감 / 수익률",
+                    "value": "계산 생략",
+                    "inline": False,
+                },
             ]
+            if realized_pnl is not None:
+                fields.append({
+                    "name": "💰 실현 손익 (KIS gross)",
+                    "value": fmt_money_signed(realized_pnl, mkt),
+                    "inline": True,
+                })
+            # 보유 종목
+            close_detail = close_balance.get("holdings_detail") or []
+            if close_detail:
+                lines = []
+                for h in close_detail[:12]:
+                    if not isinstance(h, dict):
+                        continue
+                    t = h.get("ticker") or "?"
+                    q = h.get("qty") or h.get("hldg_qty") or ""
+                    lines.append(f"{t} x{q}" if q != "" else str(t))
+                fields.append({
+                    "name": "📦 보유 종목 (close)",
+                    "value": ", ".join(lines) if lines else "(없음)",
+                    "inline": False,
+                })
         elif us_kis:
             usd_total_line = (
                 f"**{fmt_money(open_usd_total, mkt)}** → **{fmt_money(close_usd_total, mkt)}** "
-                f"({fmt_money_signed(comparison.get('usd_change', 0), mkt)})"
+                f"({fmt_money_signed(comparison.get('usd_change') or 0, mkt)})"
             )
             hv_line = (
                 f"{fmt_money(open_hv, mkt)} → {fmt_money(close_hv, mkt)} "
-                f"({fmt_money_signed(comparison['holdings_change'], mkt)})"
+                f"({fmt_money_signed(comparison.get('holdings_change') or 0, mkt)})"
             )
             cash_line = (
                 f"{fmt_money(open_cash, mkt)} → {fmt_money(close_cash, mkt)} "
-                f"({fmt_money_signed(comparison['cash_change'], mkt)})"
+                f"({fmt_money_signed(comparison.get('cash_change') or 0, mkt)})"
             )
             close_detail = _fmt_usd_cash_detail(comparison.get("close_cash_detail") or {})
             if close_detail:
@@ -2005,15 +2346,15 @@ def send_daily_trading_summary(target_trade_date: Optional[str] = None):
 
             total_line = (
                 f"**{_fmt_krw(open_total)}** → **{_fmt_krw(close_total)}** "
-                f"({_fmt_krw_signed(total_change)})"
+                f"({_fmt_krw_signed(total_change or 0)})"
             )
 
             fields = [
                 {
                     "name": f"{change_emoji} 일일 수익률 (USD)",
                     "value": (
-                        f"**{daily_return_usd:+.2f}%** "
-                        f"({fmt_money_signed(comparison.get('usd_change', 0), mkt)})"
+                        f"**{(daily_return_usd or 0):+.2f}%** "
+                        f"({fmt_money_signed(comparison.get('usd_change') or 0, mkt)})"
                     ),
                     "inline": False,
                 },
@@ -2062,82 +2403,79 @@ def send_daily_trading_summary(target_trade_date: Optional[str] = None):
             total_line = (
                 f"**{fmt_money(open_total, mkt)}** → "
                 f"**{fmt_money(close_total, mkt)}** "
-                f"({fmt_money_signed(total_change, mkt)})"
+                f"({fmt_money_signed(total_change or 0, mkt)})"
             )
             cash_line = (
                 f"{fmt_money(open_cash, mkt)} → {fmt_money(close_cash, mkt)} "
-                f"({fmt_money_signed(comparison['cash_change'], mkt)})"
+                f"({fmt_money_signed(comparison.get('cash_change') or 0, mkt)})"
             )
             hv_line = (
                 f"{fmt_money(open_hv, mkt)} → {fmt_money(close_hv, mkt)} "
-                f"({fmt_money_signed(comparison['holdings_change'], mkt)})"
+                f"({fmt_money_signed(comparison.get('holdings_change') or 0, mkt)})"
             )
-            total_title = f"{change_emoji} 총평가 변화 (예수금+보유평가)"
-            cash_title = "💵 예수금"
-            hv_title = "📈 보유평가"
-
             fields = [
-                {"name": total_title, "value": total_line, "inline": False},
-                {"name": cash_title, "value": cash_line, "inline": True},
-                {"name": hv_title, "value": hv_line, "inline": True},
+                {"name": f"{change_emoji} 총평가 변화 (예수금+보유평가)", "value": total_line, "inline": False},
+                {"name": "💵 예수금", "value": cash_line, "inline": True},
+                {"name": "📈 보유평가", "value": hv_line, "inline": True},
             ]
 
-        if not skip_return_metrics and (
-            abs(primary_return) > 0.01
-            or abs(primary_change) > 0
-            or open_hv > 0
-            or close_hv > 0
+        if return_metrics_available and (
+            abs(primary_return or 0) > 0.01
+            or abs(primary_change or 0) > 0
+            or (open_hv or 0) > 0
+            or (close_hv or 0) > 0
         ):
             if not us_kis:
                 fields.extend([
                     {
                         "name": "📊 일일 수익률",
-                        "value": f"**{daily_return:+.2f}%**",
+                        "value": f"**{(daily_return or 0):+.2f}%**",
                         "inline": True,
                     },
                 ])
             fields.extend([
                 {
                     "name": "💰 실현 손익 (KIS)" if us_kis else "💰 실현 손익",
-                    "value": fmt_money_signed(realized_pnl, mkt),
+                    "value": fmt_money_signed(realized_pnl or 0, mkt),
                     "inline": True,
                 },
                 {
                     "name": "📈 미실현·보유변동" if us_kis else "📈 미실현 손익",
                     "value": (
-                        fmt_money_signed(comparison["holdings_change"], mkt)
+                        fmt_money_signed(comparison.get("holdings_change") or 0, mkt)
                         if us_kis
-                        else fmt_money_signed(unrealized_pnl, mkt)
+                        else fmt_money_signed(unrealized_pnl or 0, mkt)
                     ),
                     "inline": True,
                 },
             ])
-            
-            if abs(estimated_fees) > 0 and not us_kis:
+
+            if estimated_fees is not None and abs(estimated_fees) > 0 and not us_kis:
                 fields.append({
                     "name": "💸 추정 수수료",
                     "value": fmt_money_signed(estimated_fees, mkt),
                     "inline": True,
                 })
-        
-        # 매매 내역 추가 (변화가 있을 때만)
-        if comparison["sold_tickers"] or comparison["bought_tickers"]:
+
+        # 매매 내역 (PARTIAL에서도 표시)
+        sold = comparison.get("sold_tickers") or []
+        bought = comparison.get("bought_tickers") or []
+        if sold or bought:
             trading_summary = []
-            if comparison["sold_tickers"]:
-                trading_summary.append(f"🔴 매도 {len(comparison['sold_tickers'])}종목")
-            if comparison["bought_tickers"]:
-                trading_summary.append(f"🟢 매수 {len(comparison['bought_tickers'])}종목")
-            
+            if sold:
+                trading_summary.append(f"🔴 매도 {len(sold)}종목 ({', '.join(sold[:8])})")
+            if bought:
+                trading_summary.append(f"🟢 매수 {len(bought)}종목 ({', '.join(bought[:8])})")
             fields.append({
                 "name": "📋 매매 내역",
                 "value": " | ".join(trading_summary),
-                "inline": False
+                "inline": False,
             })
-        
+
         # 임베드 전송 — 미국 거래일과 KST 종료일을 명확히 구분해 표시
         if is_us_market(MARKET):
             title = f"📊 {_fmt_date_dash(trade_date)} 당일 매매 성과 (미국 거래일)"
-            if skip_return_metrics:
+            if not return_metrics_available:
                 title = f"📊 {_fmt_date_dash(trade_date)} 당일 매매 요약 [PARTIAL]"
             session_line = (
                 f"🇺🇸 미국 거래일: {_fmt_date_dash(trade_date)} | "
@@ -2150,10 +2488,10 @@ def send_daily_trading_summary(target_trade_date: Optional[str] = None):
             f"{session_line}\n"
             f"⏰ {open_balance['timestamp'][:19]} → {close_balance['timestamp'][:19]}"
         )
-        if skip_return_metrics:
+        if not return_metrics_available:
             desc += (
-                "\n⚠️ PARTIAL: 통화/자산값 불명확 — 일일 수익률·자산 증감 생략 "
-                "(DAILY_BALANCE_CURRENCY_MISMATCH)"
+                "\n⚠️ Close snapshot의 통화와 원본 무결성을 확인할 수 없어 "
+                "일일 자산 증감과 수익률 계산을 생략했습니다."
             )
         if late_close_capture:
             desc += "\n⚠️ close는 요약 시점 recovery 캡처"
@@ -2162,16 +2500,13 @@ def send_daily_trading_summary(target_trade_date: Optional[str] = None):
             "title": title,
             "description": desc,
             "fields": fields,
-            "color": (
-                0x00ff00 if primary_change > 0
-                else 0xff0000 if primary_change < 0
-                else 0x808080
-            ),
+            "color": embed_color,
             "footer": {
                 "text": (
                     f"보유종목: open {open_balance.get('holdings_count', 0)}개 → "
                     f"close {close_balance.get('holdings_count', 0)}개 | "
-                    f"open={open_file_name} close={close_file_name}"
+                    f"open={open_file_name} close={close_file_name} | "
+                    f"summary_status={summary_status}"
                 )
             },
         }
@@ -2188,6 +2523,28 @@ def send_daily_trading_summary(target_trade_date: Optional[str] = None):
             "open_resolution": pair["open_resolution"],
             "close_resolution": pair["close_resolution"],
             "late_close_capture": late_close_capture,
+            "summary_status": summary_status,
+            "return_metrics_available": return_metrics_available,
+            "analysis": {
+                k: comparison.get(k)
+                for k in (
+                    "status",
+                    "summary_status",
+                    "return_metrics_available",
+                    "open_total_asset",
+                    "close_total_asset",
+                    "total_change",
+                    "total_change_pct",
+                    "investment_return_pct",
+                    "asset_value_change",
+                    "cash_change",
+                    "holdings_change",
+                    "daily_asset_pnl",
+                    "realized_pnl",
+                    "omitted_metrics",
+                    "data_quality_findings",
+                )
+            },
             "generated_at_kst": datetime.now(KST).isoformat(),
         }
         try:
@@ -2201,15 +2558,31 @@ def send_daily_trading_summary(target_trade_date: Optional[str] = None):
         if WEBHOOK_URL and is_valid_webhook(WEBHOOK_URL):
             send_discord_message(embeds=[embed])
             logger.info(
-                "일일 매매 요약 전송 완료: trade_date=%s (KST 종료일 %s)",
+                "일일 매매 요약 전송 완료: trade_date=%s summary_status=%s (KST 종료일 %s)",
                 trade_date,
+                summary_status,
                 session_close_kst,
             )
 
+        return {
+            "ok": True,
+            "summary_status": summary_status,
+            "return_metrics_available": return_metrics_available,
+            "trade_date": trade_date,
+            "analysis": comparison,
+            "discord_sent": bool(WEBHOOK_URL and is_valid_webhook(WEBHOOK_URL)),
+        }
+
     except Exception as e:
         logger.error(f"일일 매매 요약 전송 실패: {type(e).__name__}: {str(e)}")
-        logger.debug("일일 매매 요약 전송 상세 오류:", exc_info=True)
+        logger.debug("일일 매매 요약 상세 오류:", exc_info=True)
         _notify(f"❌ 일일 매매 요약 전송 실패: {type(e).__name__}: {str(e)}", key="daily_summary_error")
+        return {
+            "ok": False,
+            "summary_status": "FAILED",
+            "return_metrics_available": False,
+            "error": f"{type(e).__name__}: {e}",
+        }
 
 # ───────────────── 파이프라인 실행 ─────────────────
 def _tail(text: str, n: int = 12) -> str:

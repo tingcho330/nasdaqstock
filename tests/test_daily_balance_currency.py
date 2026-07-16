@@ -329,3 +329,248 @@ class TestCloseNotOverwrittenByLaterSnapshot:
         after = json.loads(p.read_text())
         assert after["holdings_value_usd"] == 1131.74
         assert after["total_asset_usd"] == 1687.74
+
+
+class TestCloseEvidenceInsufficient:
+    def _ops_close_ambiguous(self, tmp_path) -> dict:
+        """운영 close: arithmetic candidate만 가능, SHA unknown → gates 거부."""
+        src = tmp_path / "balance_20260715.json"
+        src.write_text(json.dumps({"note": "mutated later"}), encoding="utf-8")
+        return {
+            "date": TD,
+            "trade_date": TD,
+            "type": "close",
+            "valid": True,
+            "canonical": True,
+            "snapshot_ts_kst": "2026-07-16T06:00:00+09:00",
+            "timestamp": "2026-07-16T06:00:00+09:00",
+            "generated_at_kst": "2026-07-16T06:00:00+09:00",
+            "total_balance": 1687.74,
+            "cash": 556.0,
+            "holdings_value": 1131.74,
+            "holdings_count": 2,
+            "holdings_detail": [
+                {"ticker": "MU", "qty": 1, "value": 920.0, "currency": "USD"},
+                {"ticker": "NVDA", "qty": 1, "value": 211.74, "currency": "USD"},
+            ],
+            "kis_summary": {
+                "currency": "USD",
+                "ord_psbl_frcr_amt": 556,
+                "usd_withdrawable": 556,
+                "usd_cash_total": 2120.0,
+                "usd_buy_margin": 1564.0,
+                "tot_evlu_amt_usd": 829469.0,
+                "available_cash_krw": 829469,
+                "krw_cash": 1000000,
+                "bass_exrt": 1492.2,
+            },
+            "available_cash_krw": 829469,
+            "source_snapshot_file": str(src),
+            # no source_snapshot_sha256 → SOURCE_SNAPSHOT_SHA_UNKNOWN
+            "base_currency": None,
+            "total_asset_usd": None,
+            "available_cash_usd": None,
+            "holdings_value_usd": None,
+            "financial_values_valid": None,
+            "return_calculation_usable": None,
+            "currency_status": None,
+        }
+
+    def test_close_gates_false_dry_run(self, balance_dir, tmp_path, caplog):
+        snap = self._ops_close_ambiguous(tmp_path)
+        p = balance_dir / f"balance_close_{TD}.json"
+        p.write_text(json.dumps(snap), encoding="utf-8")
+        before = p.read_bytes()
+        with caplog.at_level("INFO"):
+            result = im.repair_daily_balance_currency(TD, "close", apply=False)
+        assert result["gates_ok"] is False
+        assert result["status"] == "evidence_insufficient"
+        assert result["updated"] == 0
+        assert result["arithmetic_candidate_total_asset_usd"] == 1687.74
+        assert result["candidate_currency_unverified"] is True
+        assert result.get("proposed_total_asset_usd") is None
+        assert "SOURCE_SNAPSHOT_SHA_UNKNOWN" in result["rejected_fields"]
+        assert "KRW_NOT_USD" in result["rejected_fields"]
+        assert "arithmetic_candidate_total_asset_usd=" in caplog.text
+        assert "evidence_insufficient" in caplog.text
+        assert p.read_bytes() == before
+        assert result["target_sha256_before"] == result["target_sha256_after"]
+        evidence = Path(result["evidence_path"])
+        assert evidence.name == f"daily_balance_currency_repair_{TD}_close_dry_run.json"
+        ev = json.loads(evidence.read_text(encoding="utf-8"))
+        assert ev["status"] == "evidence_insufficient"
+        assert ev["applied_changes"] == []
+
+    def test_close_apply_no_amount_write_idempotent(self, balance_dir, tmp_path):
+        snap = self._ops_close_ambiguous(tmp_path)
+        p = balance_dir / f"balance_close_{TD}.json"
+        p.write_text(json.dumps(snap), encoding="utf-8")
+        canon = balance_dir / "canonical"
+        canon.mkdir()
+        cp = canon / f"balance_close_trade_{TD}.json"
+        cp.write_text(json.dumps(snap), encoding="utf-8")
+
+        amounts_before = (snap["total_balance"], snap["cash"], snap["holdings_value"])
+        r1 = im.repair_daily_balance_currency(TD, "close", apply=True)
+        assert r1["gates_ok"] is False
+        assert r1["updated"] == 0
+        assert r1["financial_value_updated"] is False
+        assert r1["status"] in ("quality_metadata_updated", "evidence_insufficient")
+        after1 = json.loads(p.read_text(encoding="utf-8"))
+        assert (after1["total_balance"], after1["cash"], after1["holdings_value"]) == amounts_before
+        assert after1.get("total_asset_usd") is None
+        assert after1.get("financial_values_valid") is False
+        assert after1.get("return_calculation_usable") is False
+        assert after1.get("currency_status") == "ambiguous"
+        assert "SOURCE_SNAPSHOT_SHA_UNKNOWN" in (after1.get("normalization_errors") or [])
+
+        sha_mid = sha256_file(p)
+        r2 = im.repair_daily_balance_currency(TD, "close", apply=True)
+        assert r2["gates_ok"] is False
+        assert r2["updated"] == 0
+        assert r2["status"] == "evidence_insufficient"
+        assert r2["target_sha256_before"] == r2["target_sha256_after"]
+        assert sha256_file(p) == sha_mid
+        after2 = json.loads(p.read_text(encoding="utf-8"))
+        assert (after2["total_balance"], after2["cash"], after2["holdings_value"]) == amounts_before
+        evidence = Path(r2["evidence_path"])
+        assert evidence.name.endswith("_close_apply.json")
+
+
+@pytest.fixture()
+def discord(monkeypatch):
+    sent = {"embeds": [], "contents": []}
+
+    def _send(content=None, embeds=None, **kw):
+        if content:
+            sent["contents"].append(content)
+        if embeds:
+            sent["embeds"].extend(embeds)
+
+    monkeypatch.setattr(im, "WEBHOOK_URL", "https://discord.com/api/webhooks/1/x")
+    monkeypatch.setattr(im, "is_valid_webhook", lambda url: True)
+    monkeypatch.setattr(im, "send_discord_message", _send)
+    im._last_sent.clear()
+    return sent
+
+
+class TestPartialSummaryOpenValidCloseAmbiguous:
+    def test_partial_null_schema_no_subtraction(self, balance_dir, tmp_path, discord):
+        open_snap = {
+            "date": TD,
+            "trade_date": TD,
+            "type": "open",
+            "valid": True,
+            "legacy_alias": True,
+            "alias_of_trade_date": TD,
+            "timestamp": "2026-07-15T22:45:00+09:00",
+            "generated_at_kst": "2026-07-15T22:45:00+09:00",
+            "total_balance": 1511.87,
+            "cash": 556.0,
+            "holdings_value": 955.87,
+            "holdings_count": 1,
+            "holdings_detail": [
+                {"ticker": "MU", "qty": 1, "value": 955.87, "currency": "USD"}
+            ],
+            "kis_summary": {
+                "currency": "USD",
+                "ord_psbl_frcr_amt": 556,
+                "ovrs_rlzt_pfls_amt": 10.0,
+            },
+            "base_currency": "USD",
+            "total_asset_usd": 1511.87,
+            "available_cash_usd": 556.0,
+            "holdings_value_usd": 955.87,
+            "financial_values_valid": True,
+            "return_calculation_usable": True,
+            "currency_status": "reconstructed",
+        }
+        src = tmp_path / "balance_20260715.json"
+        src.write_text("{}", encoding="utf-8")
+        close_snap = {
+            "date": TD,
+            "trade_date": TD,
+            "type": "close",
+            "valid": True,
+            "canonical": True,
+            "timestamp": "2026-07-16T06:00:00+09:00",
+            "generated_at_kst": "2026-07-16T06:00:00+09:00",
+            "total_balance": 1687.74,
+            "cash": 556.0,
+            "holdings_value": 1131.74,
+            "holdings_count": 2,
+            "holdings_detail": [
+                {"ticker": "MU", "qty": 1, "value": 920.0, "currency": "USD"},
+                {"ticker": "NVDA", "qty": 1, "value": 211.74, "currency": "USD"},
+            ],
+            "kis_summary": {
+                "currency": "USD",
+                "ord_psbl_frcr_amt": 556,
+                "available_cash_krw": 829469,
+                "ovrs_rlzt_pfls_amt": 25.5,
+            },
+            "available_cash_krw": 829469,
+            "source_snapshot_file": str(src),
+            "currency_status": "ambiguous",
+            "financial_values_valid": False,
+            "return_calculation_usable": False,
+            "base_currency": None,
+            "total_asset_usd": None,
+            "normalization_errors": ["KRW_NOT_USD", "SOURCE_SNAPSHOT_SHA_UNKNOWN"],
+        }
+        (balance_dir / f"balance_open_{CLOSE_KST}.json").write_text(
+            json.dumps(open_snap), encoding="utf-8"
+        )
+        (balance_dir / f"balance_close_{TD}.json").write_text(
+            json.dumps(close_snap), encoding="utf-8"
+        )
+
+        result = im.send_daily_trading_summary(target_trade_date=TD)
+        assert result["ok"] is True
+        assert result["summary_status"] == "PARTIAL"
+        assert result["return_metrics_available"] is False
+        analysis = result["analysis"]
+        assert analysis["total_change"] is None
+        assert analysis["total_change_pct"] is None
+        assert analysis["investment_return_pct"] is None
+        assert analysis["daily_asset_pnl"] is None
+        assert analysis["asset_value_change"] is None
+        assert analysis["cash_change"] is None
+        assert analysis["holdings_change"] is None
+        assert analysis["open_total_asset"] == 1511.87
+        assert analysis["close_total_asset"] is None
+        assert analysis["realized_pnl"] == 15.5  # 25.5 - 10.0
+        assert "total_change" in analysis
+        assert analysis["omitted_metrics"]
+        assert len(discord["embeds"]) == 1
+        embed = discord["embeds"][0]
+        assert "PARTIAL" in embed["title"]
+        assert "일일 자산 증감과 수익률 계산을 생략" in embed["description"]
+        blob = json.dumps(embed, ensure_ascii=False)
+        assert "일일 수익률 (USD)" not in blob
+        assert "+0.00%" not in blob
+        assert "실현 손익" in blob
+        assert "NVDA" in blob or "매수" in blob
+
+    def test_build_partial_schema_keys(self):
+        open_b = {"holdings_detail": [], "kis_summary": {}}
+        close_b = {
+            "holdings_detail": [],
+            "kis_summary": {},
+            "normalization_errors": ["KRW_NOT_USD"],
+            "currency_status": "ambiguous",
+        }
+        out = im.build_partial_daily_summary(
+            open_b, close_b, TD,
+            open_vals={"total": 1511.87, "cash": 556.0, "hv": 955.87},
+            close_vals=None,
+            close_err="ambiguous",
+        )
+        for key in (
+            "total_change", "total_change_pct", "investment_return_pct",
+            "cash_change", "holdings_change", "daily_asset_pnl", "asset_value_change",
+        ):
+            assert key in out
+            assert out[key] is None
+        assert out["status"] == "PARTIAL"
+        assert out["return_metrics_available"] is False

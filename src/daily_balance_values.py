@@ -501,8 +501,12 @@ def propose_currency_repair_from_embedded(
     """
     daily balance 파일 내부 embedded evidence만으로 repair proposal 생성.
     외부 mutable source_snapshot_file 은 사용하지 않는다.
+
+    gates_ok=False (금액 apply 금지) 조건:
+    - SOURCE_SNAPSHOT_SHA_UNKNOWN / MUTATED / HISTORICAL_SNAPSHOT_TIME_MISMATCH
+    - structural gates 실패
+    - financial_values_valid=False
     """
-    # Build raw from embedded only
     raw = {
         "market": market,
         "currency": "USD",
@@ -517,7 +521,6 @@ def propose_currency_repair_from_embedded(
         "cash": snap.get("cash"),
         "usd_cash_total": (snap.get("kis_summary") or {}).get("usd_cash_total"),
     }
-    # Do NOT pass polluted top-level total_asset_usd / tot_evlu as authoritative
     normalized = normalize_account_values(raw, market=market, currency_status="reconstructed")
 
     source_ok, source_reason = verify_source_snapshot_not_mutated(snap, allow_missing_sha=True)
@@ -529,7 +532,6 @@ def propose_currency_repair_from_embedded(
             "reason": source_reason or "SOURCE_SNAPSHOT_MUTATED",
         })
 
-    # Evidence gates for apply
     ks = snap.get("kis_summary") or {}
     hd = snap.get("holdings_detail") or []
     gates = {
@@ -542,20 +544,93 @@ def propose_currency_repair_from_embedded(
             for h in hd if isinstance(h, dict) and h.get("ticker")
         ) if hd else False,
     }
-    gates_ok = all(gates.values()) and normalized.get("financial_values_valid")
+
+    # Amount-apply blockers (embedded reconstruction still proposed as arithmetic candidate)
+    amount_blockers = {
+        "SOURCE_SNAPSHOT_SHA_UNKNOWN",
+        "SOURCE_SNAPSHOT_MUTATED",
+        "HISTORICAL_SNAPSHOT_TIME_MISMATCH",
+    }
+    rejected_reasons = [str(r.get("reason") or "") for r in rejected]
+    integrity_blocked = bool(set(rejected_reasons) & amount_blockers)
+    # KRW_NOT_USD alone does not block when USD components reconstruct cleanly
+    # (open repair path). Combined with integrity failure it reinforces reject.
+    if integrity_blocked and "KRW_NOT_USD" in rejected_reasons:
+        # already blocked by integrity
+        pass
+
+    gates_ok = (
+        all(gates.values())
+        and bool(normalized.get("financial_values_valid"))
+        and not integrity_blocked
+    )
+
+    arithmetic_total = None
+    if normalized.get("available_cash_usd") is not None and normalized.get("holdings_value_usd") is not None:
+        arithmetic_total = round(
+            _f(normalized["available_cash_usd"]) + _f(normalized["holdings_value_usd"]), 2
+        )
+    elif snap.get("cash") is not None and snap.get("holdings_value") is not None:
+        arithmetic_total = round(_f(snap.get("cash")) + _f(snap.get("holdings_value")), 2)
 
     return {
         "normalized": normalized,
         "rejected_fields": rejected,
+        "rejected_reasons": rejected_reasons,
         "gates": gates,
         "gates_ok": gates_ok,
         "source_usable": source_ok,
         "source_reason": source_reason,
-        "historical_time_match": True,  # embedded evidence is same-file
-        "proposed_total_asset_usd": normalized.get("total_asset_usd"),
-        "proposed_available_cash_usd": normalized.get("available_cash_usd"),
-        "proposed_holdings_value_usd": normalized.get("holdings_value_usd"),
+        "historical_time_match": True,
+        "integrity_blocked": integrity_blocked,
+        # Do not present as confirmed USD asset when gates fail
+        "arithmetic_candidate_total_asset_usd": arithmetic_total,
+        "candidate_currency_unverified": not gates_ok,
+        "proposed_total_asset_usd": normalized.get("total_asset_usd") if gates_ok else None,
+        "proposed_available_cash_usd": normalized.get("available_cash_usd") if gates_ok else None,
+        "proposed_holdings_value_usd": normalized.get("holdings_value_usd") if gates_ok else None,
     }
+
+
+def build_ambiguous_quality_metadata(
+    rejected_reasons: List[str],
+) -> Dict[str, Any]:
+    """금액은 변경하지 않고 품질 상태만 명시."""
+    return {
+        "structurally_valid": True,
+        "currency_status": "ambiguous",
+        "financial_values_valid": False,
+        "return_calculation_usable": False,
+        "base_currency": None,
+        "total_asset_usd": None,
+        "available_cash_usd": None,
+        "holdings_value_usd": None,
+        "normalization_source": "legacy_embedded_evidence",
+        "normalization_errors": list(dict.fromkeys(rejected_reasons)),
+    }
+
+
+def apply_quality_metadata_only(
+    snap: Dict[str, Any],
+    quality: Dict[str, Any],
+) -> Dict[str, Any]:
+    """금액 필드(total_balance/cash/holdings)는 보존하고 품질 메타만 기록."""
+    out = dict(snap)
+    for key in (
+        "structurally_valid",
+        "currency_status",
+        "financial_values_valid",
+        "return_calculation_usable",
+        "base_currency",
+        "total_asset_usd",
+        "available_cash_usd",
+        "holdings_value_usd",
+        "normalization_source",
+        "normalization_errors",
+    ):
+        if key in quality:
+            out[key] = quality[key]
+    return out
 
 
 def apply_normalized_fields_to_snapshot(
@@ -596,6 +671,9 @@ def apply_normalized_fields_to_snapshot(
         if key in normalized:
             out[key] = normalized[key]
     out["rejected_fields"] = normalized.get("rejected_fields") or []
+    out["structurally_valid"] = True
+    out["normalization_source"] = "embedded_kis_summary_holdings_detail"
+    out["normalization_errors"] = []
     return out
 
 
