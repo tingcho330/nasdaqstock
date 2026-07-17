@@ -1657,109 +1657,316 @@ def load_balance_snapshot(date: str, snapshot_type: str) -> Optional[Dict]:
         logger.debug("잔액 스냅샷 로드 상세 오류:", exc_info=True)
     return None
 
+def _is_finite_number(val: Any) -> bool:
+    """True iff val is a real int/float (not bool, not None, not NaN)."""
+    if isinstance(val, bool) or val is None:
+        return False
+    if not isinstance(val, (int, float)):
+        return False
+    return val == val
+
+
+def _nullable_positive_fx(val: Any) -> Optional[float]:
+    """유효 양수 환율만 반환. None/0/음수/비숫자는 None — 0으로 치환하지 않음."""
+    if val is None or val == "":
+        return None
+    try:
+        rate = float(val)
+    except (TypeError, ValueError):
+        return None
+    if rate != rate or rate <= 0:
+        return None
+    return rate
+
+
+def _extract_fx_rate(snap: Dict, metrics: Dict) -> Optional[float]:
+    """스냅샷 embedded kis_summary의 bass_exrt를 우선 (명시 null 보존)."""
+    embedded = snap.get("kis_summary") if isinstance(snap.get("kis_summary"), dict) else None
+    if isinstance(embedded, dict) and "bass_exrt" in embedded:
+        return _nullable_positive_fx(embedded.get("bass_exrt"))
+    return _nullable_positive_fx(metrics.get("bass_exrt"))
+
+
+def _extract_optional_krw_amount(snap: Dict, metrics: Dict, key: str) -> Optional[float]:
+    """선택 KRW 금액 — 키 존재·None 구분. 없으면 metrics 양수/0 허용, 파싱 실패는 None."""
+    embedded = snap.get("kis_summary") if isinstance(snap.get("kis_summary"), dict) else None
+    if isinstance(embedded, dict) and key in embedded:
+        raw = embedded.get(key)
+        if raw is None or raw == "":
+            return None
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return None
+    raw_m = metrics.get(key)
+    if raw_m is None:
+        return None
+    try:
+        return float(raw_m)
+    except (TypeError, ValueError):
+        return None
+
+
+def _canonical_usd_components(snap: Dict) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[str]]:
+    """canonical USD 필드만 사용. 누락 시 0 치환 금지."""
+    for key in ("total_asset_usd", "available_cash_usd", "holdings_value_usd"):
+        if snap.get(key) is None:
+            return None, None, None, f"missing_{key}"
+    try:
+        total = float(snap["total_asset_usd"])
+        cash = float(snap["available_cash_usd"])
+        hv = float(snap["holdings_value_usd"])
+    except (TypeError, ValueError) as e:
+        return None, None, None, f"non_numeric_usd_component:{e}"
+    if not (_is_finite_number(total) and _is_finite_number(cash) and _is_finite_number(hv)):
+        return None, None, None, "non_finite_usd_component"
+    return total, cash, hv, None
+
+
+def _compare_balances_failure(
+    exc: BaseException,
+    *,
+    trade_date: Optional[str] = None,
+) -> Dict[str, Any]:
+    """예외 시 빈 dict 대신 구조화된 PARTIAL 실패 결과."""
+    return {
+        "date": trade_date,
+        "analysis_success": False,
+        "status": "PARTIAL",
+        "status_code": "DAILY_BALANCE_ANALYSIS_INCOMPLETE",
+        "return_metrics_available": False,
+        "asset_change_metrics_available": False,
+        "fx_metrics_available": False,
+        "fx_calculation_status": "FX_RATE_INCOMPLETE",
+        "total_change": None,
+        "cash_change": None,
+        "holdings_change": None,
+        "daily_return_pct": None,
+        "daily_return_usd_pct": None,
+        "usd_change": None,
+        "analysis_error": {
+            "code": "DAILY_BALANCE_ANALYSIS_ERROR",
+            "type": type(exc).__name__,
+            "message": str(exc),
+        },
+    }
+
+
+def _optional_fx_krw_analysis(
+    open_balance: Dict,
+    close_balance: Dict,
+    om: Dict,
+    cm: Dict,
+    *,
+    open_usd_total: float,
+    close_usd_total: float,
+    usd_change: float,
+    trade_date: Optional[str],
+) -> Dict[str, Any]:
+    """선택적 FX/KRW 분석 — 실패해도 핵심 USD 결과를 무효화하지 않음."""
+    open_fx = _extract_fx_rate(open_balance, om)
+    close_fx = _extract_fx_rate(close_balance, cm)
+    open_krw_cash = _extract_optional_krw_amount(open_balance, om, "krw_cash")
+    close_krw_cash = _extract_optional_krw_amount(close_balance, cm, "krw_cash")
+    open_krw_total = _extract_optional_krw_amount(open_balance, om, "tot_evlu_amt_krw")
+    close_krw_total = _extract_optional_krw_amount(close_balance, cm, "tot_evlu_amt_krw")
+
+    fx_out: Dict[str, Any] = {
+        "open_fx": open_fx,
+        "close_fx": close_fx,
+        "open_krw_cash": open_krw_cash,
+        "close_krw_cash": close_krw_cash,
+        "open_krw_total": open_krw_total,
+        "close_krw_total": close_krw_total,
+        "krw_total_change": (
+            round(close_krw_total - open_krw_total, 2)
+            if _is_finite_number(open_krw_total) and _is_finite_number(close_krw_total)
+            else None
+        ),
+        "trading_pnl_krw": None,
+        "fx_impact_krw": None,
+        "fx_metrics_available": False,
+        "fx_calculation_status": "FX_RATE_INCOMPLETE",
+        "open_cash_detail": om,
+        "close_cash_detail": cm,
+    }
+
+    if open_fx is None or close_fx is None:
+        logger.warning(
+            "[DAILY_BALANCE_FX_RATE_INCOMPLETE]\n"
+            "market=%s\n"
+            "trade_date=%s\n"
+            "open_fx=%s\n"
+            "close_fx=%s\n"
+            "fx_metrics_available=false\n"
+            "core_usd_comparison_available=true",
+            MARKET,
+            trade_date,
+            open_fx,
+            close_fx,
+        )
+        return fx_out
+
+    # 양쪽 환율이 유효한 양수일 때만 FX 산술 수행 (None→0 금지)
+    try:
+        ok_cash = _is_finite_number(open_krw_cash) and _is_finite_number(close_krw_cash)
+        krw_cash_delta = (close_krw_cash - open_krw_cash) if ok_cash else 0.0
+        trading_pnl_krw = int(round(usd_change * open_fx + krw_cash_delta))
+        fx_impact_krw = None
+        if _is_finite_number(close_krw_total) and _is_finite_number(close_krw_cash):
+            close_at_open_fx = int(round(close_usd_total * open_fx + close_krw_cash))
+            fx_impact_krw = int(close_krw_total) - close_at_open_fx
+        fx_out.update({
+            "trading_pnl_krw": trading_pnl_krw,
+            "fx_impact_krw": fx_impact_krw,
+            "fx_metrics_available": True,
+            "fx_calculation_status": "COMPLETE",
+        })
+    except Exception as fx_exc:
+        logger.warning(
+            "[DAILY_BALANCE_FX_RATE_INCOMPLETE] FX 산술 실패 trade_date=%s: %s: %s",
+            trade_date,
+            type(fx_exc).__name__,
+            fx_exc,
+        )
+        fx_out["fx_calculation_status"] = "FX_RATE_INCOMPLETE"
+        fx_out["fx_metrics_available"] = False
+        fx_out["trading_pnl_krw"] = None
+        fx_out["fx_impact_krw"] = None
+    return fx_out
+
+
 def compare_balances(open_balance: Dict, close_balance: Dict) -> Dict:
-    """장시작/종료 잔액 비교 (US: USD 수익률 Primary + KIS 환율 분해 / KR: 스냅샷 총평가)."""
+    """장시작/종료 잔액 비교.
+
+    A) 핵심 USD(또는 KR 총평가) 비교 — 환율과 독립
+    B) 선택적 FX/KRW 분석 — 실패해도 핵심 결과를 유지
+    """
+    trade_date = (
+        (close_balance or {}).get("trade_date")
+        or (close_balance or {}).get("date")
+        or (open_balance or {}).get("trade_date")
+    )
     try:
         us_kis = is_us_market(MARKET)
+        om: Dict = {}
+        cm: Dict = {}
+
+        # ── A. 핵심 자산 비교 ──
         if us_kis:
+            open_total, open_cash, open_hv, open_err = _canonical_usd_components(open_balance)
+            close_total, close_cash, close_hv, close_err = _canonical_usd_components(close_balance)
+            if open_err or close_err or not all(
+                _is_finite_number(v)
+                for v in (open_total, open_cash, open_hv, close_total, close_cash, close_hv)
+            ):
+                err = open_err or close_err or "core_usd_components_incomplete"
+                return {
+                    **_compare_balances_failure(
+                        ValueError(err), trade_date=trade_date
+                    ),
+                    "analysis_error": {
+                        "code": "DAILY_BALANCE_ANALYSIS_ERROR",
+                        "type": "ValueError",
+                        "message": err,
+                    },
+                    "us_kis_summary": True,
+                }
+
+            open_usd_total = round(float(open_total), 2)
+            close_usd_total = round(float(close_total), 2)
+            total_change = round(close_usd_total - open_usd_total, 2)
+            cash_change = round(float(close_cash) - float(open_cash), 2)
+            holdings_change = round(float(close_hv) - float(open_hv), 2)
+            daily_return_pct = (
+                (total_change / open_usd_total) * 100 if open_usd_total > 0 else 0.0
+            )
+            daily_return_usd_pct = daily_return_pct
+            usd_change = total_change
             om = _kis_metrics_from_snapshot(open_balance)
             cm = _kis_metrics_from_snapshot(close_balance)
-            open_total = om["tot_evlu_amt_krw"]
-            close_total = cm["tot_evlu_amt_krw"]
-
-            # USD 값은 동일 단위끼리만 비교: 명시적 *_usd 필드 우선, KIS metric 폴백
-            def _usd_cash(snap: Dict, metrics: Dict) -> float:
-                if snap.get("available_cash_usd") is not None:
-                    return _parse_float_amount(snap.get("available_cash_usd"))
-                return float(metrics["ord_psbl_frcr_amt"])
-
-            def _usd_hv(snap: Dict) -> float:
-                if snap.get("holdings_value_usd") is not None:
-                    return _parse_float_amount(snap.get("holdings_value_usd"))
-                _, _, hv = _portfolio_totals_from_snapshot(snap)
-                return hv
-
-            open_cash = _usd_cash(open_balance, om)
-            close_cash = _usd_cash(close_balance, cm)
-            open_hv = _usd_hv(open_balance)
-            close_hv = _usd_hv(close_balance)
-
-            open_usd_total = _usd_portfolio_total(open_cash, open_hv)
-            close_usd_total = _usd_portfolio_total(close_cash, close_hv)
-            usd_change = round(close_usd_total - open_usd_total, 2)
-            daily_return_usd_pct = (
-                (usd_change / open_usd_total) * 100 if open_usd_total > 0 else 0.0
-            )
-            daily_return_pct = daily_return_usd_pct
-
-            open_fx = om.get("bass_exrt") or 0.0
-            close_fx = cm.get("bass_exrt") or 0.0
-            open_krw_cash = om.get("krw_cash") or 0
-            close_krw_cash = cm.get("krw_cash") or 0
-
-            trading_pnl_krw = 0
-            fx_impact_krw = 0
-            if open_fx > 0:
-                trading_pnl_krw = int(round(
-                    usd_change * open_fx + (close_krw_cash - open_krw_cash)
-                ))
-                close_at_open_fx = int(round(close_usd_total * open_fx + close_krw_cash))
-                fx_impact_krw = close_total - close_at_open_fx
         else:
             open_total, open_cash, open_hv = _portfolio_totals_from_snapshot(open_balance)
             close_total, close_cash, close_hv = _portfolio_totals_from_snapshot(close_balance)
-            open_usd_total = close_usd_total = usd_change = 0.0
+            if not all(
+                _is_finite_number(v)
+                for v in (open_total, open_cash, open_hv, close_total, close_cash, close_hv)
+            ):
+                return _compare_balances_failure(
+                    ValueError("core_portfolio_components_incomplete"),
+                    trade_date=trade_date,
+                )
+            total_change = close_total - open_total
+            cash_change = close_cash - open_cash
+            holdings_change = close_hv - open_hv
+            daily_return_pct = (
+                (total_change / open_total) * 100 if open_total > 0 else 0.0
+            )
             daily_return_usd_pct = 0.0
-            open_fx = close_fx = 0.0
-            trading_pnl_krw = fx_impact_krw = 0
-            open_krw_cash = close_krw_cash = 0
+            usd_change = 0.0
+            open_usd_total = close_usd_total = 0.0
 
-        total_change = close_total - open_total
-        cash_change = close_cash - open_cash
-        holdings_change = close_hv - open_hv
-
-        if not us_kis:
-            daily_return_pct = (total_change / open_total) * 100 if open_total > 0 else 0
-        
-        # 보유종목 변화 분석
+        # 보유종목 변화 분석 (None-safe)
         open_detail = open_balance.get("holdings_detail") or []
         close_detail = close_balance.get("holdings_detail") or []
-        open_tickers = {h["ticker"] for h in open_detail}
-        close_tickers = {h["ticker"] for h in close_detail}
-        
+        open_tickers = {
+            h["ticker"] for h in open_detail if isinstance(h, dict) and h.get("ticker")
+        }
+        close_tickers = {
+            h["ticker"] for h in close_detail if isinstance(h, dict) and h.get("ticker")
+        }
         sold_tickers = open_tickers - close_tickers
         bought_tickers = close_tickers - open_tickers
         held_tickers = open_tickers & close_tickers
-        
-        # 실현 손익: KIS ovrs_rlzt_pfls_amt delta (US) / 매도 종목 open 평가 (KR 폴백)
+
         realized_pnl = 0.0
         if us_kis:
-            open_rlzt = om.get("ovrs_rlzt_pfls_amt") or 0.0
-            close_rlzt = cm.get("ovrs_rlzt_pfls_amt") or 0.0
-            if close_rlzt > 0 or open_rlzt > 0:
-                realized_pnl = round(close_rlzt - open_rlzt, 2)
-            else:
-                realized_pnl = 0.0
+            open_rlzt = om.get("ovrs_rlzt_pfls_amt")
+            close_rlzt = cm.get("ovrs_rlzt_pfls_amt")
+            open_rlzt_f = float(open_rlzt) if _is_finite_number(open_rlzt) else 0.0
+            close_rlzt_f = float(close_rlzt) if _is_finite_number(close_rlzt) else 0.0
+            if close_rlzt_f > 0 or open_rlzt_f > 0:
+                realized_pnl = round(close_rlzt_f - open_rlzt_f, 2)
         else:
             for ticker in sold_tickers:
                 open_holding = next(
-                    (h for h in open_balance["holdings_detail"] if h["ticker"] == ticker),
+                    (
+                        h for h in open_detail
+                        if isinstance(h, dict) and h.get("ticker") == ticker
+                    ),
                     None,
                 )
-                if open_holding:
-                    realized_pnl += open_holding["value"]
-        
+                if open_holding is not None and _is_finite_number(open_holding.get("value")):
+                    realized_pnl += float(open_holding["value"])
+
         unrealized_pnl = 0.0
         for ticker in held_tickers:
-            open_holding = next((h for h in open_balance["holdings_detail"] if h["ticker"] == ticker), None)
-            close_holding = next((h for h in close_balance["holdings_detail"] if h["ticker"] == ticker), None)
-            if open_holding and close_holding:
-                unrealized_pnl += close_holding["value"] - open_holding["value"]
-        
+            open_holding = next(
+                (h for h in open_detail if isinstance(h, dict) and h.get("ticker") == ticker),
+                None,
+            )
+            close_holding = next(
+                (h for h in close_detail if isinstance(h, dict) and h.get("ticker") == ticker),
+                None,
+            )
+            if (
+                open_holding
+                and close_holding
+                and _is_finite_number(open_holding.get("value"))
+                and _is_finite_number(close_holding.get("value"))
+            ):
+                unrealized_pnl += float(close_holding["value"]) - float(open_holding["value"])
+
         estimated_fees = total_change - realized_pnl - unrealized_pnl
-        
-        result = {
-            "date": close_balance.get("date") or close_balance.get("trade_date"),
+
+        result: Dict[str, Any] = {
+            "date": trade_date,
+            "analysis_success": True,
+            "status": "OK",
+            "status_code": "DAILY_BALANCE_COMPARISON_COMPLETE",
+            "return_metrics_available": True,
+            "asset_change_metrics_available": True,
+            "analysis_error": None,
             "total_change": total_change,
             "cash_change": cash_change,
             "holdings_change": holdings_change,
@@ -1773,33 +1980,77 @@ def compare_balances(open_balance: Dict, close_balance: Dict) -> Dict:
             "sold_tickers": list(sold_tickers),
             "bought_tickers": list(bought_tickers),
             "held_tickers": list(held_tickers),
-            "open_balance": open_total,
-            "close_balance": close_total,
+            "open_balance": open_usd_total if us_kis else open_total,
+            "close_balance": close_usd_total if us_kis else close_total,
             "open_cash": open_cash,
             "close_cash": close_cash,
             "open_holdings_value": open_hv,
             "close_holdings_value": close_hv,
-            "open_usd_total": open_usd_total,
-            "close_usd_total": close_usd_total,
+            "open_usd_total": open_usd_total if us_kis else open_total,
+            "close_usd_total": close_usd_total if us_kis else close_total,
             "us_kis_summary": us_kis,
+            "fx_metrics_available": False if us_kis else True,
+            "fx_calculation_status": "FX_RATE_INCOMPLETE" if us_kis else "N/A",
         }
+
+        # ── B. 선택적 FX/KRW 분석 (US만) ──
         if us_kis:
-            result.update({
-                "open_fx": open_fx,
-                "close_fx": close_fx,
-                "trading_pnl_krw": trading_pnl_krw,
-                "fx_impact_krw": fx_impact_krw,
-                "open_krw_cash": open_krw_cash,
-                "close_krw_cash": close_krw_cash,
-                "open_cash_detail": om,
-                "close_cash_detail": cm,
-            })
+            try:
+                fx_part = _optional_fx_krw_analysis(
+                    open_balance,
+                    close_balance,
+                    om,
+                    cm,
+                    open_usd_total=open_usd_total,
+                    close_usd_total=close_usd_total,
+                    usd_change=usd_change,
+                    trade_date=trade_date,
+                )
+                result.update(fx_part)
+            except Exception as fx_exc:
+                logger.warning(
+                    "[DAILY_BALANCE_FX_RATE_INCOMPLETE] optional FX block failed "
+                    "trade_date=%s: %s: %s",
+                    trade_date,
+                    type(fx_exc).__name__,
+                    fx_exc,
+                )
+                result.update({
+                    "open_fx": None,
+                    "close_fx": None,
+                    "trading_pnl_krw": None,
+                    "fx_impact_krw": None,
+                    "open_krw_cash": None,
+                    "close_krw_cash": None,
+                    "fx_metrics_available": False,
+                    "fx_calculation_status": "FX_RATE_INCOMPLETE",
+                    "open_cash_detail": om,
+                    "close_cash_detail": cm,
+                })
+
+        logger.info(
+            "[DAILY_BALANCE_COMPARISON_COMPLETE]\n"
+            "trade_date=%s\n"
+            "total_change=%s\n"
+            "cash_change=%s\n"
+            "holdings_change=%s\n"
+            "total_change_pct=%s",
+            trade_date,
+            result["total_change"],
+            result["cash_change"],
+            result["holdings_change"],
+            result["daily_return_pct"],
+        )
         return result
-        
+
     except Exception as e:
-        logger.error(f"잔액 비교 분석 실패: {type(e).__name__}: {str(e)}")
+        logger.error(
+            "잔액 비교 분석 실패: %s: %s",
+            type(e).__name__,
+            e,
+        )
         logger.debug("잔액 비교 분석 상세 오류:", exc_info=True)
-        return {}
+        return _compare_balances_failure(e, trade_date=trade_date)
 
 def _resolve_usd_comparison_values(snap: Dict) -> Tuple[Optional[Dict], Optional[str]]:
     """
@@ -2112,44 +2363,184 @@ def build_partial_daily_summary(
     }
 
 
+def comparison_supports_complete_summary(raw_cmp: Any) -> bool:
+    """compare_balances 결과가 COMPLETE 승격에 필요한 핵심 metric을 갖췄는지."""
+    if not isinstance(raw_cmp, dict) or not raw_cmp:
+        return False
+    if raw_cmp.get("analysis_success") is not True:
+        return False
+    if raw_cmp.get("analysis_error"):
+        return False
+    if raw_cmp.get("return_metrics_available") is not True:
+        return False
+    for key in ("total_change", "cash_change", "holdings_change", "daily_return_pct"):
+        if not _is_finite_number(raw_cmp.get(key)):
+            return False
+    return True
+
+
 def build_complete_daily_summary(
     open_balance: Dict,
     close_balance: Dict,
     comparison: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """FULL pair 산술 결과에 COMPLETE 메타를 부착. 투자증감 ≠ 투자수익률."""
-    out = dict(comparison)
+    """FULL pair 산술 결과에 COMPLETE 메타를 부착. 자산증감 ≠ 투자수익률.
+
+    필수 metric이 없으면 COMPLETE를 생성하지 않고 PARTIAL을 반환한다.
+    """
+    out = dict(comparison) if isinstance(comparison, dict) else {}
+    required_ok = comparison_supports_complete_summary(out)
+    if not required_ok:
+        out["status"] = "PARTIAL"
+        out["summary_status"] = "PARTIAL"
+        out["status_code"] = "DAILY_BALANCE_ANALYSIS_INCOMPLETE"
+        out["return_metrics_available"] = False
+        out["asset_change_metrics_available"] = False
+        out["investment_return_available"] = False
+        out["partial_summary"] = True
+        out["total_change"] = out.get("total_change") if _is_finite_number(out.get("total_change")) else None
+        out["total_change_pct"] = None
+        out["cash_change"] = out.get("cash_change") if _is_finite_number(out.get("cash_change")) else None
+        out["holdings_change"] = (
+            out.get("holdings_change") if _is_finite_number(out.get("holdings_change")) else None
+        )
+        out["daily_return_pct"] = (
+            out.get("daily_return_pct") if _is_finite_number(out.get("daily_return_pct")) else None
+        )
+        out["daily_asset_pnl"] = None
+        out["investment_return_pct"] = None
+        out["asset_value_change"] = None
+        out["omitted_metrics"] = list(PARTIAL_OMITTED_METRICS)
+        out["data_quality_findings"] = list(out.get("data_quality_findings") or [])
+        if not any(
+            f.get("code") == "DAILY_BALANCE_ANALYSIS_INCOMPLETE"
+            for f in out["data_quality_findings"]
+            if isinstance(f, dict)
+        ):
+            out["data_quality_findings"].append({
+                "code": "DAILY_BALANCE_ANALYSIS_INCOMPLETE",
+                "severity": "WARNING",
+                "reasons": ["required_core_metrics_missing_or_analysis_failed"],
+            })
+        return out
+
     asset_change = out.get("usd_change")
-    if asset_change is None:
+    if not _is_finite_number(asset_change):
         asset_change = out.get("total_change")
-    out["status"] = "COMPLETE"
-    out["summary_status"] = "COMPLETE"
-    out["status_code"] = "DAILY_SUMMARY_COMPLETE"
-    out["return_metrics_available"] = True
+
     out["partial_summary"] = False
+    out["return_metrics_available"] = True
+    out["asset_change_metrics_available"] = True
     out["asset_value_change"] = asset_change
-    out["daily_asset_pnl"] = asset_change
     out["total_change"] = out.get("total_change")
     out["total_change_pct"] = out.get("daily_return_pct")
     out["open_total_asset"] = out.get("open_usd_total", out.get("open_balance"))
     out["close_total_asset"] = out.get("close_usd_total", out.get("close_balance"))
-    out["omitted_metrics"] = []
+    out["omitted_metrics"] = list(out.get("omitted_metrics") or [])
     out["data_quality_findings"] = list(out.get("data_quality_findings") or [])
+    out["analysis_error"] = None
+
+    fx_ok = out.get("fx_metrics_available") is True or not is_us_market(MARKET)
+    if is_us_market(MARKET) and out.get("fx_metrics_available") is not True:
+        out["fx_metrics_available"] = False
+        out["fx_calculation_status"] = out.get("fx_calculation_status") or "FX_RATE_INCOMPLETE"
+        if not any(
+            f.get("code") == "FX_RATE_INCOMPLETE"
+            for f in out["data_quality_findings"]
+            if isinstance(f, dict)
+        ):
+            out["data_quality_findings"].append({
+                "code": "FX_RATE_INCOMPLETE",
+                "severity": "WARNING",
+                "reasons": ["open_or_close_fx_rate_missing_or_invalid"],
+            })
 
     if _has_external_cash_flow_evidence(open_balance, close_balance):
         out["investment_return_pct"] = out.get("daily_return_usd_pct", out.get("daily_return_pct"))
+        out["daily_asset_pnl"] = asset_change
+        out["investment_return_available"] = True
         out["return_calculation_status"] = "COMPLETE"
     else:
-        # 자산 증감은 표시 가능, 투자수익률은 미확정
+        # 자산 증감은 표시 가능, 투자수익률·daily_asset_pnl은 미확정
         out["investment_return_pct"] = None
+        out["daily_asset_pnl"] = None
+        out["investment_return_available"] = False
         out["return_calculation_status"] = "CASH_FLOW_EVIDENCE_INCOMPLETE"
         if "investment_return_pct" not in out["omitted_metrics"]:
             out["omitted_metrics"] = list(out["omitted_metrics"]) + ["investment_return_pct"]
-        out["data_quality_findings"].append({
-            "code": "CASH_FLOW_EVIDENCE_INCOMPLETE",
-            "severity": "WARNING",
-            "reasons": ["external_deposit_withdraw_fx_evidence_missing"],
-        })
+        if "daily_asset_pnl" not in out["omitted_metrics"]:
+            out["omitted_metrics"] = list(out["omitted_metrics"]) + ["daily_asset_pnl"]
+        if not any(
+            f.get("code") == "CASH_FLOW_EVIDENCE_INCOMPLETE"
+            for f in out["data_quality_findings"]
+            if isinstance(f, dict)
+        ):
+            out["data_quality_findings"].append({
+                "code": "CASH_FLOW_EVIDENCE_INCOMPLETE",
+                "severity": "WARNING",
+                "reasons": ["external_deposit_withdraw_fx_evidence_missing"],
+            })
+
+    # COMPLETE: 핵심 metric + (US면 FX) 모두 충족할 때만
+    if fx_ok:
+        out["status"] = "COMPLETE"
+        out["summary_status"] = "COMPLETE"
+        out["status_code"] = "DAILY_SUMMARY_COMPLETE"
+    else:
+        out["status"] = "PARTIAL"
+        out["summary_status"] = "PARTIAL"
+        out["status_code"] = "DAILY_SUMMARY_PARTIAL"
+        # 핵심 USD metric은 유지 (return_metrics_available=true)
+    return out
+
+
+def enforce_summary_state_invariants(comparison: Dict[str, Any]) -> Dict[str, Any]:
+    """Summary 저장·전송 직전 모순 상태 차단. WARNING demotion, FAILED 아님."""
+    out = dict(comparison) if isinstance(comparison, dict) else {}
+    findings = list(out.get("data_quality_findings") or [])
+    violations: List[str] = []
+
+    status = out.get("summary_status")
+    rma = bool(out.get("return_metrics_available", False))
+    tc = out.get("total_change")
+    tcp = out.get("total_change_pct")
+    analysis_success = out.get("analysis_success")
+    analysis_error = out.get("analysis_error")
+    ret_status = out.get("return_calculation_status")
+
+    if status == "COMPLETE" and not _is_finite_number(tc):
+        violations.append("COMPLETE_WITH_NULL_TOTAL_CHANGE")
+    if status == "COMPLETE" and analysis_error:
+        violations.append("COMPLETE_WITH_ANALYSIS_ERROR")
+    if rma and not _is_finite_number(tc):
+        violations.append("RETURN_METRICS_TRUE_WITH_NULL_TOTAL_CHANGE")
+    if rma and not _is_finite_number(tcp):
+        violations.append("RETURN_METRICS_TRUE_WITH_NULL_TOTAL_CHANGE_PCT")
+    if ret_status == "CASH_FLOW_EVIDENCE_INCOMPLETE" and not _is_finite_number(tc):
+        violations.append("CASH_FLOW_INCOMPLETE_WITH_NULL_TOTAL_CHANGE")
+    if analysis_success is False and status == "COMPLETE":
+        violations.append("ANALYSIS_FAILED_WITH_COMPLETE")
+    if (not out or out == {}) and status == "COMPLETE":
+        violations.append("EMPTY_COMPARISON_WITH_COMPLETE")
+
+    if not violations:
+        return out
+
+    logger.warning(
+        "[SUMMARY_STATE_INVARIANT_VIOLATION] violations=%s summary_status=%s → PARTIAL",
+        ",".join(violations),
+        status,
+    )
+    out["summary_status"] = "PARTIAL"
+    out["status"] = "PARTIAL"
+    out["status_code"] = "SUMMARY_STATE_INVARIANT_VIOLATION"
+    out["return_metrics_available"] = False
+    findings.append({
+        "code": "SUMMARY_STATE_INVARIANT_VIOLATION",
+        "severity": "WARNING",
+        "reasons": violations,
+    })
+    out["data_quality_findings"] = findings
     return out
 
 
@@ -2396,15 +2787,46 @@ def send_daily_trading_summary(target_trade_date: Optional[str] = None):
             )
         else:
             raw_cmp = compare_balances(open_balance, close_balance)
-            if is_us_market(MARKET) and pair_supports_complete_summary(
+            pair_ok = is_us_market(MARKET) and pair_supports_complete_summary(
                 open_balance,
                 close_balance,
                 open_vals=open_ccy,
                 close_vals=close_ccy,
-            ):
+            )
+            cmp_ok = comparison_supports_complete_summary(raw_cmp)
+            # pair_supports_complete_summary만으로 COMPLETE 승격 금지 —
+            # raw_cmp 핵심 metric·analysis_success까지 모두 충족해야 함
+            if is_us_market(MARKET) and pair_ok and cmp_ok:
                 comparison = build_complete_daily_summary(
                     open_balance, close_balance, raw_cmp
                 )
+            elif is_us_market(MARKET) and cmp_ok:
+                # USD 산술은 성공했으나 COMPLETE 자격(플래그/FX 등) 미충족
+                comparison = build_complete_daily_summary(
+                    open_balance, close_balance, raw_cmp
+                )
+                if comparison.get("summary_status") == "COMPLETE":
+                    comparison["summary_status"] = "PARTIAL"
+                    comparison["status"] = "PARTIAL"
+                    comparison["status_code"] = "DAILY_SUMMARY_PARTIAL"
+            elif is_us_market(MARKET):
+                # 비교 실패 또는 핵심 metric 부재 — COMPLETE 금지
+                comparison = build_complete_daily_summary(
+                    open_balance,
+                    close_balance,
+                    raw_cmp if isinstance(raw_cmp, dict) else {},
+                )
+                if comparison.get("summary_status") == "COMPLETE":
+                    comparison["summary_status"] = "PARTIAL"
+                    comparison["status"] = "PARTIAL"
+                    comparison["status_code"] = "DAILY_BALANCE_ANALYSIS_INCOMPLETE"
+                    comparison["return_metrics_available"] = False
+            else:
+                comparison = build_complete_daily_summary(
+                    open_balance, close_balance, raw_cmp
+                )
+
+            if comparison.get("summary_status") == "COMPLETE":
                 logger.info(
                     "[DAILY_SUMMARY_COMPLETE]\n"
                     "market=%s\n"
@@ -2416,39 +2838,37 @@ def send_daily_trading_summary(target_trade_date: Optional[str] = None):
                     trade_date,
                     comparison.get("return_calculation_status"),
                 )
-            elif is_us_market(MARKET):
-                # USD 구성요소는 해석됐으나 COMPLETE 자격(플래그) 미충족
-                # → 산술은 가능하나 COMPLETE로 승격하지 않음; investment return 미확정
-                comparison = build_complete_daily_summary(
-                    open_balance, close_balance, raw_cmp
-                )
-                comparison["summary_status"] = "PARTIAL"
-                comparison["status"] = "PARTIAL"
-                comparison["status_code"] = "DAILY_SUMMARY_PARTIAL"
-                comparison["return_metrics_available"] = True
-                comparison["investment_return_pct"] = None
-                comparison["return_calculation_status"] = "CASH_FLOW_EVIDENCE_INCOMPLETE"
+            else:
                 logger.info(
                     "[DAILY_SUMMARY_PARTIAL]\n"
-                    "market=%s\n"
-                    "trade_date=%s\n"
                     "summary_status=PARTIAL\n"
-                    "note=usd_components_resolved_but_complete_credentials_incomplete",
-                    MARKET,
-                    trade_date,
-                )
-            else:
-                comparison = build_complete_daily_summary(
-                    open_balance, close_balance, raw_cmp
+                    "return_metrics_available=%s\n"
+                    "investment_return_available=%s\n"
+                    "fx_metrics_available=%s\n"
+                    "return_calculation_status=%s",
+                    str(comparison.get("return_metrics_available", False)).lower(),
+                    str(comparison.get("investment_return_available", False)).lower(),
+                    str(comparison.get("fx_metrics_available", False)).lower(),
+                    comparison.get("return_calculation_status"),
                 )
 
-        return_metrics_available = bool(comparison.get("return_metrics_available", True))
-        summary_status = comparison.get("summary_status") or (
-            "PARTIAL" if skip_return_metrics else "COMPLETE"
-        )
+        comparison = enforce_summary_state_invariants(comparison)
+        return_metrics_available = bool(comparison.get("return_metrics_available", False))
+        summary_status = comparison.get("summary_status") or "PARTIAL"
         if summary_status == "OK":
-            summary_status = "COMPLETE"
-            comparison["summary_status"] = "COMPLETE"
+            # raw compare OK ≠ COMPLETE — 자격 재검증 후에만 COMPLETE 유지
+            if comparison_supports_complete_summary(comparison) and (
+                not is_us_market(MARKET)
+                or comparison.get("fx_metrics_available") is True
+            ):
+                summary_status = "COMPLETE"
+                comparison["summary_status"] = "COMPLETE"
+            else:
+                summary_status = "PARTIAL"
+                comparison["summary_status"] = "PARTIAL"
+        comparison = enforce_summary_state_invariants(comparison)
+        summary_status = comparison.get("summary_status") or "PARTIAL"
+        return_metrics_available = bool(comparison.get("return_metrics_available", False))
 
         # 디스코드 임베드 — 고정 schema 키만 사용 (KeyError 방지)
         total_change = comparison.get("total_change")
@@ -2570,11 +2990,6 @@ def send_daily_trading_summary(target_trade_date: Optional[str] = None):
             if close_detail:
                 cash_line = f"{cash_line}\n{close_detail}"
 
-            total_line = (
-                f"**{_fmt_krw(open_total or 0)}** → **{_fmt_krw(close_total or 0)}** "
-                f"({_fmt_krw_signed(total_change or 0)})"
-            )
-
             fields = [
                 {
                     "name": f"{change_emoji} 일일 수익률 (USD)",
@@ -2599,16 +3014,25 @@ def send_daily_trading_summary(target_trade_date: Optional[str] = None):
                     "value": cash_line,
                     "inline": True,
                 },
-                {
-                    "name": f"{krw_ref_emoji} 총평가 (원화환산, 참고)",
-                    "value": total_line,
-                    "inline": False,
-                },
             ]
 
-            open_fx = comparison.get("open_fx") or 0.0
-            close_fx = comparison.get("close_fx") or 0.0
-            if open_fx > 0 and close_fx > 0:
+            # KRW 총평가는 선택 지표 — 값이 있을 때만 표시 (USD open_balance와 혼동 금지)
+            open_krw = comparison.get("open_krw_total")
+            close_krw = comparison.get("close_krw_total")
+            krw_change = comparison.get("krw_total_change")
+            if _is_finite_number(open_krw) and _is_finite_number(close_krw):
+                fields.append({
+                    "name": f"{krw_ref_emoji} 총평가 (원화환산, 참고)",
+                    "value": (
+                        f"**{_fmt_krw(int(open_krw))}** → **{_fmt_krw(int(close_krw))}** "
+                        f"({_fmt_krw_signed(int(krw_change or 0))})"
+                    ),
+                    "inline": False,
+                })
+
+            open_fx = _nullable_positive_fx(comparison.get("open_fx"))
+            close_fx = _nullable_positive_fx(comparison.get("close_fx"))
+            if open_fx is not None and close_fx is not None:
                 fx_delta = close_fx - open_fx
                 fx_lines = [
                     f"**{_fmt_fx(open_fx)}** → **{_fmt_fx(close_fx)}** "
@@ -2757,7 +3181,15 @@ def send_daily_trading_summary(target_trade_date: Optional[str] = None):
                 "DAILY_SUMMARY_PARTIAL" if summary_status == "PARTIAL" else "DAILY_SUMMARY_COMPLETE"
             ),
             "return_metrics_available": return_metrics_available,
+            "asset_change_metrics_available": bool(
+                comparison.get("asset_change_metrics_available", return_metrics_available)
+            ),
+            "investment_return_available": bool(
+                comparison.get("investment_return_available", False)
+            ),
+            "fx_metrics_available": bool(comparison.get("fx_metrics_available", False)),
             "return_calculation_status": comparison.get("return_calculation_status"),
+            "fx_calculation_status": comparison.get("fx_calculation_status"),
             "total_change": comparison.get("total_change"),
             "total_change_pct": comparison.get("total_change_pct"),
             "cash_change": comparison.get("cash_change"),
@@ -2767,6 +3199,7 @@ def send_daily_trading_summary(target_trade_date: Optional[str] = None):
             "asset_value_change": comparison.get("asset_value_change"),
             "omitted_metrics": list(comparison.get("omitted_metrics") or []),
             "data_quality_findings": list(comparison.get("data_quality_findings") or []),
+            "analysis_error": comparison.get("analysis_error"),
             "realized_pnl": comparison.get("realized_pnl"),
             "open_total_asset": comparison.get("open_total_asset"),
             "close_total_asset": comparison.get("close_total_asset"),
