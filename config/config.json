@@ -53,7 +53,35 @@
     // true: 잔고 대비 매수 불가 종목 후보에서 제외
     "affordability_filter": true,
     // 매수 가능 금액 버퍼 (0.05=5% 여유)
-    "affordability_buffer": 0.05
+    "affordability_buffer": 0.05,
+    // Marcap 유효값 비율 미만이면 시총 필터 SKIPPED
+    "min_valid_marcap_ratio": 0.8,
+    // RSI 과열 제외 임계값 (신규 후보)
+    "rsi_overheated_threshold": 70.0,
+    // 보유종목은 스코어에 남기고 신규 후보에서는 제외
+    "exclude_held_from_candidates": true,
+    // 동일 발행사(GOOG/GOOGL 등) 중복 제거
+    "issuer_dedupe_enabled": true,
+    "issuer_groups_file": "issuer_groups.json",
+    // Production 임계값 정책. mode=static 유지(자동 완화 금지). shadow는 비교용만.
+    "score_threshold_policy": {
+      "mode": "static",
+      "static_threshold": 0.48,
+      "shadow_enabled": true,
+      "shadow_mode": "hybrid",
+      "shadow_floor": 0.42,
+      "shadow_percentile": 0.90,
+      "shadow_max_candidates": 8
+    },
+    // Amount5D 운영 기준은 static 유지. shadow liquidity는 메타데이터만.
+    "amount5d_policy": {
+      "mode": "static",
+      "static_threshold": 5000000000,
+      "shadow_enabled": true,
+      "shadow_mode": "percentile",
+      "shadow_percentile": 0.90,
+      "shadow_min_threshold": 500000000
+    }
   },
 
   // ── 리스크 관리 (risk_manager.py / background_risk_manager) ───────

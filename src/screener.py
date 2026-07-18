@@ -50,6 +50,27 @@ from utils import (
     _to_float,
 )
 
+from screener_ops import (
+    FunnelRecorder,
+    amount5d_cache_path,
+    amount5d_distribution,
+    atomic_write_json,
+    build_run_meta,
+    classify_empty_result,
+    compute_shadow_liquidity_threshold,
+    compute_shadow_score_threshold,
+    enrich_scored_dataframe,
+    load_amount5d_cache,
+    load_issuer_group_map,
+    marcap_filter_decision,
+    merge_amount5d_cache_entries,
+    save_amount5d_cache,
+    score_distribution,
+    scores_records_for_export,
+    select_candidates_pipeline,
+    write_review_markdown,
+)
+
 # 시장 분석 모듈 (screener_core에서 통합)
 from screener_core import MarketAnalyzer, MarketRegime, MarketState, get_historical_prices
 
@@ -1371,35 +1392,79 @@ def _get_trading_value_5d_avg(
     *,
     tickers: Optional[List[str]] = None,
     kis: Optional[KIS] = None,
-) -> pd.Series:
+    refresh_cache: bool = False,
+    exchange_map: Optional[Dict[str, str]] = None,
+) -> Tuple[pd.Series, Dict[str, Any]]:
     """
     거래대금 5일 평균(Amount5D)을 KIS 기간별 시세로 계산.
     - 전체 종목을 긁지 않고, tickers(관심종목)에 대해서만 호출.
     - 기준일(date_str, 당일)은 장중 누적 거래대금이라 제외하고 직전 5거래일만 사용.
-    - 반환: index=Code (KR 6자리 / US 심볼), name="Amount5D"
+    - 동일 market/trade_date 재실행 시 output/cache Amount5D JSON 캐시 사용.
+    - 반환: (Series index=Code, cache_stats dict)
     """
+    cache_stats: Dict[str, Any] = {
+        "hits": 0,
+        "misses": 0,
+        "failed": 0,
+        "duration_sec": 0.0,
+        "cache_used": False,
+        "refreshed": bool(refresh_cache),
+    }
     if not tickers:
-        return pd.Series(dtype="float64", name="Amount5D")
+        return pd.Series(dtype="float64", name="Amount5D"), cache_stats
     kis = kis or _KIS_INSTANCE
     if kis is None:
-        return pd.Series(dtype="float64", name="Amount5D")
+        return pd.Series(dtype="float64", name="Amount5D"), cache_stats
 
     try:
         datetime.strptime(date_str, "%Y%m%d")
     except Exception:
-        return pd.Series(dtype="float64", name="Amount5D")
+        return pd.Series(dtype="float64", name="Amount5D"), cache_stats
 
+    t0 = time.perf_counter()
     us_mode = is_us_market(market)
     start_dt = (datetime.strptime(date_str, "%Y%m%d") - timedelta(days=30)).strftime("%Y%m%d")
     uniq = [norm_ticker(t, market) for t in pd.unique(pd.Series(tickers)) if t]
+    lookback_days = 5
+    data_source = "kis"
+    cache_path = amount5d_cache_path(OUTPUT_DIR, market, date_str)
+    cached = None if refresh_cache else load_amount5d_cache(
+        cache_path,
+        market=market,
+        trade_date=date_str,
+        lookback_days=lookback_days,
+        data_source=data_source,
+    )
+
+    results: Dict[str, float] = {}
+    statuses: Dict[str, str] = {}
+    to_fetch: List[str] = []
+    cached_entries = (cached or {}).get("entries") or {}
+
+    for code in uniq:
+        ent = cached_entries.get(code) if isinstance(cached_entries, dict) else None
+        if isinstance(ent, dict) and ent.get("status") == "ok" and ent.get("value") is not None:
+            try:
+                results[code] = float(ent["value"])
+                statuses[code] = "ok"
+                cache_stats["hits"] += 1
+                continue
+            except (TypeError, ValueError):
+                pass
+        to_fetch.append(code)
+        cache_stats["misses"] += 1
+
+    if cache_stats["hits"]:
+        cache_stats["cache_used"] = True
 
     debug_limit = int(os.getenv("SCREENER_AMOUNT5D_DEBUG_LIMIT", "30"))
     debug_entries: List[Dict[str, Any]] = []
     debug_lock = threading.Lock()
+    new_entries: Dict[str, Dict[str, Any]] = {}
 
-    def _avg_from_df(code: str, df: pd.DataFrame) -> float:
+    def _avg_from_df(code: str, df: pd.DataFrame) -> Tuple[Optional[float], str]:
         if df is None or df.empty:
-            return 0.0
+            return None, "empty_df"
         date_candidates = ["xymd", "stck_bsop_date", "bsop_date", "date", "Date"]
         tv_candidates = ["tamt", "acml_tr_pbmn", "acml_tr_pbmn_amt", "stck_tr_pbmn", "trade_value", "거래대금"]
         date_col = next((c for c in date_candidates if c in df.columns), None)
@@ -1408,7 +1473,7 @@ def _get_trading_value_5d_avg(
             with debug_lock:
                 if len(debug_entries) < debug_limit:
                     debug_entries.append({"ticker": code, "stage": "tv_col_not_found", "cols": list(df.columns)})
-            return 0.0
+            return None, "tv_col_not_found"
         if date_col:
             try:
                 tmp = df[[date_col, tv_col]].copy()
@@ -1417,13 +1482,17 @@ def _get_trading_value_5d_avg(
                 tmp = tmp.dropna(subset=[tv_col]).sort_values(date_col)
                 tmp = tmp[tmp[date_col] != str(date_str)]
                 s2 = tmp[tv_col].tail(5)
-                return float(s2.mean()) if len(s2) else 0.0
+                if len(s2):
+                    return float(s2.mean()), "ok"
+                return None, "no_bars"
             except Exception:
                 pass
         s = pd.to_numeric(df[tv_col], errors="coerce").dropna()
-        return float(s.tail(5).mean()) if len(s) else 0.0
+        if len(s):
+            return float(s.tail(5).mean()), "ok"
+        return None, "no_bars"
 
-    def _one(code: str) -> Tuple[str, float]:
+    def _one(code: str) -> Tuple[str, Optional[float], str]:
         if us_mode:
             df = _kis_overseas_daily_price_safe(kis, code, date_str, market, retries=4)
         else:
@@ -1434,17 +1503,60 @@ def _get_trading_value_5d_avg(
             with debug_lock:
                 if len(debug_entries) < debug_limit:
                     debug_entries.append({"ticker": code, "stage": "period_price_empty_df", "cols": []})
-            return code, 0.0
-        return code, _avg_from_df(code, df)
+            return code, None, "fetch_failed"
+        val, st = _avg_from_df(code, df)
+        return code, val, st
 
-    results: Dict[str, float] = {}
-    default_workers = "1" if us_mode else "4"
-    workers = max(1, min(int(os.getenv("KIS_SCREEN_WORKERS", default_workers)), _KIS_MAX_CONCURRENCY))
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        futs = {ex.submit(_one, c): c for c in uniq}
-        for fut in as_completed(futs):
-            code, val = fut.result()
-            results[norm_ticker(code, market)] = val
+    if to_fetch:
+        default_workers = "1" if us_mode else "4"
+        workers = max(1, min(int(os.getenv("KIS_SCREEN_WORKERS", default_workers)), _KIS_MAX_CONCURRENCY))
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = {ex.submit(_one, c): c for c in to_fetch}
+            for fut in as_completed(futs):
+                code, val, st = fut.result()
+                key = norm_ticker(code, market)
+                excd = ""
+                if exchange_map:
+                    excd = str(exchange_map.get(key) or exchange_map.get(code) or "")
+                if st == "ok" and val is not None:
+                    results[key] = float(val)
+                    statuses[key] = "ok"
+                    new_entries[key] = {
+                        "value": float(val),
+                        "status": "ok",
+                        "exchange": excd,
+                        "lookback_days": lookback_days,
+                        "data_source": data_source,
+                    }
+                else:
+                    # Distinguish fetch failure from a genuine zero amount
+                    cache_stats["failed"] += 1
+                    statuses[key] = st or "failed"
+                    results[key] = 0.0
+                    new_entries[key] = {
+                        "value": None,
+                        "status": st or "failed",
+                        "exchange": excd,
+                        "lookback_days": lookback_days,
+                        "data_source": data_source,
+                    }
+
+        try:
+            payload = merge_amount5d_cache_entries(
+                cached,
+                market=market,
+                trade_date=date_str,
+                lookback_days=lookback_days,
+                data_source=data_source,
+                new_entries=new_entries,
+            )
+            save_amount5d_cache(cache_path, payload)
+        except Exception as e:
+            logger.warning("[AMOUNT5D_CACHE] save failed: %s", e)
+
+    # Ensure every requested ticker has a value (failed → 0.0 for filter compatibility)
+    for code in uniq:
+        results.setdefault(code, 0.0)
 
     out = pd.Series(results, name="Amount5D", dtype="float64")
     if us_mode:
@@ -1452,7 +1564,17 @@ def _get_trading_value_5d_avg(
     else:
         out.index = out.index.astype(str).str.replace(r"[^0-9]", "", regex=True).str.zfill(6)
 
-    # 0이 너무 많이 나오는지 요약 로그 + 디버그 샘플 저장
+    cache_stats["duration_sec"] = round(time.perf_counter() - t0, 3)
+    logger.info(
+        "[AMOUNT5D_CACHE] market=%s trade_date=%s hits=%d misses=%d failed=%d duration_sec=%.3f",
+        market,
+        date_str,
+        cache_stats["hits"],
+        cache_stats["misses"],
+        cache_stats["failed"],
+        cache_stats["duration_sec"],
+    )
+
     try:
         zeros = int((out == 0.0).sum())
         nonzeros = len(out) - zeros
@@ -1466,7 +1588,7 @@ def _get_trading_value_5d_avg(
             logger.info("[Amount5D] debug 샘플 저장: %s", str(dbg_path))
     except Exception:
         pass
-    return out
+    return out, cache_stats
 
 def _index_close_from_df(df: pd.DataFrame) -> Optional[pd.Series]:
     """KIS 업종/지수 일자별 응답에서 종가 시계열을 '오름차순(과거→현재)'으로 반환.
@@ -1875,15 +1997,32 @@ def _filter_initial_stocks(
     market: str,
     risk: Dict[str, Any],
     debug: bool,
-) -> Tuple[pd.DataFrame, str]:
+    *,
+    refresh_amount5d: bool = False,
+    funnel: Optional[FunnelRecorder] = None,
+) -> Tuple[pd.DataFrame, str, Dict[str, Any]]:
+    """1차 필터. 반환: (df, fixed_date, stage1_meta)."""
     logger.info("1차 필터링 시작...")
     fixed_date = _resolve_business_date(date_str, market)
+    funnel = funnel or FunnelRecorder()
+    stage1_meta: Dict[str, Any] = {
+        "amount5d_distribution": None,
+        "amount5d_cache": None,
+        "duration_sec": 0.0,
+        "marcap_status": None,
+    }
+    t_stage = time.perf_counter()
 
     # 종목 기본 목록(KIS master)
     df_all = get_stock_listing(market)
     if df_all is None or df_all.empty:
         logger.error("종목 마스터가 비어 있어 1차 필터링을 중단합니다.")
-        return pd.DataFrame(), fixed_date
+        funnel.record_applied("UNIVERSE", 0, 0)
+        funnel.record_skipped("MARKET_CAP", 0, reason="UNIVERSE_EMPTY")
+        funnel.record_not_run("AMOUNT5D", reason="NO_INPUT")
+        funnel.add_finding("UNIVERSE_EMPTY", "ERROR")
+        stage1_meta["duration_sec"] = round(time.perf_counter() - t_stage, 3)
+        return pd.DataFrame(), fixed_date, stage1_meta
 
     # Name/Marcap 보정
     if "Name" not in df_all.columns:
@@ -1907,7 +2046,6 @@ def _filter_initial_stocks(
 
     _describe_series("Marcap", df_pre["Marcap"])
 
-    # 필터링
     if is_us_market(market):
         min_mc = float(cfg.get("min_market_cap_us", 0))
         max_mc = float(cfg.get("max_market_cap_us", cfg.get("max_market_cap", 1e15)))
@@ -1915,51 +2053,122 @@ def _filter_initial_stocks(
         min_mc = float(cfg.get("min_market_cap", 0))
         max_mc = float(cfg.get("max_market_cap", 1e13))
     min_amt = min_trading_value_5d_avg(cfg, market)
-    if is_us_market(market) and float(df_pre["Marcap"].max() or 0) <= 0:
-        mask_mc = pd.Series(True, index=df_pre.index)
-        logger.info("US Marcap 미제공(마스터) → 1차 시총 필터 스킵")
-    else:
-        mask_mc = (df_pre["Marcap"] >= min_mc) & (df_pre["Marcap"] <= max_mc)
+    min_valid_ratio = float(cfg.get("min_valid_marcap_ratio", 0.8) or 0.8)
+
     n0 = len(df_pre)
-    n1 = int(mask_mc.sum())
-    logger.info("단계별 생존 수: 시작=%d → Marcap(≥%s, ≤%s)=%d", n0, f"{int(min_mc):,}", f"{int(max_mc):,}", n1)
-    # 디버깅: Marcap 필터로 제외된 종목 (하한/상한 사유 분리)
-    logger.debug(
-        "[1차:Marcap] 하한미달=%d건, 상한초과=%d건",
-        int((df_pre["Marcap"] < min_mc).sum()),
-        int((df_pre["Marcap"] > max_mc).sum()),
+    funnel.record_applied("UNIVERSE", n0, n0)
+
+    mc_status, mc_reason, mask_mc = marcap_filter_decision(
+        df_pre["Marcap"],
+        min_mc=min_mc,
+        max_mc=max_mc,
+        is_us=is_us_market(market),
+        min_valid_ratio=min_valid_ratio,
     )
-    df_mc = df_pre[mask_mc].copy()
-    _log_dropped("1차:Marcap", df_pre.index, df_mc.index)
+    stage1_meta["marcap_status"] = mc_status
+    if mc_status == "SKIPPED":
+        funnel.record_skipped(
+            "MARKET_CAP",
+            n0,
+            reason=mc_reason or "MARKET_CAP_DATA_UNAVAILABLE",
+            threshold=min_mc,
+        )
+        funnel.add_finding(mc_reason or "MARKET_CAP_DATA_UNAVAILABLE", "WARNING")
+        logger.info(
+            "Marcap filter status=SKIPPED reason=%s input_count=%d output_count=%d",
+            mc_reason,
+            n0,
+            n0,
+        )
+        df_mc = df_pre.copy()
+    else:
+        n1 = int(mask_mc.sum())
+        funnel.record_applied("MARKET_CAP", n0, n1, threshold=min_mc)
+        logger.info(
+            "Marcap filter status=APPLIED (≥%s, ≤%s): %d → %d",
+            f"{int(min_mc):,}",
+            f"{int(max_mc):,}",
+            n0,
+            n1,
+        )
+        logger.debug(
+            "[1차:Marcap] 하한미달=%d건, 상한초과=%d건",
+            int((df_pre["Marcap"] < min_mc).sum()),
+            int((df_pre["Marcap"] > max_mc).sum()),
+        )
+        df_mc = df_pre[mask_mc].copy()
+        _log_dropped("1차:Marcap", df_pre.index, df_mc.index)
+
     if df_mc.empty:
         logger.warning("Marcap 필터 후 종목이 없습니다.")
-        return pd.DataFrame(), fixed_date
+        funnel.record_not_run("AMOUNT5D", reason="NO_INPUT")
+        stage1_meta["duration_sec"] = round(time.perf_counter() - t_stage, 3)
+        return pd.DataFrame(), fixed_date, stage1_meta
 
-    # 2) 거래대금(5D avg): 관심종목(마켓캡 통과)만 KIS 기간별 시세로 계산
-    amt5 = _get_trading_value_5d_avg(fixed_date, market, tickers=df_mc.index.tolist(), kis=_KIS_INSTANCE)
+    # 2) 거래대금(5D avg)
+    ex_map = {}
+    if "EXCD" in df_mc.columns:
+        ex_map = {str(i): str(v) for i, v in df_mc["EXCD"].items() if pd.notna(v)}
+    amt5, cache_stats = _get_trading_value_5d_avg(
+        fixed_date,
+        market,
+        tickers=df_mc.index.tolist(),
+        kis=_KIS_INSTANCE,
+        refresh_cache=refresh_amount5d,
+        exchange_map=ex_map,
+    )
+    stage1_meta["amount5d_cache"] = cache_stats
     df_mc = df_mc.join(amt5, how="left")
-    amt_num = pd.to_numeric(df_mc.get("Amount5D", pd.Series(index=df_mc.index, dtype="float64")), errors="coerce").fillna(0)
+    amt_num = pd.to_numeric(
+        df_mc.get("Amount5D", pd.Series(index=df_mc.index, dtype="float64")),
+        errors="coerce",
+    ).fillna(0)
+    amt_dist = amount5d_distribution(amt_num.tolist(), float(min_amt))
+    stage1_meta["amount5d_distribution"] = amt_dist
+
+    # Shadow liquidity (record only — do not apply to production filter)
+    liq_policy = (cfg.get("amount5d_policy") or {})
+    shadow_liq_thr = compute_shadow_liquidity_threshold(amt_num.tolist(), liq_policy)
+    if shadow_liq_thr is not None:
+        stage1_meta["amount5d_shadow_threshold"] = shadow_liq_thr
+        stage1_meta["amount5d_shadow_pass_count"] = int((amt_num >= shadow_liq_thr).sum())
+
     mask_amt = amt_num >= min_amt
+    n_amt_in = len(df_mc)
     n2 = int(mask_amt.sum())
-    logger.info("단계별 생존 수: +Amount5D(≥%s)=%d (대상=%d)", f"{int(min_amt):,}", n2, len(df_mc))
-    # 디버깅: Amount5D 분포 + 제외 종목
+    funnel.record_applied(
+        "AMOUNT5D",
+        n_amt_in,
+        n2,
+        threshold=float(min_amt),
+        duration_sec=cache_stats.get("duration_sec"),
+    )
+    logger.info(
+        "Amount5D filter status=APPLIED (≥%s): %d → %d (pass_ratio=%.1f%%)",
+        f"{int(min_amt):,}",
+        n_amt_in,
+        n2,
+        (n2 * 100.0 / n_amt_in) if n_amt_in else 0.0,
+    )
     _describe_series("Amount5D", amt_num)
     logger.debug("[1차:Amount5D] 거래대금 미달=%d건", int((amt_num < min_amt).sum()))
     df_filtered = df_mc[mask_amt].copy()
     _log_dropped("1차:Amount5D", df_mc.index, df_filtered.index)
     if df_filtered.empty:
         logger.warning("거래대금(5D) 필터 후 종목이 없습니다.")
-        return pd.DataFrame(), fixed_date
+        if int(cache_stats.get("failed") or 0) >= n_amt_in and n_amt_in > 0:
+            funnel.add_finding("AMOUNT5D_DATA_UNAVAILABLE", "ERROR")
+        stage1_meta["duration_sec"] = round(time.perf_counter() - t_stage, 3)
+        funnel.log("1차 필터링")
+        return pd.DataFrame(), fixed_date, stage1_meta
 
-    # 3) 펀더멘털(PER/PBR): 최종 관심종목만 inquire_price로 보강
+    # 3) 펀더멘털(PER/PBR): 최종 관심종목만 inquire_price로 보강 (드롭 없음)
     fundamentals = get_fundamentals(fixed_date, market, tickers=df_filtered.index.tolist(), kis=_KIS_INSTANCE)
     if fundamentals is not None and not fundamentals.empty:
         df_filtered = df_filtered.join(fundamentals[["PER", "PBR"]], how="left")
     else:
         df_filtered["PER"] = np.nan
         df_filtered["PBR"] = np.nan
-
-    n_fund = len(df_filtered)
 
     # 화이트/블랙리스트
     bl = {norm_ticker(x, market) for x in risk.get("blacklist_tickers", []) if x}
@@ -1976,7 +2185,6 @@ def _filter_initial_stocks(
         df_filtered = df_filtered[~df_filtered.index.isin(bl)]
         logger.info("블랙리스트 적용: %d → %d", before, len(df_filtered))
         _log_dropped("1차:블랙리스트", _before_idx, df_filtered.index)
-    n_list = len(df_filtered)
 
     # 빈/무효 티커 제거 (KR: 4자 이상 / US: 1자 이상)
     _min_len = 1 if is_us_market(market) else 4
@@ -1988,23 +2196,18 @@ def _filter_initial_stocks(
         logger.info("1차 필터링 후 무효 티커 제외: %d건 → %d 종목", dropped, len(df_filtered))
         _log_dropped("1차:무효티커", _before_idx, df_filtered.index)
 
-    # 단계별 생존 종목 수 퍼널 요약
-    _log_funnel(
-        "1차 필터링",
-        [
-            ("전체 종목", n0),
-            (f"Marcap(≥{int(min_mc):,})", n1),
-            (f"Amount5D(≥{int(min_amt):,})", n2),
-            ("펀더멘털 보강", n_fund),
-            ("화이트/블랙리스트", n_list),
-            ("유효 티커", len(df_filtered)),
-        ],
-    )
+    funnel.log("1차 필터링")
+    stage1_meta["duration_sec"] = round(time.perf_counter() - t_stage, 3)
     logger.info(
-        "✅ 1차 필터링 완료: %d → %d 종목 (시장=%s, 기준일=%s, min_mc=%s, min_amt5D=%s)",
-        len(df_pre), len(df_filtered), market, fixed_date, f"{int(min_mc):,}", f"{int(min_amt):,}",
+        "✅ 1차 필터링 완료: %d → %d 종목 (시장=%s, 기준일=%s, marcap=%s, min_amt5D=%s)",
+        n0,
+        len(df_filtered),
+        market,
+        fixed_date,
+        mc_status,
+        f"{int(min_amt):,}",
     )
-    return df_filtered, fixed_date
+    return df_filtered, fixed_date, stage1_meta
 
 def _calculate_scores_for_holdings_ticker(
     code: str,
@@ -2385,30 +2588,32 @@ def _calculate_scores_for_ticker(
         per_missing = pd.isna(per_val) or (per_val == 0)
         pbr_missing = pd.isna(pbr_val) or (pbr_val == 0)
         marcap = float(pd.to_numeric(fin_info.get("Marcap", 0), errors="coerce") or 0)
+        # US 마스터 Marcap=0 이면 대형/중형 추정 로직에 사용하지 않음
+        marcap_usable = marcap > 0 and not (is_us_market(mkt) and marcap <= 0)
 
-        # PER 결측 시 시가총액 기반 추정값으로 대체
+        # PER 결측 시 시가총액 기반 추정값으로 대체 (유효 Marcap일 때만 규모 분기)
         if per_missing:
-            if marcap > 1e12:      # 1조 이상(대형주)
+            if marcap_usable and marcap > 1e12:      # 1조 이상(대형주, KR 스케일)
                 per_val = 15.0
-            elif marcap > 1e11:    # 1000억 이상(중형주)
+            elif marcap_usable and marcap > 1e11:    # 1000억 이상(중형주)
                 per_val = 20.0
-            elif marcap > 0:       # 소형주
+            elif marcap_usable:                      # 소형주
                 per_val = 25.0
             else:
-                per_val = 20.0     # 기본값
-            logger.debug(f"[{code}] PER 결측(0/NaN) → 추정값 {per_val} 사용")
+                per_val = 20.0     # Marcap 부재/US 0 → 중립 기본값
+            logger.debug(f"[{code}] PER 결측(0/NaN) → 추정값 {per_val} 사용 (marcap_usable={marcap_usable})")
 
         # PBR 결측 시 시가총액 기반 추정값으로 대체
         if pbr_missing:
-            if marcap > 1e12:
+            if marcap_usable and marcap > 1e12:
                 pbr_val = 1.2
-            elif marcap > 1e11:
+            elif marcap_usable and marcap > 1e11:
                 pbr_val = 1.5
-            elif marcap > 0:
+            elif marcap_usable:
                 pbr_val = 2.0
             else:
                 pbr_val = 1.5
-            logger.debug(f"[{code}] PBR 결측(0/NaN) → 추정값 {pbr_val} 사용")
+            logger.debug(f"[{code}] PBR 결측(0/NaN) → 추정값 {pbr_val} 사용 (marcap_usable={marcap_usable})")
 
         # PER 점수: 음수(적자)는 페널티(B안), 양수는 저평가일수록 고점
         if per_val < 0:
@@ -2592,15 +2797,101 @@ def run_screener(
     debug: bool,
     pipeline_session: Optional[str] = None,
     force: bool = False,
+    refresh_amount5d: bool = False,
 ):
     global _KIS_INSTANCE, _KIS_RATE_LIMITER, _KIS_MAX_CONCURRENCY, _CURRENT_MARKET_STATE
     sess = (pipeline_session or os.getenv("PIPELINE_SESSION", "")).lower().strip()
     if sess not in ("am", "pm"):
         sess = resolve_pipeline_context(market=market).get("session", "pm")
     os.environ["PIPELINE_SESSION"] = sess
+    run_started_at = datetime.now(KST)
+    run_t0 = time.perf_counter()
+    funnel = FunnelRecorder()
+    stage_durations: Dict[str, float] = {}
+    stage1_meta: Dict[str, Any] = {}
+    market_state_payload: Dict[str, Any] = {}
+    fixed_date = date_str
+
+    def _persist_run_meta(
+        *,
+        status: str,
+        result_status: str,
+        empty_reason: Optional[str],
+        configured_threshold: float,
+        effective_threshold: float,
+        candidate_count: int,
+        score_dist: Optional[Dict[str, Any]] = None,
+        shadow: Optional[Dict[str, Any]] = None,
+        top_scores: Optional[List[Dict[str, Any]]] = None,
+        production_candidates: Optional[List[Dict[str, Any]]] = None,
+        shadow_candidates: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        funnel_dicts, repaired = funnel.sanitize_for_storage()
+        final_status = status
+        if repaired and status == "SUCCESS":
+            final_status = "SUCCESS_WITH_WARNINGS"
+        finished = datetime.now(KST)
+        meta = build_run_meta(
+            market=market,
+            trade_date=fixed_date,
+            session=sess,
+            status=final_status,
+            result_status=result_status,
+            empty_reason=empty_reason,
+            started_at_kst=run_started_at.isoformat(),
+            finished_at_kst=finished.isoformat(),
+            duration_sec=time.perf_counter() - run_t0,
+            market_state=market_state_payload,
+            funnel=funnel_dicts,
+            score_distribution_data=score_dist or score_distribution([]),
+            configured_threshold=configured_threshold,
+            effective_threshold=effective_threshold,
+            candidate_count=candidate_count,
+            data_quality_findings=list(funnel.findings),
+            stage_durations_sec=dict(stage_durations),
+            amount5d_stats=stage1_meta.get("amount5d_distribution"),
+            amount5d_cache_stats=stage1_meta.get("amount5d_cache"),
+            shadow=shadow,
+            production_shadow_difference={
+                "production_candidate_count": candidate_count,
+                "shadow_candidate_count": (shadow or {}).get("candidate_count", 0),
+                "threshold_delta": (
+                    None
+                    if shadow is None or shadow.get("threshold") is None
+                    else round(float(shadow["threshold"]) - float(configured_threshold), 4)
+                ),
+            },
+        )
+        meta_path = OUTPUT_DIR / format_pipeline_artifact(
+            "screener_run_meta", fixed_date, market, sess
+        )
+        atomic_write_json(meta_path, meta)
+        logger.info(
+            "run_meta 저장: %s status=%s result_status=%s empty_reason=%s",
+            meta_path,
+            meta.get("status"),
+            meta.get("result_status"),
+            meta.get("empty_reason"),
+        )
+        try:
+            review_path = OUTPUT_DIR / "reviews" / format_pipeline_artifact(
+                "screener_review", fixed_date, market, sess, suffix=".md"
+            )
+            write_review_markdown(
+                review_path,
+                meta,
+                top_scores=top_scores or [],
+                production_candidates=production_candidates or [],
+                shadow_candidates=shadow_candidates or [],
+            )
+            logger.info("스크리너 리뷰 저장: %s", review_path)
+        except Exception as e:
+            logger.warning("스크리너 리뷰 저장 실패: %s", e)
+        return meta
+
     start_msg = (
         f"▶ 스크리너 시작 (date={date_str}, session={sess}, market={market}, "
-        f"workers={workers}, debug={debug})"
+        f"workers={workers}, debug={debug}, refresh_amount5d={refresh_amount5d})"
     )
     logger.info(start_msg)
     _notify(start_msg, key="screener_start", cooldown_sec=60)
@@ -2678,6 +2969,24 @@ def run_screener(
     screener_params = settings.get("screener_params", {})
     risk_params = settings.get("risk_params", {})
 
+    threshold_policy = screener_params.get("score_threshold_policy") or {}
+    static_threshold = float(
+        threshold_policy.get("static_threshold", screener_params.get("min_score_threshold", 0.48))
+        or screener_params.get("min_score_threshold", 0.48)
+    )
+    # Production mode remains static unless explicitly configured otherwise
+    production_mode = str(threshold_policy.get("mode", "static")).lower()
+    if production_mode != "static":
+        logger.warning(
+            "score_threshold_policy.mode=%s is not enabled for production; "
+            "using static_threshold=%.4f (shadow-only dynamic evaluation)",
+            production_mode,
+            static_threshold,
+        )
+    configured_threshold = static_threshold
+    screener_params = dict(screener_params)
+    screener_params["min_score_threshold"] = configured_threshold
+
     with stage("1차 필터링", notify_key="screener_stage1"):
         # 시장 상태를 고려한 스크리닝 파라미터 조정
         from screener_core import get_market_aware_screening_params
@@ -2686,12 +2995,44 @@ def run_screener(
             logger.info(f"시장 인식 스크리닝 파라미터 적용: {_CURRENT_MARKET_STATE.regime.value}")
         else:
             adjusted_params = screener_params
-        
-        df_filtered, fixed_date = _filter_initial_stocks(date_str, adjusted_params, market, risk_params, debug)
+
+        df_filtered, fixed_date, stage1_meta = _filter_initial_stocks(
+            date_str,
+            adjusted_params,
+            market,
+            risk_params,
+            debug,
+            refresh_amount5d=refresh_amount5d,
+            funnel=funnel,
+        )
+        stage_durations["initial_filter"] = float(stage1_meta.get("duration_sec") or 0.0)
         if df_filtered.empty:
             msg = "❌ 1차 필터링 결과, 대상 종목이 없습니다."
             logger.warning(msg)
             _notify(msg, key="screener_no_candidates_stage1", cooldown_sec=60)
+            # Mark downstream stages as NOT_RUN
+            for st_name in ("SCORING", "MIN_SCORE", "MOMENTUM", "VOLATILITY", "SECTOR_DIVERSIFICATION"):
+                if not any(s.stage == st_name for s in funnel.stages):
+                    funnel.record_not_run(st_name, reason="NO_INPUT")
+            empty_reason = "AMOUNT5D_DATA_UNAVAILABLE"
+            for f in funnel.findings:
+                if f.get("code") == "UNIVERSE_EMPTY":
+                    empty_reason = "UNIVERSE_EMPTY"
+                    break
+            _persist_run_meta(
+                status="SUCCESS",
+                result_status="EMPTY_DATA_QUALITY",
+                empty_reason=empty_reason,
+                configured_threshold=configured_threshold,
+                effective_threshold=configured_threshold,
+                candidate_count=0,
+            )
+            # Keep empty candidate artifacts for downstream safety
+            for prefix in ("screener_candidates_full", "screener_candidates", "screener_scores"):
+                atomic_write_json(
+                    OUTPUT_DIR / format_pipeline_artifact(prefix, fixed_date, market, sess),
+                    [],
+                )
             return
 
     # KIS 1회 호출로 섹터+상장일 동시 조회 → 이후 섹터 보강/상장일 프리패치는 캐시만 사용
@@ -2761,12 +3102,20 @@ def run_screener(
         
         # 시장 상태를 전역 변수로 저장 (후속 단계에서 사용)
         _CURRENT_MARKET_STATE = market_state
+        market_state_payload = {
+            "regime_score": float(regime) if regime is not None else None,
+            "trend": getattr(market_state, "trend_direction", None),
+            "volatility": getattr(market_state, "volatility_level", None),
+            "regime": getattr(getattr(market_state, "regime", None), "value", None),
+            "confidence": float(getattr(market_state, "confidence", 0.0) or 0.0),
+        }
 
     with stage("섹터 트렌드 계산", notify_key="screener_sector_trend"):
         sector_trends = _calculate_sector_trends(fixed_date)
 
     # ✅ 보유 종목 스코어 업데이트
     holdings_scores = {}
+    holdings = []
     with stage("보유 종목 스코어 업데이트", notify_key="screener_holdings"):
         holdings = get_holdings_from_balance()
         if holdings:
@@ -2793,12 +3142,24 @@ def run_screener(
             df_filtered = df_filtered[_valid_idx]
         if df_filtered.empty:
             logger.warning("스코어링 대상 종목이 없어 상세 분석을 건너뜁니다.")
+            funnel.record_not_run("SCORING", reason="NO_INPUT")
+            for st_name in ("MIN_SCORE", "MOMENTUM", "VOLATILITY", "SECTOR_DIVERSIFICATION"):
+                funnel.record_not_run(st_name, reason="NO_INPUT")
+            _persist_run_meta(
+                status="SUCCESS",
+                result_status="EMPTY_DATA_QUALITY",
+                empty_reason="SCORING_FAILURE_ALL",
+                configured_threshold=configured_threshold,
+                effective_threshold=configured_threshold,
+                candidate_count=0,
+            )
             return
         # 스코어링 실패 통계 초기화
         global _fail_stats, _fail_rows
         _fail_stats.clear()
         _fail_rows.clear()
-        
+
+        scoring_t0 = time.perf_counter()
         results = []
         total = len(df_filtered)
         kis_conc = int((settings.get("kis_limits") or {}).get("max_concurrency", 2) or 2)
@@ -2884,6 +3245,9 @@ def run_screener(
         except Exception as _e:
             logger.debug("실패 요약/CSV 저장 중 오류: %s", _e)
 
+        stage_durations["scoring"] = round(time.perf_counter() - scoring_t0, 3)
+        funnel.record_applied("SCORING", total, len(results), duration_sec=stage_durations["scoring"])
+
         if not results:
             try:
                 dbg_dir = OUTPUT_DIR / "debug"
@@ -2900,7 +3264,9 @@ def run_screener(
             except Exception as _e:
                 logger.debug("컨텍스트 저장 실패: %s", _e)
 
-            # 실패 원인 분석
+            funnel.add_finding("SCORING_FAILURE_ALL", "ERROR")
+            for st_name in ("MIN_SCORE", "MOMENTUM", "VOLATILITY", "SECTOR_DIVERSIFICATION"):
+                funnel.record_not_run(st_name, reason="NO_INPUT")
             fail_analysis = []
             if _fail_stats.get("newly_listed_skip", 0) > 0:
                 fail_analysis.append(f"신규상장({_fail_stats['newly_listed_skip']}개)")
@@ -2910,14 +3276,31 @@ def run_screener(
                 fail_analysis.append(f"데이터부족({_fail_stats['skipped_short_history']}개)")
             if _fail_stats.get("insufficient_data", 0) > 0:
                 fail_analysis.append(f"지표계산실패({_fail_stats['insufficient_data']}개)")
-            
             analysis_str = ", ".join(fail_analysis) if fail_analysis else "원인불명"
             msg = f"❌ 2차 스크리닝 결과, 최종 후보가 없습니다. (실패원인: {analysis_str})"
             logger.warning(msg)
             _notify(msg, key="screener_no_candidates_stage2", cooldown_sec=60)
+            atomic_write_json(
+                OUTPUT_DIR / format_pipeline_artifact("screener_scores", fixed_date, market, sess),
+                [],
+            )
+            for prefix in ("screener_candidates_full", "screener_candidates", "screener_shadow_candidates"):
+                atomic_write_json(
+                    OUTPUT_DIR / format_pipeline_artifact(prefix, fixed_date, market, sess),
+                    [],
+                )
+            _persist_run_meta(
+                status="SUCCESS",
+                result_status="EMPTY_DATA_QUALITY",
+                empty_reason="SCORING_FAILURE_ALL",
+                configured_threshold=configured_threshold,
+                effective_threshold=configured_threshold,
+                candidate_count=0,
+            )
             return
 
     with stage("정렬/다양화/손절·목표가 계산/저장", notify_key="screener_finalize"):
+        finalize_t0 = time.perf_counter()
         df_scores = pd.DataFrame(results).set_index("Ticker")
         left = df_filtered.copy()
         right = df_scores.copy()
@@ -2931,126 +3314,149 @@ def run_screener(
             .reset_index()
             .rename(columns={"index": "Ticker"})
         )
-        # Ticker: KR 6자리 / US 심볼 (Code 컬럼이 있으면 통일 후 제거)
         if "Code" in df_final.columns:
             df_final["Ticker"] = norm_ticker_series(df_final["Code"], market)
             df_final = df_final.drop(columns=["Code"], errors="ignore")
         elif "Ticker" in df_final.columns:
             df_final["Ticker"] = norm_ticker_series(df_final["Ticker"], market)
 
-        # 정렬: 제외사유 없는 것 우선, 그 다음 점수 높은 순
-        df_final["exclude_reasons_len"] = df_final["exclude_reasons"].apply(len)
-        df_sorted = df_final.sort_values(by=["exclude_reasons_len", "Score"], ascending=[True, False]).drop(columns=["exclude_reasons_len"])
+        held_tickers = {
+            norm_ticker(h.get("pdno", ""), market)
+            for h in (holdings or [])
+            if h.get("pdno")
+        }
+        config_dir = Path(getattr(utils, "CONFIG_PATH", Path("/app/config/config.json"))).parent
+        issuer_map = load_issuer_group_map(
+            {"screener_params": {
+                **screener_params,
+                "issuer_groups_file": screener_params.get(
+                    "issuer_groups_file", "issuer_groups.json"
+                ),
+            }},
+            config_dir=config_dir,
+        )
+        rsi_hot = float(screener_params.get("rsi_overheated_threshold", 70.0) or 70.0)
+        exclude_held = bool(screener_params.get("exclude_held_from_candidates", True))
 
-        # Phase 3: 스크리너 필터링 강화
-        n_scored_total = len(df_sorted)
-        n_after_score = n_scored_total
-        n_after_momentum = n_scored_total
-        n_after_vol = n_scored_total
+        # Precompute momentum/vol pass flags on full scored set (for export + optional filters)
+        momentum_pass_map: Dict[str, bool] = {}
+        volatility_pass_map: Dict[str, bool] = {}
+        require_mom = bool(screener_params.get("require_positive_momentum", False))
+        exclude_vol = bool(screener_params.get("exclude_high_volatility", False))
+        vol_thr = float(screener_params.get("volatility_threshold", 0.30) or 0.30)
+        if require_mom or exclude_vol:
+            for _, row in df_final.iterrows():
+                ticker = str(row.get("Ticker", ""))
+                momentum_pass_map[ticker] = True
+                volatility_pass_map[ticker] = True
+                try:
+                    price_data = get_historical_prices(
+                        ticker,
+                        (datetime.strptime(fixed_date, "%Y%m%d") - timedelta(days=60)).strftime("%Y%m%d"),
+                        fixed_date,
+                    )
+                    if price_data is None or len(price_data) < 20:
+                        continue
+                    close_col = next(
+                        (c for c in ("Close", "close", "종가") if c in price_data.columns),
+                        None,
+                    )
+                    if not close_col:
+                        continue
+                    prices = price_data[close_col].tolist()
+                    if require_mom and len(prices) >= 20 and prices[-20] > 0:
+                        momentum_pass_map[ticker] = ((prices[-1] - prices[-20]) / prices[-20]) > 0
+                    if exclude_vol and len(prices) >= 20:
+                        returns = pd.Series(prices).pct_change().dropna()
+                        volatility_pass_map[ticker] = float(returns.std() * (252 ** 0.5)) <= vol_thr
+                except Exception as e:
+                    logger.debug("[%s] mom/vol precompute failed: %s", ticker, e)
 
-        # 1) 최소 점수 임계값 필터
-        min_score_threshold = screener_params.get("min_score_threshold", 0.0)
-        if min_score_threshold > 0:
-            before = len(df_sorted)
-            _before_tickers = df_sorted["Ticker"] if "Ticker" in df_sorted.columns else df_sorted.index
-            df_sorted = df_sorted[df_sorted["Score"] >= min_score_threshold]
-            n_after_score = len(df_sorted)
-            logger.info(f"최소 점수 필터 ({min_score_threshold:.2f}): {before} → {len(df_sorted)} 종목")
-            _after_tickers = df_sorted["Ticker"] if "Ticker" in df_sorted.columns else df_sorted.index
-            _log_dropped(f"최종:최소점수<{min_score_threshold:.2f}", _before_tickers, _after_tickers)
-        
-        # 2) 모멘텀 필터 (양의 모멘텀 필수)
-        if screener_params.get("require_positive_momentum", False):
-            before = len(df_sorted)
-            # 20일 수익률 계산 (간단한 모멘텀 지표)
-            momentum_mask = pd.Series(True, index=df_sorted.index)
-            for idx, row in df_sorted.iterrows():
-                ticker = row.get("Ticker", "")
-                try:
-                    # 가격 데이터 조회하여 모멘텀 계산
-                    price_data = get_historical_prices(ticker, 
-                        (datetime.strptime(date_str, "%Y%m%d") - timedelta(days=30)).strftime("%Y%m%d"),
-                        date_str)
-                    if price_data is not None and len(price_data) >= 20:
-                        close_col = None
-                        for col in ["Close", "close", "종가"]:
-                            if col in price_data.columns:
-                                close_col = col
-                                break
-                        if close_col:
-                            prices = price_data[close_col].tolist()
-                            if len(prices) >= 20:
-                                momentum_20d = (prices[-1] - prices[-20]) / prices[-20] if prices[-20] > 0 else 0
-                                momentum_mask.loc[idx] = momentum_20d > 0
-                except Exception as e:
-                    logger.debug(f"[{ticker}] 모멘텀 계산 실패: {e}")
-                    momentum_mask.loc[idx] = True  # 오류 시 통과
-            
-            _before_tickers = df_sorted["Ticker"] if "Ticker" in df_sorted.columns else df_sorted.index
-            df_sorted = df_sorted[momentum_mask]
-            n_after_momentum = len(df_sorted)
-            logger.info(f"양의 모멘텀 필터: {before} → {len(df_sorted)} 종목")
-            _after_tickers = df_sorted["Ticker"] if "Ticker" in df_sorted.columns else df_sorted.index
-            _log_dropped("최종:음의모멘텀", _before_tickers, _after_tickers)
-        
-        # 3) 변동성 필터 (고변동성 종목 제외)
-        if screener_params.get("exclude_high_volatility", False):
-            volatility_threshold = screener_params.get("volatility_threshold", 0.30)
-            before = len(df_sorted)
-            volatility_mask = pd.Series(True, index=df_sorted.index)
-            for idx, row in df_sorted.iterrows():
-                ticker = row.get("Ticker", "")
-                try:
-                    # 가격 데이터 조회하여 변동성 계산
-                    price_data = get_historical_prices(ticker,
-                        (datetime.strptime(date_str, "%Y%m%d") - timedelta(days=60)).strftime("%Y%m%d"),
-                        date_str)
-                    if price_data is not None and len(price_data) >= 20:
-                        close_col = None
-                        for col in ["Close", "close", "종가"]:
-                            if col in price_data.columns:
-                                close_col = col
-                                break
-                        if close_col:
-                            prices = price_data[close_col].tolist()
-                            if len(prices) >= 20:
-                                returns = pd.Series(prices).pct_change().dropna()
-                                volatility = returns.std() * (252 ** 0.5)  # 연율화 변동성
-                                volatility_mask.loc[idx] = volatility <= volatility_threshold
-                except Exception as e:
-                    logger.debug(f"[{ticker}] 변동성 계산 실패: {e}")
-                    volatility_mask.loc[idx] = True  # 오류 시 통과
-            
-            _before_tickers = df_sorted["Ticker"] if "Ticker" in df_sorted.columns else df_sorted.index
-            df_sorted = df_sorted[volatility_mask]
-            n_after_vol = len(df_sorted)
-            logger.info(f"변동성 필터 (≤{volatility_threshold:.0%}): {before} → {len(df_sorted)} 종목")
-            _after_tickers = df_sorted["Ticker"] if "Ticker" in df_sorted.columns else df_sorted.index
-            _log_dropped(f"최종:고변동성>{volatility_threshold:.0%}", _before_tickers, _after_tickers)
+        scored_all = enrich_scored_dataframe(
+            df_final,
+            held_tickers=held_tickers,
+            issuer_map=issuer_map,
+            production_threshold=configured_threshold,
+            rsi_overheated_threshold=rsi_hot,
+            exclude_held_from_candidates=exclude_held,
+            momentum_pass_map=momentum_pass_map,
+            volatility_pass_map=volatility_pass_map,
+        )
+        score_dist = score_distribution(
+            [float(x) for x in scored_all["Score"].tolist()] if not scored_all.empty else []
+        )
+        logger.info(
+            "스코어 분포(저장용 전체): count=%s mean=%s median=%s max=%s p90=%s",
+            score_dist.get("count"),
+            score_dist.get("mean"),
+            score_dist.get("median"),
+            score_dist.get("max"),
+            score_dist.get("p90"),
+        )
 
         top_n = min(int(screener_params.get("top_n", 10)), int(risk_params.get("max_positions", 10)))
         sector_cap = float(screener_params.get("sector_cap", 0.3))
-        
-        # 다양화 (Ticker 컬럼 없으면 인덱스를 Ticker로 사용)
-        if "Ticker" not in df_sorted.columns and len(df_sorted.columns) > 0:
-            df_sorted = df_sorted.copy()
-            df_sorted.insert(0, "Ticker", df_sorted.index)
-        final_candidates_base = diversify_by_sector(df_sorted.set_index("Ticker"), top_n, sector_cap).reset_index()
 
-        # 최종 단계 퍼널 요약
-        _log_funnel(
-            "최종 선정",
-            [
-                ("스코어링 통과", n_scored_total),
-                (f"최소점수≥{min_score_threshold:.2f}", n_after_score),
-                ("양의 모멘텀", n_after_momentum),
-                ("변동성 필터", n_after_vol),
-                (f"섹터다양화(top{top_n})", len(final_candidates_base)),
-            ],
+        final_candidates_base, sel_stages = select_candidates_pipeline(
+            scored_all,
+            threshold=configured_threshold,
+            require_positive_momentum=require_mom,
+            exclude_high_volatility=exclude_vol,
+            top_n=top_n,
+            sector_cap=sector_cap,
+            diversify_fn=diversify_by_sector,
+            apply_issuer_dedupe=bool(screener_params.get("issuer_dedupe_enabled", True)),
+            require_eligible=True,
+        )
+        for st in sel_stages:
+            funnel.record(st)
+        funnel.log("최종 선정")
+        logger.info(
+            "최소점수 통과 수=%d / 최종 후보 수=%d (threshold=%.4f)",
+            next((s.output_count for s in sel_stages if s.stage == "MIN_SCORE"), 0),
+            len(final_candidates_base),
+            configured_threshold,
         )
         if "Sector" in final_candidates_base.columns and not final_candidates_base.empty:
             _sec_dist = final_candidates_base["Sector"].value_counts().to_dict()
             logger.info("최종 후보 섹터 분포: %s", _sec_dist)
+
+        # Shadow mode (never feeds trader)
+        shadow_payload: Optional[Dict[str, Any]] = None
+        shadow_candidates_df = final_candidates_base.iloc[0:0]
+        shadow_thr = compute_shadow_score_threshold(
+            [float(x) for x in scored_all["Score"].tolist()] if not scored_all.empty else [],
+            threshold_policy,
+        )
+        if shadow_thr is not None and threshold_policy.get("shadow_enabled", False):
+            shadow_max = int(threshold_policy.get("shadow_max_candidates", top_n) or top_n)
+            shadow_candidates_df, shadow_stages = select_candidates_pipeline(
+                scored_all,
+                threshold=float(shadow_thr),
+                require_positive_momentum=require_mom,
+                exclude_high_volatility=exclude_vol,
+                top_n=shadow_max,
+                sector_cap=sector_cap,
+                diversify_fn=diversify_by_sector,
+                apply_issuer_dedupe=bool(screener_params.get("issuer_dedupe_enabled", True)),
+                require_eligible=True,
+                max_candidates=shadow_max,
+            )
+            shadow_payload = {
+                "enabled": True,
+                "mode": threshold_policy.get("shadow_mode", "hybrid"),
+                "floor": threshold_policy.get("shadow_floor"),
+                "percentile": threshold_policy.get("shadow_percentile"),
+                "threshold": round(float(shadow_thr), 4),
+                "candidate_count": int(len(shadow_candidates_df)),
+                "stages": [s.to_dict() for s in shadow_stages],
+                "note": "Shadow candidates are NOT used as trader input",
+            }
+            logger.info(
+                "Shadow mode: threshold=%.4f candidates=%d (not used by trader)",
+                float(shadow_thr),
+                len(shadow_candidates_df),
+            )
 
         # ── 레벨 계산 ──
         # Phase 1: config에서 읽기
@@ -3060,15 +3466,19 @@ def run_screener(
         
         levels_data = []
         for _, row in final_candidates_base.iterrows():
+            px = float(row["Price"]) if "Price" in row and pd.notna(row["Price"]) else 0.0
             levels = {
-                "stop_loss": row["Price"] * (1 - stop_loss_pct),  # Phase 1: 하드코딩 제거
-                "take_profit": row["Price"] * (1 + take_profit_pct),  # Phase 1: 하드코딩 제거
-                "atr_stop": row["Price"] * (1 - stop_loss_pct * 0.5),  # ATR 기반 손절 (임시)
-                "atr_profit": row["Price"] * (1 + take_profit_pct * 0.5)   # ATR 기반 목표가 (임시)
+                "stop_loss": px * (1 - stop_loss_pct),
+                "take_profit": px * (1 + take_profit_pct),
+                "atr_stop": px * (1 - stop_loss_pct * 0.5),
+                "atr_profit": px * (1 + take_profit_pct * 0.5),
             }
             levels_data.append(levels)
-        df_levels = pd.DataFrame(levels_data, index=final_candidates_base.index)
-        final_candidates = pd.concat([final_candidates_base, df_levels], axis=1)
+        if levels_data:
+            df_levels = pd.DataFrame(levels_data, index=final_candidates_base.index)
+            final_candidates = pd.concat([final_candidates_base, df_levels], axis=1)
+        else:
+            final_candidates = final_candidates_base.copy()
 
         # 필수 컬럼 보장 - stop_loss/take_profit은 후보 0건이면 df_levels가 비어 있어 없을 수 있음
         if "손절가" not in final_candidates.columns:
@@ -3138,85 +3548,107 @@ def run_screener(
         for df_ in (final_candidates_full, final_candidates_slim):
             df_["affordability_filter_requested"] = aff_req
 
-        # 파일 경로 (실제 사용되는 파일만)
-        cands_full_json  = OUTPUT_DIR / format_pipeline_artifact(
+        # 파일 경로
+        cands_full_json = OUTPUT_DIR / format_pipeline_artifact(
             "screener_candidates_full", fixed_date, market, sess
         )
-        cands_slim_json  = OUTPUT_DIR / format_pipeline_artifact(
+        cands_slim_json = OUTPUT_DIR / format_pipeline_artifact(
             "screener_candidates", fixed_date, market, sess
         )
-        scores_json      = OUTPUT_DIR / format_pipeline_artifact(
+        scores_json = OUTPUT_DIR / format_pipeline_artifact(
             "screener_scores", fixed_date, market, sess
         )
-        holdings_json    = OUTPUT_DIR / format_pipeline_artifact(
+        shadow_json = OUTPUT_DIR / format_pipeline_artifact(
+            "screener_shadow_candidates", fixed_date, market, sess
+        )
+        holdings_json = OUTPUT_DIR / format_pipeline_artifact(
             "screener_holdings", fixed_date, market, sess
         )
 
-        # 저장 (실제 사용되는 파일만)
+        # Production candidates (trader / news / gpt input)
         final_candidates_full.to_json(cands_full_json, orient="records", indent=2, force_ascii=False)
         final_candidates_slim.to_json(cands_slim_json, orient="records", indent=2, force_ascii=False)
-        
-        # 보유 종목 점수 캐시 (트레이더 교체 판단용) - 확장된 데이터 구조 (존재하는 컬럼만 사용)
-        _score_cols = [
-            "Ticker", "Name", "Sector", "Price", "Score",
-            "FinScore", "TechScore", "MktScore", "SectorScore", "PatternScore",
-            "VolKki", "Pos52w", "PER", "PBR", "RSI", "ATR", "MA50", "MA200",
-            "MA20Up", "AccumVol", "HigherLows", "Consolidation", "YEY",
-            "affordability_filter_requested",
-        ]
-        _score_cols_present = [c for c in _score_cols if c in final_candidates_slim.columns]
-        if not _score_cols_present:
-            logger.warning("스코어 저장용 컬럼이 없어 scores_json 생략")
-        else:
-            scores_to_save = final_candidates_slim[_score_cols_present].copy()
-            _rename_map = {
-                "Ticker": "ticker",
-                "Score": "score_total",
-                "Name": "name",
-                "Sector": "sector",
-                "Price": "price",
-                "FinScore": "fin_score",
-                "TechScore": "tech_score",
-                "MktScore": "mkt_score",
-                "SectorScore": "sector_score",
-                "PatternScore": "pattern_score",
-                "VolKki": "vol_kki",
-                "Pos52w": "pos_52w",
-                "PER": "per",
-                "PBR": "pbr",
-                "RSI": "rsi",
-                "ATR": "atr",
-                "MA50": "ma50",
-                "MA200": "ma200",
-                "MA20Up": "ma20_up",
-                "AccumVol": "accum_vol",
-                "HigherLows": "higher_lows",
-                "Consolidation": "consolidation",
-                "YEY": "yey",
-            }
-            scores_to_save = scores_to_save.rename(columns={k: v for k, v in _rename_map.items() if k in scores_to_save.columns})
-            scores_to_save["updated_at"] = fixed_date
-            scores_to_save.to_json(scores_json, orient="records", indent=2, force_ascii=False)
 
-        # 보유 종목 스코어 저장 (trader.py가 사용)
+        # Full scored universe (NOT limited to final candidates)
+        scores_records = scores_records_for_export(scored_all, trade_date=fixed_date)
+        atomic_write_json(scores_json, scores_records)
+
+        # Shadow candidates — never used as trader input
+        if shadow_candidates_df is not None and not shadow_candidates_df.empty:
+            shadow_out = shadow_candidates_df.copy()
+            shadow_out["schema_version"] = SCHEMA_VERSION
+            shadow_out["generated_at"] = generated_at
+            shadow_out["shadow"] = True
+            shadow_out.to_json(shadow_json, orient="records", indent=2, force_ascii=False)
+        else:
+            atomic_write_json(shadow_json, [])
+
         if holdings_scores:
             holdings_list = list(holdings_scores.values())
-            with open(holdings_json, "w", encoding="utf-8") as f:
-                json.dump(holdings_list, f, ensure_ascii=False, indent=2)
-            logger.info("보유 종목 스코어 저장: %s", holdings_json)
-
-        # 로그 (실제 사용되는 파일만)
-        logger.info("최종 후보(풀) 저장: %s", cands_full_json)
-        logger.info("✅ 스크리닝 완료. 후보(슬림) 저장: %s", cands_slim_json)
-        logger.info("스코어 캐시 저장: %s", scores_json)
-        if holdings_scores:
+            atomic_write_json(holdings_json, holdings_list)
             logger.info("보유 종목 스코어 저장: %s (%d개)", holdings_json, len(holdings_scores))
+
+        stage_durations["final_selection"] = round(time.perf_counter() - finalize_t0, 3)
+
+        min_score_pass = next(
+            (s.output_count for s in sel_stages if s.stage == "MIN_SCORE"), 0
+        )
+        status, result_status, empty_reason = classify_empty_result(
+            candidate_count=len(final_candidates),
+            scored_count=len(scored_all),
+            universe_count=next(
+                (s.output_count for s in funnel.stages if s.stage == "UNIVERSE"), 0
+            ),
+            amount5d_pass=next(
+                (s.output_count for s in funnel.stages if s.stage == "AMOUNT5D"), 0
+            ),
+            scoring_failures_all=False,
+            data_quality_codes=[f.get("code", "") for f in funnel.findings],
+            min_score_pass=min_score_pass,
+            empty_after_min_score=(min_score_pass == 0 and len(scored_all) > 0),
+        )
+        if empty_reason:
+            logger.info(
+                "EMPTY reason=%s result_status=%s (production candidates=%d, scores=%d)",
+                empty_reason,
+                result_status,
+                len(final_candidates),
+                len(scores_records),
+            )
+
+        top_score_rows = scores_records[:10]
+        _persist_run_meta(
+            status=status,
+            result_status=result_status,
+            empty_reason=empty_reason,
+            configured_threshold=configured_threshold,
+            effective_threshold=configured_threshold,
+            candidate_count=len(final_candidates),
+            score_dist=score_dist,
+            shadow=shadow_payload,
+            top_scores=top_score_rows,
+            production_candidates=final_candidates.to_dict(orient="records")
+            if not final_candidates.empty
+            else [],
+            shadow_candidates=shadow_candidates_df.to_dict(orient="records")
+            if shadow_candidates_df is not None and not shadow_candidates_df.empty
+            else [],
+        )
+
+        logger.info("최종 후보(풀) 저장: %s (%d)", cands_full_json, len(final_candidates))
+        logger.info("✅ 스크리닝 완료. 후보(슬림) 저장: %s (%d)", cands_slim_json, len(final_candidates))
+        logger.info("스코어 전체 저장: %s (%d)", scores_json, len(scores_records))
+        logger.info("Shadow 후보 저장: %s (%d)", shadow_json, len(shadow_candidates_df) if shadow_candidates_df is not None else 0)
 
         try:
             _top_cols = ["Ticker", "Name", "Sector", "Price", "목표가", "손절가", "Score"]
             _top_cols_ok = [c for c in _top_cols if c in final_candidates_slim.columns]
             if not _top_cols_ok or final_candidates_slim.empty:
-                _notify("✅ 스크리너 완료 (후보 없음 또는 요약 컬럼 부족)", key="screener_done", cooldown_sec=60)
+                _notify(
+                    f"✅ 스크리너 완료 (후보 0 / scores={len(scores_records)} / {result_status})",
+                    key="screener_done",
+                    cooldown_sec=60,
+                )
             else:
                 top5 = final_candidates_slim.head(5)[_top_cols_ok]
                 lines = ["Top5:"]
@@ -3235,7 +3667,7 @@ def run_screener(
 
 # ─────────── CLI ───────────
 def parse_args():
-    parser = argparse.ArgumentParser(description="KOSPI/KOSDAQ/KONEX 스크리너")
+    parser = argparse.ArgumentParser(description="KOSPI/KOSDAQ/KONEX/SP500 스크리너")
     parser.add_argument("--date", default=datetime.now().strftime("%Y%m%d"))
     parser.add_argument("--session", choices=["am", "pm"], help="파이프라인 세션 (미지정 시 KST·MARKET 기준 자동)")
     parser.add_argument(
@@ -3250,6 +3682,11 @@ def parse_args():
         "--force",
         action="store_true",
         help="휴장일/주말에도 실행 (로컬 테스트용)",
+    )
+    parser.add_argument(
+        "--refresh-amount5d",
+        action="store_true",
+        help="Amount5D 캐시를 무시하고 KIS에서 재조회",
     )
     return parser.parse_args()
 
@@ -3266,7 +3703,29 @@ if __name__ == "__main__":
             args.debug,
             pipeline_session=args.session,
             force=args.force,
+            refresh_amount5d=args.refresh_amount5d,
         )
     except Exception as e:
         logger.critical("스크리너 치명적 오류: %s", e, exc_info=True)
+        try:
+            sess = (args.session or os.getenv("PIPELINE_SESSION") or "pm").lower()
+            if sess not in ("am", "pm"):
+                sess = "pm"
+            fail_meta = {
+                "schema_version": "1.0",
+                "market": args.market,
+                "trade_date": args.date,
+                "session": sess,
+                "status": "FAILED",
+                "result_status": "FAILED",
+                "empty_reason": "UNHANDLED_EXCEPTION",
+                "error": f"{type(e).__name__}: {e}",
+            }
+            atomic_write_json(
+                OUTPUT_DIR
+                / format_pipeline_artifact("screener_run_meta", args.date, args.market, sess),
+                fail_meta,
+            )
+        except Exception:
+            pass
         sys.exit(1)

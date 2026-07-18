@@ -1,0 +1,13 @@
+{
+  // Same-issuer share classes (highest score kept at diversification)
+  "issuer_groups": {
+    "GOOG": "ALPHABET",
+    "GOOGL": "ALPHABET",
+    "BRK.B": "BERKSHIRE",
+    "BRK.A": "BERKSHIRE",
+    "FOX": "FOX_CORP",
+    "FOXA": "FOX_CORP",
+    "NWS": "NEWS_CORP",
+    "NWSA": "NEWS_CORP"
+  }
+}

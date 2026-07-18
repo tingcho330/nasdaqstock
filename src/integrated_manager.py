@@ -3287,6 +3287,47 @@ def _tail(text: str, n: int = 12) -> str:
     lines = text.strip().splitlines()
     return "\n".join(lines[-n:])
 
+
+def _extract_screener_summary(stdout: str) -> str:
+    """운영 INFO용 스크리너 핵심 요약 라인만 추출."""
+    try:
+        from screener_ops import extract_screener_summary_lines
+
+        lines = extract_screener_summary_lines(stdout or "")
+        return "\n".join(lines) if lines else _tail(stdout, 20)
+    except Exception:
+        return _tail(stdout, 20)
+
+
+def _save_subprocess_stdout_log(
+    script_name: str,
+    run_id: str,
+    pipeline_ctx: Dict[str, str],
+    stdout: str,
+    stderr: str = "",
+) -> Optional[Path]:
+    """성공/실패 모두 자식 stdout/stderr를 파일로 보존."""
+    try:
+        from screener_ops import save_subprocess_log
+
+        trade_date = pipeline_ctx.get("trade_date") or datetime.now(KST).strftime("%Y%m%d")
+        session = pipeline_ctx.get("session") or "pm"
+        stem = Path(script_name).stem
+        logs_dir = OUTPUT_DIR / "logs"
+        return save_subprocess_log(
+            logs_dir,
+            script_stem=stem,
+            trade_date=trade_date,
+            session=session,
+            market=MARKET,
+            run_id=run_id,
+            stdout=stdout or "",
+            stderr=stderr or "",
+        )
+    except Exception as e:
+        logger.warning("[%s] subprocess log 저장 실패(%s): %s", run_id, script_name, e)
+        return None
+
 def _apply_pipeline_env(run_id: str) -> Dict[str, str]:
     """파이프라인 AM/PM·거래일을 환경변수로 고정 (자정 넘김 시 산출물 짝 유지)."""
     cfg = getattr(settings, "_config", None) or {}
@@ -3382,9 +3423,18 @@ def run_script(script_name: str, run_id: str, pipeline_ctx: Optional[Dict[str, s
             env=child_env,
         )
         dur = time.perf_counter() - t0
-        stdout_tail = _tail(result.stdout, 12)
+        log_path = _save_subprocess_stdout_log(
+            script_name, run_id, ctx, result.stdout or "", result.stderr or ""
+        )
         logger.info(f"[{run_id}] ✅ STEP OK: {script_name} | {dur:.1f}s")
-        logger.debug(f"[{run_id}] --- {script_name} tail ---\n{stdout_tail}")
+        if log_path:
+            logger.info(f"[{run_id}] subprocess log saved: {log_path}")
+        if script_name == "screener.py":
+            summary = _extract_screener_summary(result.stdout or "")
+            if summary:
+                logger.info(f"[{run_id}] --- screener summary ---\n{summary}")
+        else:
+            logger.debug(f"[{run_id}] --- {script_name} tail ---\n{_tail(result.stdout, 12)}")
 
         if dur > SLOW_STEP_SEC:
             warned = True
@@ -3392,15 +3442,33 @@ def run_script(script_name: str, run_id: str, pipeline_ctx: Optional[Dict[str, s
 
         return True, warned, dur
 
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as e:
         dur = time.perf_counter() - t0
+        out = getattr(e, "stdout", "") or ""
+        err = getattr(e, "stderr", "") or ""
+        if isinstance(out, bytes):
+            out = out.decode("utf-8", errors="replace")
+        if isinstance(err, bytes):
+            err = err.decode("utf-8", errors="replace")
+        log_path = _save_subprocess_stdout_log(script_name, run_id, ctx, out, err)
         logger.error(f"[{run_id}] ❌ STEP TIMEOUT: {script_name} ({timeout_sec}s) | {dur:.1f}s 경과")
+        if log_path:
+            logger.error(f"[{run_id}] subprocess log saved: {log_path}")
+        logger.error(f"[{run_id}] --- STDOUT tail ---\n{_tail(out, 40)}")
+        logger.error(f"[{run_id}] --- STDERR tail ---\n{_tail(err, 40)}")
         return False, warned, dur
 
     except subprocess.CalledProcessError as e:
         dur = time.perf_counter() - t0
+        stdout_tail = _tail(e.stdout, 80)
         stderr_tail = _tail(e.stderr, 80)
+        log_path = _save_subprocess_stdout_log(
+            script_name, run_id, ctx, e.stdout or "", e.stderr or ""
+        )
         logger.error(f"[{run_id}] ❌ STEP FAIL: {script_name} (exit={e.returncode}) | {dur:.1f}s")
+        if log_path:
+            logger.error(f"[{run_id}] subprocess log saved: {log_path}")
+        logger.error(f"[{run_id}] --- STDOUT tail ---\n{stdout_tail}")
         logger.error(f"[{run_id}] --- STDERR tail ---\n{stderr_tail}")
         return False, warned, dur
 
