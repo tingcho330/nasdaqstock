@@ -24,6 +24,7 @@ from daily_balance_values import (  # noqa: E402
     is_return_calculation_usable,
     normalize_account_values,
     propose_currency_repair_from_embedded,
+    resolve_realized_pnl_delta,
     save_immutable_source_copy,
     sha256_file,
     verify_source_snapshot_not_mutated,
@@ -167,15 +168,27 @@ class TestNormalize:
 
 class TestCurrencyRepair:
     def test_propose_from_embedded_ops_open(self):
+        """Polluted open: arithmetic candidate only — never a validated proposal."""
         snap = ops_polluted_open()
         prop = propose_currency_repair_from_embedded(snap, market="SP500")
-        assert prop["proposed_total_asset_usd"] == 1511.87
-        assert prop["proposed_available_cash_usd"] == 556.0
-        assert prop["proposed_holdings_value_usd"] == 955.87
-        assert prop["gates_ok"] is True
+        assert prop["arithmetic_candidate_total_asset_usd"] == 1511.87
+        assert prop["candidate_currency_unverified"] is True
+        assert prop["proposed_total_asset_usd"] is None
+        assert prop["proposed_available_cash_usd"] is None
+        assert prop["proposed_holdings_value_usd"] is None
+        assert prop["gates_ok"] is False
         reasons = [r["reason"] for r in prop["rejected_fields"]]
         assert "LEGACY_USD_FIELD_POLLUTED_BY_KRW" in reasons
         assert "NOT_ASSET_CASH_BUYING_POWER_INCLUDED" in reasons
+        # NAS: SHA unknown when file exists; local: missing path/file — both block apply
+        assert any(
+            r in reasons
+            for r in (
+                "SOURCE_SNAPSHOT_SHA_UNKNOWN",
+                "SOURCE_SNAPSHOT_MISSING_FILE",
+                "SOURCE_SNAPSHOT_MISSING_PATH",
+            )
+        )
         assert any(r.get("field") == "source_snapshot_file" for r in prop["rejected_fields"])
 
     def test_dry_run_no_file_change(self, balance_dir):
@@ -185,12 +198,125 @@ class TestCurrencyRepair:
         before = p.read_bytes()
         result = im.repair_daily_balance_currency(TD, "open", apply=False)
         assert result["dry_run"] is True
+        assert result["status"] == "evidence_insufficient"
+        assert result["gates_ok"] is False
         assert result["updated"] == 0
-        assert result["proposed_total_asset_usd"] == 1511.87
+        assert result["applied"] is False
+        assert result["financial_value_updated"] is False
+        assert result["arithmetic_candidate_total_asset_usd"] == 1511.87
+        assert result["candidate_currency_unverified"] is True
+        assert result.get("proposed_total_asset_usd") is None
         assert p.read_bytes() == before
 
-    def test_apply_atomic_and_idempotent(self, balance_dir):
+    def test_apply_refuses_unverified_candidate_and_is_idempotent(self, balance_dir):
+        """Polluted fixture must never write USD amounts; quality metadata may update once."""
         snap = ops_polluted_open()
+        # Use trade_date-named legacy path so repair twin-write covers it
+        p = balance_dir / f"balance_open_{TD}.json"
+        p.write_text(json.dumps(snap), encoding="utf-8")
+        canon = balance_dir / "canonical"
+        canon.mkdir()
+        (canon / f"balance_open_trade_{TD}.json").write_text(json.dumps(snap), encoding="utf-8")
+
+        amounts_before = (snap["total_balance"], snap["cash"], snap["holdings_value"])
+        r1 = im.repair_daily_balance_currency(TD, "open", apply=True)
+        assert r1["applied"] is False
+        assert r1["gates_ok"] is False
+        assert r1["financial_value_updated"] is False
+        assert r1["updated"] == 0
+        assert r1["status"] in ("quality_metadata_updated", "evidence_insufficient")
+        # Prefer reading the path repair actually selected
+        target = Path(r1["target_path"]) if r1.get("target_path") else p
+        after1 = json.loads(target.read_text(encoding="utf-8"))
+        assert (after1["total_balance"], after1["cash"], after1["holdings_value"]) == amounts_before
+        assert after1.get("total_asset_usd") is None
+        assert after1.get("available_cash_usd") is None
+        assert after1.get("holdings_value_usd") is None
+        assert after1.get("currency_status") == "ambiguous"
+        assert after1["kis_summary"]["tot_evlu_amt_usd"] == 829469.0
+        assert after1["holdings_detail"][0]["value"] == 955.87
+
+        r2 = im.repair_daily_balance_currency(TD, "open", apply=True)
+        assert r2["updated"] == 0
+        assert r2["financial_value_updated"] is False
+        assert r2["gates_ok"] is False
+        after2 = json.loads(Path(r2["target_path"] or target).read_text(encoding="utf-8"))
+        assert (after2["total_balance"], after2["cash"], after2["holdings_value"]) == amounts_before
+        assert after2.get("total_asset_usd") is None
+        assert after2.get("available_cash_usd") is None
+        assert after2.get("holdings_value_usd") is None
+        assert after2.get("currency_status") == "ambiguous"
+
+    def test_apply_verified_immutable_fixture_success_and_idempotent(self, balance_dir, tmp_path):
+        """Full evidence gates → validated proposal applied; second apply is idempotent."""
+        src = tmp_path / "balance_20260715.json"
+        src_payload = {
+            "trade_date": TD,
+            "generated_at_kst": "2026-07-15T22:45:06+09:00",
+            "holdings": [{"ticker": "MU", "value": 955.87}],
+        }
+        src.write_text(json.dumps(src_payload), encoding="utf-8")
+        digest = sha256_file(src)
+        assert digest
+
+        imm = save_immutable_source_copy(
+            src,
+            balance_storage=balance_dir,
+            market="SP500",
+            trade_date=TD,
+            snapshot_type="open",
+            snapshot_ts_kst="2026-07-15T22:45:06+09:00",
+        )
+
+        snap = {
+            "date": TD,
+            "trade_date": TD,
+            "type": "open",
+            "valid": True,
+            "canonical": False,
+            "legacy_alias": True,
+            "alias_of_trade_date": TD,
+            "source": "kis_account_file_same_date",
+            "snapshot_ts_kst": "2026-07-15T22:45:06+09:00",
+            "timestamp": "2026-07-15T22:45:06+09:00",
+            "generated_at_kst": "2026-07-15T22:45:06+09:00",
+            "total_balance": 829469,
+            "cash": 2120,
+            "holdings_value": 955.87,
+            "holdings_count": 1,
+            "holdings_detail": [
+                {"ticker": "MU", "qty": 1, "price": 955.87, "value": 955.87, "currency": "USD"}
+            ],
+            "kis_summary": {
+                "currency": "USD",
+                "tot_evlu_amt_krw": 4347907,
+                "tot_evlu_amt_usd": 829469.0,
+                "ord_psbl_frcr_amt": 556,
+                "usd_cash_total": 2120.48,
+                "usd_withdrawable": 555.87,
+                "usd_sell_reuse": 0.0,
+                "usd_buy_margin": 1564.61,
+                "krw_cash": 1189783,
+                "available_cash_krw": 829469,
+                "bass_exrt": 1492.2,
+                "evlu_pfls_smtl_amt": 956,
+            },
+            "source_snapshot_file": str(src),
+            "source_snapshot_sha256": digest,
+            "source_snapshot_trade_date": TD,
+            "source_snapshot_immutable_copy": imm.get("source_snapshot_immutable_copy"),
+            "available_cash_krw": 829469,
+        }
+
+        prop = propose_currency_repair_from_embedded(snap, market="SP500")
+        assert prop["gates_ok"] is True
+        assert prop["proposed_total_asset_usd"] == 1511.87
+        assert prop["arithmetic_candidate_total_asset_usd"] == 1511.87
+        assert prop["candidate_currency_unverified"] is False
+        reasons = [r["reason"] for r in prop["rejected_fields"]]
+        assert "LEGACY_USD_FIELD_POLLUTED_BY_KRW" in reasons
+        assert "NOT_ASSET_CASH_BUYING_POWER_INCLUDED" in reasons
+
         p = balance_dir / f"balance_open_{CLOSE_KST}.json"
         p.write_text(json.dumps(snap), encoding="utf-8")
         canon = balance_dir / "canonical"
@@ -198,22 +324,90 @@ class TestCurrencyRepair:
         (canon / f"balance_open_trade_{TD}.json").write_text(json.dumps(snap), encoding="utf-8")
 
         r1 = im.repair_daily_balance_currency(TD, "open", apply=True)
+        assert r1["gates_ok"] is True
         assert r1["applied"] is True
+        assert r1["financial_value_updated"] is True
         assert r1["updated"] >= 1
+        assert r1["proposed_total_asset_usd"] == 1511.87
         repaired = json.loads(p.read_text(encoding="utf-8"))
         assert repaired["total_asset_usd"] == 1511.87
         assert repaired["available_cash_usd"] == 556.0
-        assert repaired["cash"] == 556.0
-        assert repaired["total_balance"] == 1511.87
+        assert repaired["holdings_value_usd"] == 955.87
+        assert repaired["base_currency"] == "USD"
+        assert repaired["currency_status"] == "reconstructed"
         assert repaired["financial_values_valid"] is True
         assert repaired["return_calculation_usable"] is True
-        assert repaired["kis_summary"]["tot_evlu_amt_usd"] == 829469.0
-        assert repaired["holdings_detail"][0]["value"] == 955.87
+        assert repaired["usd_components_consistent"] is True
+        assert repaired["kis_summary"]["tot_evlu_amt_usd"] == 829469.0  # polluted legacy preserved
         assert is_return_calculation_usable(repaired)
 
         r2 = im.repair_daily_balance_currency(TD, "open", apply=True)
         assert r2["updated"] == 0
         assert r2["status"] == "already_valid"
+        assert r2["financial_value_updated"] is False
+        after2 = json.loads(p.read_text(encoding="utf-8"))
+        assert after2["total_asset_usd"] == 1511.87
+        assert after2["available_cash_usd"] == 556.0
+        assert after2["holdings_value_usd"] == 955.87
+
+    def test_sha_mismatch_blocks_apply(self, balance_dir, tmp_path):
+        src = tmp_path / "balance_20260715.json"
+        src.write_text(json.dumps({"trade_date": TD, "v": 1}), encoding="utf-8")
+        wrong_sha = "0" * 64
+        snap = {
+            "trade_date": TD,
+            "type": "open",
+            "valid": True,
+            "snapshot_ts_kst": "2026-07-15T22:45:06+09:00",
+            "timestamp": "2026-07-15T22:45:06+09:00",
+            "total_balance": 1511.87,
+            "cash": 556.0,
+            "holdings_value": 955.87,
+            "holdings_detail": [
+                {"ticker": "MU", "qty": 1, "value": 955.87, "currency": "USD"}
+            ],
+            "kis_summary": {
+                "currency": "USD",
+                "ord_psbl_frcr_amt": 556,
+            },
+            "source_snapshot_file": str(src),
+            "source_snapshot_sha256": wrong_sha,
+            "source_snapshot_trade_date": TD,
+        }
+        prop = propose_currency_repair_from_embedded(snap, market="SP500")
+        assert prop["gates_ok"] is False
+        assert "SOURCE_SNAPSHOT_MUTATED" in prop["rejected_reasons"]
+        p = balance_dir / f"balance_open_{TD}.json"
+        p.write_text(json.dumps(snap), encoding="utf-8")
+        r = im.repair_daily_balance_currency(TD, "open", apply=True)
+        assert r["gates_ok"] is False
+        assert r["financial_value_updated"] is False
+        assert json.loads(p.read_text()).get("total_asset_usd") is None
+
+    def test_trade_date_mismatch_blocks_apply(self, balance_dir, tmp_path):
+        src = tmp_path / "balance_20260715.json"
+        src.write_text(json.dumps({"trade_date": "20260714"}), encoding="utf-8")
+        digest = sha256_file(src)
+        snap = {
+            "trade_date": TD,
+            "type": "open",
+            "valid": True,
+            "snapshot_ts_kst": "2026-07-15T22:45:06+09:00",
+            "timestamp": "2026-07-15T22:45:06+09:00",
+            "total_balance": 1511.87,
+            "cash": 556.0,
+            "holdings_value": 955.87,
+            "holdings_detail": [
+                {"ticker": "MU", "qty": 1, "value": 955.87, "currency": "USD"}
+            ],
+            "kis_summary": {"currency": "USD", "ord_psbl_frcr_amt": 556},
+            "source_snapshot_file": str(src),
+            "source_snapshot_sha256": digest,
+            "source_snapshot_trade_date": "20260714",
+        }
+        prop = propose_currency_repair_from_embedded(snap, market="SP500")
+        assert prop["gates_ok"] is False
+        assert "SOURCE_SNAPSHOT_TRADE_DATE_MISMATCH" in prop["rejected_reasons"]
 
 
 class TestProvenance:
@@ -552,6 +746,12 @@ class TestPartialSummaryOpenValidCloseAmbiguous:
         assert analysis["open_total_asset"] == 1511.87
         assert analysis["close_total_asset"] is None
         assert analysis["realized_pnl"] == 15.5  # 25.5 - 10.0
+        assert analysis["realized_pnl_available"] is True
+        assert analysis["realized_pnl_currency"] == "USD"
+        assert analysis["realized_pnl_source"] == "kis_summary.ovrs_rlzt_pfls_amt_delta"
+        assert analysis["realized_pnl_status"] == "OK"
+        assert analysis["summary_status"] == "PARTIAL"
+        assert analysis["return_metrics_available"] is False
         assert "total_change" in analysis
         assert analysis["omitted_metrics"]
         assert analysis["data_quality_findings"][0]["severity"] == "WARNING"
@@ -566,11 +766,14 @@ class TestPartialSummaryOpenValidCloseAmbiguous:
         assert "+0.00%" not in blob
         assert "실현 손익" in blob
         assert "NVDA" in blob or "매수" in blob
+        assert "DAILY_REALIZED_PNL_RESOLVED" in caplog.text
         meta = json.loads((balance_dir / f"daily_summary_meta_{TD}.json").read_text())
         assert meta["summary_status"] == "PARTIAL"
         assert meta["total_change"] is None
         assert meta["daily_asset_pnl"] is None
         assert 0 not in (meta["total_change"], meta["daily_asset_pnl"], meta["investment_return_pct"])
+        # realized availability must not promote COMPLETE
+        assert result["summary_status"] != "COMPLETE"
 
     def test_build_partial_schema_keys(self):
         open_b = {"holdings_detail": [], "kis_summary": {}}
@@ -594,6 +797,8 @@ class TestPartialSummaryOpenValidCloseAmbiguous:
             assert out[key] is None
         assert out["status"] == "PARTIAL"
         assert out["return_metrics_available"] is False
+        assert out["realized_pnl"] is None
+        assert out["realized_pnl_available"] is False
         assert out["data_quality_findings"][0]["code"] == "DAILY_BALANCE_CURRENCY_AMBIGUOUS"
         assert out["data_quality_findings"][0]["severity"] == "WARNING"
 
@@ -705,3 +910,109 @@ class TestPartialSummaryOpenValidCloseAmbiguous:
         assert result["status_code"] == "DAILY_SUMMARY_DELIVERY_FAILED"
         assert "DAILY_SUMMARY_DELIVERY_FAILED" in caplog.text
         assert notify  # ERROR 알림 대상
+
+
+class TestRealizedPnLDelta:
+    def _pair(self, open_rlzt, close_rlzt, *, open_ccy="USD", close_ccy="USD", open_td=TD, close_td=TD):
+        open_ks: dict = {"currency": open_ccy}
+        close_ks: dict = {"currency": close_ccy}
+        if open_rlzt is not Ellipsis:
+            open_ks["ovrs_rlzt_pfls_amt"] = open_rlzt
+        if close_rlzt is not Ellipsis:
+            close_ks["ovrs_rlzt_pfls_amt"] = close_rlzt
+        return (
+            {"trade_date": open_td, "kis_summary": open_ks},
+            {"trade_date": close_td, "kis_summary": close_ks},
+        )
+
+    def test_delta_15_5(self):
+        o, c = self._pair(10.0, 25.5)
+        r = resolve_realized_pnl_delta(o, c, expected_trade_date=TD)
+        assert r["available"] is True
+        assert r["value"] == 15.5
+        assert r["currency"] == "USD"
+        assert r["source"] == "kis_summary.ovrs_rlzt_pfls_amt_delta"
+        assert r["status"] == "OK"
+
+    def test_true_zero_delta_available(self):
+        o, c = self._pair(10.0, 10.0)
+        r = resolve_realized_pnl_delta(o, c, expected_trade_date=TD)
+        assert r["available"] is True
+        assert r["value"] == 0.0
+        assert r["status"] == "OK"
+
+    def test_open_field_missing(self):
+        o, c = self._pair(Ellipsis, 25.5)
+        r = resolve_realized_pnl_delta(o, c)
+        assert r["available"] is False
+        assert r["value"] is None
+        assert "OPEN_OVRS_RLZT_MISSING" in r["error_reasons"]
+
+    def test_close_field_missing(self):
+        o, c = self._pair(10.0, Ellipsis)
+        r = resolve_realized_pnl_delta(o, c)
+        assert r["available"] is False
+        assert r["value"] is None
+        assert "CLOSE_OVRS_RLZT_MISSING" in r["error_reasons"]
+
+    def test_currency_mismatch(self):
+        o, c = self._pair(10.0, 25.5, open_ccy="USD", close_ccy="KRW")
+        r = resolve_realized_pnl_delta(o, c)
+        assert r["available"] is False
+        assert r["value"] is None
+        assert "CLOSE_CURRENCY_NOT_USD" in r["error_reasons"] or "CURRENCY_MISMATCH" in r["error_reasons"]
+
+    def test_currency_missing(self):
+        o, c = self._pair(10.0, 25.5, open_ccy="", close_ccy="USD")
+        r = resolve_realized_pnl_delta(o, c)
+        assert r["available"] is False
+        assert r["value"] is None
+        assert "OPEN_CURRENCY_MISSING" in r["error_reasons"]
+
+    def test_nan_rejected(self):
+        o, c = self._pair(float("nan"), 25.5)
+        r = resolve_realized_pnl_delta(o, c)
+        assert r["available"] is False
+        assert r["value"] is None
+        assert "OPEN_OVRS_RLZT_NOT_FINITE" in r["error_reasons"]
+
+    def test_inf_rejected(self):
+        o, c = self._pair(10.0, float("inf"))
+        r = resolve_realized_pnl_delta(o, c)
+        assert r["available"] is False
+        assert "CLOSE_OVRS_RLZT_NOT_FINITE" in r["error_reasons"]
+
+    def test_trade_date_mismatch(self):
+        o, c = self._pair(10.0, 25.5, open_td=TD, close_td="20260716")
+        r = resolve_realized_pnl_delta(o, c)
+        assert r["available"] is False
+        assert "TRADE_DATE_MISMATCH" in r["error_reasons"]
+
+    def test_partial_build_preserves_realized(self):
+        open_b = {
+            "trade_date": TD,
+            "kis_summary": {"currency": "USD", "ovrs_rlzt_pfls_amt": 10.0},
+            "holdings_detail": [],
+        }
+        close_b = {
+            "trade_date": TD,
+            "kis_summary": {"currency": "USD", "ovrs_rlzt_pfls_amt": 25.5},
+            "holdings_detail": [],
+            "currency_status": "ambiguous",
+            "normalization_errors": ["SOURCE_SNAPSHOT_SHA_UNKNOWN"],
+        }
+        out = im.build_partial_daily_summary(
+            open_b,
+            close_b,
+            TD,
+            open_vals={"total": 1511.87, "cash": 556.0, "hv": 955.87},
+            close_vals=None,
+            close_err="ambiguous",
+        )
+        assert out["summary_status"] == "PARTIAL"
+        assert out["return_metrics_available"] is False
+        assert out["total_change"] is None
+        assert out["realized_pnl"] == 15.5
+        assert out["realized_pnl_available"] is True
+        # must not promote
+        assert out["status"] == "PARTIAL"

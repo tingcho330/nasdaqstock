@@ -1919,15 +1919,32 @@ def compare_balances(open_balance: Dict, close_balance: Dict) -> Dict:
         bought_tickers = close_tickers - open_tickers
         held_tickers = open_tickers & close_tickers
 
-        realized_pnl = 0.0
+        realized_pnl = None
+        realized_meta: Dict[str, Any] = {}
         if us_kis:
-            open_rlzt = om.get("ovrs_rlzt_pfls_amt")
-            close_rlzt = cm.get("ovrs_rlzt_pfls_amt")
-            open_rlzt_f = float(open_rlzt) if _is_finite_number(open_rlzt) else 0.0
-            close_rlzt_f = float(close_rlzt) if _is_finite_number(close_rlzt) else 0.0
-            if close_rlzt_f > 0 or open_rlzt_f > 0:
-                realized_pnl = round(close_rlzt_f - open_rlzt_f, 2)
+            from daily_balance_values import resolve_realized_pnl_delta
+
+            resolved = resolve_realized_pnl_delta(
+                open_balance, close_balance, expected_trade_date=trade_date
+            )
+            if resolved.get("available"):
+                realized_pnl = resolved.get("value")
+                realized_meta = {
+                    "realized_pnl_available": True,
+                    "realized_pnl_status": "OK",
+                    "realized_pnl_currency": resolved.get("currency"),
+                    "realized_pnl_source": resolved.get("source"),
+                }
+            else:
+                realized_meta = {
+                    "realized_pnl_available": False,
+                    "realized_pnl_status": resolved.get("status") or "EVIDENCE_INCOMPLETE",
+                    "realized_pnl_currency": None,
+                    "realized_pnl_source": None,
+                    "realized_pnl_error_reasons": list(resolved.get("error_reasons") or []),
+                }
         else:
+            realized_pnl = 0.0
             for ticker in sold_tickers:
                 open_holding = next(
                     (
@@ -1938,6 +1955,12 @@ def compare_balances(open_balance: Dict, close_balance: Dict) -> Dict:
                 )
                 if open_holding is not None and _is_finite_number(open_holding.get("value")):
                     realized_pnl += float(open_holding["value"])
+            realized_meta = {
+                "realized_pnl_available": True,
+                "realized_pnl_status": "OK",
+                "realized_pnl_currency": None,
+                "realized_pnl_source": "sold_holdings_value",
+            }
 
         unrealized_pnl = 0.0
         for ticker in held_tickers:
@@ -1957,7 +1980,10 @@ def compare_balances(open_balance: Dict, close_balance: Dict) -> Dict:
             ):
                 unrealized_pnl += float(close_holding["value"]) - float(open_holding["value"])
 
-        estimated_fees = total_change - realized_pnl - unrealized_pnl
+        if realized_pnl is not None and _is_finite_number(total_change):
+            estimated_fees = float(total_change) - float(realized_pnl) - unrealized_pnl
+        else:
+            estimated_fees = None
 
         result: Dict[str, Any] = {
             "date": trade_date,
@@ -1992,6 +2018,7 @@ def compare_balances(open_balance: Dict, close_balance: Dict) -> Dict:
             "fx_metrics_available": False if us_kis else True,
             "fx_calculation_status": "FX_RATE_INCOMPLETE" if us_kis else "N/A",
         }
+        result.update(realized_meta)
 
         # ── B. 선택적 FX/KRW 분석 (US만) ──
         if us_kis:
@@ -2165,18 +2192,94 @@ def _holdings_ticker_sets(open_balance: Dict, close_balance: Dict) -> Dict[str, 
     }
 
 
-def _realized_gross_pnl_from_pair(open_balance: Dict, close_balance: Dict) -> float:
-    """KIS ovrs_rlzt delta (USD). Asset return과 무관하게 표시 가능."""
-    if not is_us_market(MARKET):
-        return 0.0
-    om = _kis_metrics_from_snapshot(open_balance)
-    cm = _kis_metrics_from_snapshot(close_balance)
-    open_rlzt = om.get("ovrs_rlzt_pfls_amt") or 0.0
-    close_rlzt = cm.get("ovrs_rlzt_pfls_amt") or 0.0
-    if close_rlzt > 0 or open_rlzt > 0:
-        return round(float(close_rlzt) - float(open_rlzt), 2)
-    return 0.0
+def _realized_gross_pnl_from_pair(
+    open_balance: Dict,
+    close_balance: Dict,
+    *,
+    expected_trade_date: Optional[str] = None,
+) -> Optional[float]:
+    """Backward-compat wrapper — prefer resolve_realized_pnl_delta for new callers."""
+    from daily_balance_values import resolve_realized_pnl_delta
 
+    if not is_us_market(MARKET):
+        return None
+    resolved = resolve_realized_pnl_delta(
+        open_balance,
+        close_balance,
+        expected_trade_date=expected_trade_date,
+    )
+    if resolved.get("available"):
+        logger.info(
+            "[DAILY_REALIZED_PNL_RESOLVED]\ntrade_date=%s\nvalue=%s\ncurrency=%s\nsource=%s",
+            resolved.get("trade_date"),
+            resolved.get("value"),
+            resolved.get("currency"),
+            resolved.get("source"),
+        )
+        return resolved.get("value")
+    logger.info(
+        "[DAILY_REALIZED_PNL_UNAVAILABLE]\ntrade_date=%s\nstatus=%s\nreasons=%s",
+        expected_trade_date
+        or (open_balance or {}).get("trade_date")
+        or (close_balance or {}).get("trade_date"),
+        resolved.get("status"),
+        ",".join(resolved.get("error_reasons") or []),
+    )
+    return None
+
+
+def _attach_realized_pnl_fields(
+    target: Dict[str, Any],
+    open_balance: Dict,
+    close_balance: Dict,
+    *,
+    expected_trade_date: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Attach independent realized PnL fields (None when evidence incomplete)."""
+    from daily_balance_values import resolve_realized_pnl_delta
+
+    if not is_us_market(MARKET):
+        target["realized_pnl"] = None
+        target["realized_pnl_available"] = False
+        target["realized_pnl_status"] = "NOT_US_MARKET"
+        target["realized_pnl_currency"] = None
+        target["realized_pnl_source"] = None
+        return target
+
+    resolved = resolve_realized_pnl_delta(
+        open_balance,
+        close_balance,
+        expected_trade_date=expected_trade_date,
+    )
+    if resolved.get("available"):
+        logger.info(
+            "[DAILY_REALIZED_PNL_RESOLVED]\ntrade_date=%s\nvalue=%s\ncurrency=%s\nsource=%s",
+            resolved.get("trade_date"),
+            resolved.get("value"),
+            resolved.get("currency"),
+            resolved.get("source"),
+        )
+        target["realized_pnl"] = resolved.get("value")
+        target["realized_pnl_available"] = True
+        target["realized_pnl_status"] = "OK"
+        target["realized_pnl_currency"] = resolved.get("currency")
+        target["realized_pnl_source"] = resolved.get("source")
+    else:
+        logger.info(
+            "[DAILY_REALIZED_PNL_UNAVAILABLE]\ntrade_date=%s\nstatus=%s\nreasons=%s",
+            expected_trade_date
+            or (open_balance or {}).get("trade_date")
+            or (close_balance or {}).get("trade_date"),
+            resolved.get("status"),
+            ",".join(resolved.get("error_reasons") or []),
+        )
+        target["realized_pnl"] = None
+        target["realized_pnl_available"] = False
+        target["realized_pnl_status"] = resolved.get("status") or "EVIDENCE_INCOMPLETE"
+        target["realized_pnl_currency"] = None
+        target["realized_pnl_source"] = None
+        target["realized_pnl_error_reasons"] = list(resolved.get("error_reasons") or [])
+    return target
 
 def _currency_reject_reasons(snap: Dict) -> List[str]:
     errs = snap.get("normalization_errors")
@@ -2320,7 +2423,7 @@ def build_partial_daily_summary(
     open_total = open_vals["total"] if open_vals else None
     close_total = close_vals["total"] if close_vals else None
 
-    return {
+    out: Dict[str, Any] = {
         "status": "PARTIAL",
         "summary_status": "PARTIAL",
         "status_code": "DAILY_SUMMARY_PARTIAL",
@@ -2343,7 +2446,6 @@ def build_partial_daily_summary(
         "usd_change": None,
         "omitted_metrics": list(PARTIAL_OMITTED_METRICS),
         "data_quality_findings": findings,
-        "realized_pnl": _realized_gross_pnl_from_pair(open_balance, close_balance),
         "unrealized_pnl": None,
         "estimated_fees": None,
         "sold_tickers": tickers["sold_tickers"],
@@ -2361,6 +2463,10 @@ def build_partial_daily_summary(
         "open_ccy_error": open_err,
         "close_ccy_error": close_err,
     }
+    _attach_realized_pnl_fields(
+        out, open_balance, close_balance, expected_trade_date=trade_date
+    )
+    return out
 
 
 def comparison_supports_complete_summary(raw_cmp: Any) -> bool:

@@ -547,10 +547,13 @@ def propose_currency_repair_from_embedded(
         ) if hd else False,
     }
 
-    # Amount-apply blockers (embedded reconstruction still proposed as arithmetic candidate)
+    # Amount-apply blockers — arithmetic candidate may still be computed
     amount_blockers = {
         "SOURCE_SNAPSHOT_SHA_UNKNOWN",
         "SOURCE_SNAPSHOT_MUTATED",
+        "SOURCE_SNAPSHOT_MISSING_FILE",
+        "SOURCE_SNAPSHOT_MISSING_PATH",
+        "SOURCE_SNAPSHOT_TRADE_DATE_MISMATCH",
         "HISTORICAL_SNAPSHOT_TIME_MISMATCH",
     }
     rejected_reasons = [str(r.get("reason") or "") for r in rejected]
@@ -696,3 +699,104 @@ def is_return_calculation_usable(snap: Optional[Dict]) -> bool:
         hv = _f(snap["holdings_value_usd"])
         return abs(tot - cash - hv) <= COMPONENT_TOLERANCE_USD and tot > 0
     return False
+
+
+def _finite_number(val: Any) -> Optional[float]:
+    """Parse a finite float; reject bool/NaN/Inf/non-numeric. None if unavailable."""
+    if val is None or isinstance(val, bool):
+        return None
+    try:
+        x = float(str(val).replace(",", "").strip())
+    except (TypeError, ValueError):
+        return None
+    if x != x or x in (float("inf"), float("-inf")):
+        return None
+    return x
+
+
+def resolve_realized_pnl_delta(
+    open_snapshot: Any,
+    close_snapshot: Any,
+    *,
+    expected_trade_date: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Open/Close embedded kis_summary.ovrs_rlzt_pfls_amt delta (USD).
+
+    Independent of asset-currency repair / ambiguous total_asset gates.
+    Evidence incomplete → available=False and value=None (never fake 0.0).
+    Actual zero delta → available=True and value=0.0.
+    """
+    empty = {
+        "available": False,
+        "value": None,
+        "currency": None,
+        "source": None,
+        "status": "EVIDENCE_INCOMPLETE",
+        "error_reasons": [],
+    }
+    reasons: List[str] = []
+
+    if not isinstance(open_snapshot, dict):
+        reasons.append("OPEN_SNAPSHOT_NOT_DICT")
+    if not isinstance(close_snapshot, dict):
+        reasons.append("CLOSE_SNAPSHOT_NOT_DICT")
+    if reasons:
+        return {**empty, "error_reasons": reasons}
+
+    open_td = str(open_snapshot.get("trade_date") or "").strip()
+    close_td = str(close_snapshot.get("trade_date") or "").strip()
+    if not open_td or not close_td:
+        reasons.append("TRADE_DATE_MISSING")
+    elif open_td != close_td:
+        reasons.append("TRADE_DATE_MISMATCH")
+    if expected_trade_date:
+        exp = str(expected_trade_date).strip()
+        if open_td != exp or close_td != exp:
+            reasons.append("TRADE_DATE_EXPECTED_MISMATCH")
+
+    om = open_snapshot.get("kis_summary")
+    cm = close_snapshot.get("kis_summary")
+    if not isinstance(om, dict):
+        reasons.append("OPEN_KIS_SUMMARY_MISSING")
+    if not isinstance(cm, dict):
+        reasons.append("CLOSE_KIS_SUMMARY_MISSING")
+    if reasons:
+        return {**empty, "error_reasons": list(dict.fromkeys(reasons))}
+
+    open_ccy = str(om.get("currency") or "").strip().upper()
+    close_ccy = str(cm.get("currency") or "").strip().upper()
+    if open_ccy != "USD":
+        reasons.append("OPEN_CURRENCY_NOT_USD" if open_ccy else "OPEN_CURRENCY_MISSING")
+    if close_ccy != "USD":
+        reasons.append("CLOSE_CURRENCY_NOT_USD" if close_ccy else "CLOSE_CURRENCY_MISSING")
+    if open_ccy and close_ccy and open_ccy != close_ccy:
+        reasons.append("CURRENCY_MISMATCH")
+
+    if "ovrs_rlzt_pfls_amt" not in om:
+        reasons.append("OPEN_OVRS_RLZT_MISSING")
+    if "ovrs_rlzt_pfls_amt" not in cm:
+        reasons.append("CLOSE_OVRS_RLZT_MISSING")
+
+    open_v = _finite_number(om.get("ovrs_rlzt_pfls_amt")) if "ovrs_rlzt_pfls_amt" in om else None
+    close_v = _finite_number(cm.get("ovrs_rlzt_pfls_amt")) if "ovrs_rlzt_pfls_amt" in cm else None
+    if "ovrs_rlzt_pfls_amt" in om and open_v is None:
+        reasons.append("OPEN_OVRS_RLZT_NOT_FINITE")
+    if "ovrs_rlzt_pfls_amt" in cm and close_v is None:
+        reasons.append("CLOSE_OVRS_RLZT_NOT_FINITE")
+
+    if reasons:
+        return {**empty, "error_reasons": list(dict.fromkeys(reasons))}
+
+    delta = round(float(close_v) - float(open_v), 2)
+    return {
+        "available": True,
+        "value": delta,
+        "currency": "USD",
+        "source": "kis_summary.ovrs_rlzt_pfls_amt_delta",
+        "status": "OK",
+        "error_reasons": [],
+        "open_value": open_v,
+        "close_value": close_v,
+        "trade_date": open_td,
+    }
