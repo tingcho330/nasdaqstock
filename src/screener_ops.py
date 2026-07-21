@@ -901,7 +901,24 @@ def build_run_meta(
     amount5d_cache_stats: Optional[Dict[str, Any]] = None,
     shadow: Optional[Dict[str, Any]] = None,
     production_shadow_difference: Optional[Dict[str, Any]] = None,
+    run_id: Optional[str] = None,
+    run_mode: Optional[str] = None,
+    replay_type: Optional[str] = None,
+    decision_artifact: Optional[bool] = None,
+    invoked_by: Optional[str] = None,
+    source_run_id: Optional[str] = None,
+    run_directory: Optional[str] = None,
+    as_of_kst: Optional[str] = None,
+    as_of_utc: Optional[str] = None,
+    data_cutoff_at_kst: Optional[str] = None,
+    market_session_state: Optional[str] = None,
+    daily_bar_status: Optional[str] = None,
+    git_commit: Optional[str] = None,
+    config_sha256: Optional[str] = None,
+    issuer_groups_sha256: Optional[str] = None,
+    artifact_integrity: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
+    ms = dict(market_state or {})
     meta: Dict[str, Any] = {
         "schema_version": RUN_META_SCHEMA,
         "market": market,
@@ -913,7 +930,7 @@ def build_run_meta(
         "started_at_kst": started_at_kst,
         "finished_at_kst": finished_at_kst,
         "duration_sec": round(float(duration_sec), 3),
-        "market_state": market_state or {},
+        "market_state": ms,
         "funnel": funnel,
         "score_distribution": score_distribution_data,
         "configured_threshold": configured_threshold,
@@ -924,6 +941,48 @@ def build_run_meta(
         "data_quality_findings": data_quality_findings or [],
         "stage_durations_sec": stage_durations_sec or {},
     }
+    if run_id is not None:
+        meta["run_id"] = run_id
+        meta["source_run_id"] = source_run_id or run_id
+    if run_mode is not None:
+        meta["run_mode"] = run_mode
+        meta["replay"] = str(run_mode).upper() == "REPLAY"
+    if replay_type is not None:
+        meta["replay_type"] = replay_type
+    elif str(run_mode or "").upper() == "DECISION":
+        meta["replay_type"] = None
+    if decision_artifact is not None:
+        meta["decision_artifact"] = bool(decision_artifact)
+    if invoked_by is not None:
+        meta["invoked_by"] = invoked_by
+    if run_directory is not None:
+        meta["run_directory"] = run_directory
+    if as_of_kst is not None:
+        meta["as_of_kst"] = as_of_kst
+    if as_of_utc is not None:
+        meta["as_of_utc"] = as_of_utc
+    if data_cutoff_at_kst is not None:
+        meta["data_cutoff_at_kst"] = data_cutoff_at_kst
+    if market_session_state is not None:
+        meta["market_session_state"] = market_session_state
+    if daily_bar_status is not None:
+        meta["daily_bar_status"] = daily_bar_status
+    if git_commit is not None:
+        meta["git_commit"] = git_commit
+    if config_sha256 is not None:
+        meta["config_sha256"] = config_sha256
+    if issuer_groups_sha256 is not None:
+        meta["issuer_groups_sha256"] = issuer_groups_sha256
+    if artifact_integrity is not None:
+        meta["artifact_integrity"] = artifact_integrity
+    # Promote clarified regime fields to top-level for easy grep
+    for key in (
+        "weighted_regime_score",
+        "scoring_market_component",
+        "advanced_market_confidence",
+    ):
+        if key in ms and key not in meta:
+            meta[key] = ms.get(key)
     if amount5d_stats is not None:
         meta["amount5d_distribution"] = amount5d_stats
     if amount5d_cache_stats is not None:
@@ -949,7 +1008,46 @@ def write_review_markdown(
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     lines: List[str] = []
+    run_mode = str(meta.get("run_mode") or "").upper()
+    if run_mode == "REPLAY" or meta.get("replay") is True:
+        lines.append("# REPLAY — NOT USED BY TRADER")
+        lines.append("")
+        if str(meta.get("replay_type") or "") == "CURRENT_DATA_RECALCULATION":
+            lines.append(
+                "This result was recalculated using data available at replay execution time."
+            )
+            lines.append(
+                "It is not an exact reconstruction of the original decision run."
+            )
+            lines.append("")
     lines.append(f"# Screener Review — {meta.get('market')} {meta.get('trade_date')} {meta.get('session')}")
+    lines.append("")
+    lines.append("## Run Identity")
+    lines.append(f"- run_id: `{meta.get('run_id') or meta.get('source_run_id')}`")
+    lines.append(f"- run_mode: `{meta.get('run_mode')}`")
+    lines.append(f"- replay_type: `{meta.get('replay_type')}`")
+    lines.append(f"- invoked_by: `{meta.get('invoked_by')}`")
+    lines.append(f"- decision_artifact: `{meta.get('decision_artifact')}`")
+    lines.append(f"- as_of_kst: `{meta.get('as_of_kst')}`")
+    lines.append(f"- market_session_state: `{meta.get('market_session_state')}`")
+    lines.append(f"- daily_bar_status: `{meta.get('daily_bar_status')}`")
+    lines.append(f"- git_commit: `{meta.get('git_commit')}`")
+    lines.append(f"- config_sha256: `{meta.get('config_sha256')}`")
+    lines.append("")
+    integrity = meta.get("artifact_integrity") or {}
+    lines.append("## Artifact Integrity")
+    if integrity:
+        for k, v in integrity.items():
+            if isinstance(v, dict):
+                lines.append(
+                    f"- {k}: row_count={v.get('row_count')} sha={v.get('sha256')}"
+                )
+            else:
+                lines.append(f"- {k}: {v}")
+    else:
+        lines.append(f"- manifest path: `{meta.get('manifest_path')}`")
+        lines.append(f"- immutable run directory: `{meta.get('run_directory')}`")
+    lines.append(f"- immutable run directory: `{meta.get('run_directory')}`")
     lines.append("")
     lines.append("## Status")
     lines.append(f"- status: `{meta.get('status')}`")
@@ -959,9 +1057,26 @@ def write_review_markdown(
     lines.append("")
     ms = meta.get("market_state") or {}
     lines.append("## Market Regime")
-    lines.append(f"- regime_score: {ms.get('regime_score')}")
+    wrs = meta.get("weighted_regime_score", ms.get("weighted_regime_score"))
+    smc = meta.get("scoring_market_component", ms.get("scoring_market_component"))
+    amc = meta.get("advanced_market_confidence", ms.get("advanced_market_confidence", ms.get("confidence")))
+    lines.append(f"- weighted_regime_score: {wrs}  # equal-weight average of regime components")
+    lines.append(f"- scoring_market_component: {smc}  # value injected into stock MktScore (0.7*weighted+0.3*0.5)")
+    lines.append(f"- advanced_market_confidence: {amc}  # MarketAnalyzer confidence")
+    lines.append(f"- market_session_state: {meta.get('market_session_state') or ms.get('market_session_state')}")
+    lines.append(f"- daily_bar_status: {meta.get('daily_bar_status') or ms.get('daily_bar_status')}")
+    lines.append(f"- as_of_kst: {meta.get('as_of_kst')}")
     lines.append(f"- trend: {ms.get('trend')}")
     lines.append(f"- volatility: {ms.get('volatility')}")
+    # deprecated alias note (must not mix values)
+    if ms.get("regime_score") is not None and wrs is not None and ms.get("regime_score") != wrs:
+        lines.append(
+            f"- WARNING: deprecated regime_score={ms.get('regime_score')} differs from weighted_regime_score"
+        )
+    elif ms.get("regime_score") is not None:
+        lines.append(
+            f"- regime_score (deprecated alias of weighted_regime_score): {ms.get('regime_score')}"
+        )
     lines.append("")
     lines.append("## Funnel")
     lines.append("| stage | status | in | out | drop | reason |")

@@ -3420,7 +3420,7 @@ def _save_subprocess_stdout_log(
         session = pipeline_ctx.get("session") or "pm"
         stem = Path(script_name).stem
         logs_dir = OUTPUT_DIR / "logs"
-        return save_subprocess_log(
+        path = save_subprocess_log(
             logs_dir,
             script_stem=stem,
             trade_date=trade_date,
@@ -3430,9 +3430,91 @@ def _save_subprocess_stdout_log(
             stdout=stdout or "",
             stderr=stderr or "",
         )
+        # Prefer also placing screener log into immutable run dir when known
+        if script_name == "screener.py":
+            screener_run_id = os.environ.get("SCREENER_RUN_ID") or run_id
+            run_dir = (
+                OUTPUT_DIR
+                / "runs"
+                / "decision"
+                / MARKET
+                / trade_date
+                / session
+                / screener_run_id
+            )
+            # staging may still exist under .staging-* if process crashed mid-run
+            if run_dir.exists():
+                try:
+                    dest = run_dir / "screener.log"
+                    dest.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+                except Exception as e:
+                    logger.debug("run dir screener.log copy skipped: %s", e)
+            else:
+                # try replay path as fallback
+                replay_dir = (
+                    OUTPUT_DIR
+                    / "runs"
+                    / "replay"
+                    / MARKET
+                    / trade_date
+                    / session
+                    / screener_run_id
+                )
+                if replay_dir.exists():
+                    try:
+                        (replay_dir / "screener.log").write_text(
+                            path.read_text(encoding="utf-8"), encoding="utf-8"
+                        )
+                    except Exception:
+                        pass
+        return path
     except Exception as e:
         logger.warning("[%s] subprocess log 저장 실패(%s): %s", run_id, script_name, e)
         return None
+
+
+def _new_pipeline_run_id() -> str:
+    try:
+        from screener_artifacts import generate_run_id
+
+        return generate_run_id()
+    except Exception:
+        return datetime.now(KST).strftime("%Y%m%d-%H%M%S") + "-" + os.urandom(3).hex()
+
+
+def _validate_screener_decision_gate(run_id: str, pipeline_ctx: Dict[str, str]) -> bool:
+    """Block news/gpt/trader if Production fixed artifacts are not a successful DECISION."""
+    try:
+        from screener_artifacts import validate_screener_step_for_pipeline
+
+        trade_date = pipeline_ctx.get("trade_date") or ""
+        session = pipeline_ctx.get("session") or "pm"
+        ok, msg, meta = validate_screener_step_for_pipeline(
+            trade_date=trade_date,
+            market=MARKET,
+            session=session,
+            run_id=os.environ.get("SCREENER_RUN_ID") or run_id,
+            output_dir=OUTPUT_DIR,
+        )
+        if ok:
+            logger.info(
+                "[%s] screener decision gate OK: candidates=%s source_run_id=%s",
+                run_id,
+                (meta or {}).get("production_candidate_count"),
+                (meta or {}).get("source_run_id") or (meta or {}).get("run_id"),
+            )
+            return True
+        logger.error("[%s] screener decision gate FAILED: %s", run_id, msg)
+        _notify(
+            f"❌ screener decision gate 실패 — trader 진행 중단: {msg}",
+            key=f"{run_id}:screener_gate",
+            cooldown_sec=60,
+        )
+        return False
+    except Exception as e:
+        logger.error("[%s] screener decision gate exception: %s", run_id, e, exc_info=True)
+        return False
+
 
 def _apply_pipeline_env(run_id: str) -> Dict[str, str]:
     """파이프라인 AM/PM·거래일을 환경변수로 고정 (자정 넘김 시 산출물 짝 유지)."""
@@ -3460,6 +3542,22 @@ def _resolve_screener_input_for_news(ctx: Dict[str, str]) -> Optional[Path]:
             session=sess,
         )
         if p.exists():
+            # Prefer DECISION-validated Production only
+            try:
+                from screener_artifacts import validate_decision_artifacts_for_trader
+
+                ok, msg, _ = validate_decision_artifacts_for_trader(
+                    trade_date=ctx["trade_date"],
+                    market=MARKET,
+                    session=sess or ctx.get("session") or "pm",
+                    output_dir=OUTPUT_DIR,
+                    candidates_path=p,
+                )
+                if not ok:
+                    logger.warning("news screener input rejected (%s): %s", p.name, msg)
+                    continue
+            except Exception as e:
+                logger.debug("news screener validation skipped: %s", e)
             return p
     return None
 
@@ -3475,8 +3573,19 @@ def run_script(script_name: str, run_id: str, pipeline_ctx: Optional[Dict[str, s
     session = ctx.get("session") or ""
 
     args = []
+    screener_run_id = None
     if script_name == "screener.py":
-        args = ["--market", MARKET, "--date", trade_date]
+        screener_run_id = _new_pipeline_run_id()
+        os.environ["SCREENER_RUN_ID"] = screener_run_id
+        os.environ["SCREENER_RUN_MODE"] = "DECISION"
+        os.environ["SCREENER_INVOKED_BY"] = "integrated_manager"
+        args = [
+            "--market", MARKET,
+            "--date", trade_date,
+            "--run-mode", "decision",
+            "--run-id", screener_run_id,
+            "--invoked-by", "integrated_manager",
+        ]
         if session:
             args.extend(["--session", session])
     elif script_name == "gpt_analyzer.py":
@@ -3509,6 +3618,10 @@ def run_script(script_name: str, run_id: str, pipeline_ctx: Optional[Dict[str, s
     child_env["RUN_STARTED_AT"] = os.environ.get("RUN_STARTED_AT", str(time.time()))
     child_env.setdefault("MARKET", MARKET)
     child_env.setdefault("SLOTS", SLOTS)
+    if script_name == "screener.py" and screener_run_id:
+        child_env["SCREENER_RUN_ID"] = screener_run_id
+        child_env["SCREENER_RUN_MODE"] = "DECISION"
+        child_env["SCREENER_INVOKED_BY"] = "integrated_manager"
 
     logger.info(f"[{run_id}] ▶ STEP START: {script_name} | cmd='{cmd_str}' (timeout={timeout_sec}s)")
     t0 = time.perf_counter()
@@ -3517,6 +3630,8 @@ def run_script(script_name: str, run_id: str, pipeline_ctx: Optional[Dict[str, s
     # RiskManager 실행 전 요약 파일 자동 복구
     if script_name == "trader.py":  # trader.py에서 RiskManager를 사용
         _ensure_summary_file_for_risk_manager()
+        if not _validate_screener_decision_gate(run_id, ctx):
+            return False, warned, time.perf_counter() - t0
     
     try:
         result = subprocess.run(
@@ -3539,6 +3654,8 @@ def run_script(script_name: str, run_id: str, pipeline_ctx: Optional[Dict[str, s
             summary = _extract_screener_summary(result.stdout or "")
             if summary:
                 logger.info(f"[{run_id}] --- screener summary ---\n{summary}")
+            if not _validate_screener_decision_gate(run_id, ctx):
+                return False, warned, dur
         else:
             logger.debug(f"[{run_id}] --- {script_name} tail ---\n{_tail(result.stdout, 12)}")
 
@@ -3593,14 +3710,15 @@ def run_screener_job():
             _notify(msg=f"ℹ️ {msg}", key="screener_holiday", cooldown_sec=600)
             return
 
-        run_id = datetime.now(KST).strftime("%Y%m%d-%H%M%S")
+        run_id = _new_pipeline_run_id()
         os.environ["RUN_ID"] = run_id
         os.environ["RUN_STARTED_AT"] = str(time.time())
         pipeline_ctx = _apply_pipeline_env(run_id)
 
         start = (
             f"🔍 스크리너 실행 시작 (MARKET={MARKET}, "
-            f"session={pipeline_ctx['session']}, trade_date={pipeline_ctx['trade_date']})"
+            f"session={pipeline_ctx['session']}, trade_date={pipeline_ctx['trade_date']}, "
+            f"run_mode=DECISION)"
         )
         logger.info(f"[{run_id}] KST {datetime.now(KST):%Y-%m-%d %H:%M:%S} - {start}")
         _notify(start, key=f"{run_id}:screener_start", cooldown_sec=30)
@@ -3815,7 +3933,7 @@ def run_trading_pipeline():
             _notify(msg=f"ℹ️ {msg}", key="holiday", cooldown_sec=600)
             return
 
-        run_id = datetime.now(KST).strftime("%Y%m%d-%H%M%S")
+        run_id = _new_pipeline_run_id()
         os.environ["RUN_ID"] = run_id
         os.environ["RUN_STARTED_AT"] = str(time.time())
         pipeline_ctx = _apply_pipeline_env(run_id)

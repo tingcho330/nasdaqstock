@@ -71,6 +71,22 @@ from screener_ops import (
     write_review_markdown,
 )
 
+from screener_artifacts import (
+    ArtifactError,
+    FrozenReplayNotImplemented,
+    ScreenerRunWriter,
+    build_score_features_snapshot,
+    clarify_regime_fields,
+    generate_run_id,
+    get_git_commit,
+    production_fixed_exists,
+    promote_fixed_artifacts,
+    resolve_data_clock,
+    resolve_run_mode_policy,
+    sha256_file,
+    sha256_json_payload,
+)
+
 # 시장 분석 모듈 (screener_core에서 통합)
 from screener_core import MarketAnalyzer, MarketRegime, MarketState, get_historical_prices
 
@@ -2798,6 +2814,11 @@ def run_screener(
     pipeline_session: Optional[str] = None,
     force: bool = False,
     refresh_amount5d: bool = False,
+    run_mode: Optional[str] = None,
+    run_id: Optional[str] = None,
+    allow_decision_overwrite: bool = False,
+    invoked_by: Optional[str] = None,
+    replay_type: Optional[str] = None,
 ):
     global _KIS_INSTANCE, _KIS_RATE_LIMITER, _KIS_MAX_CONCURRENCY, _CURRENT_MARKET_STATE
     sess = (pipeline_session or os.getenv("PIPELINE_SESSION", "")).lower().strip()
@@ -2811,8 +2832,75 @@ def run_screener(
     stage1_meta: Dict[str, Any] = {}
     market_state_payload: Dict[str, Any] = {}
     fixed_date = date_str
+    weighted_regime_score: Optional[float] = None
+    scoring_market_component: Optional[float] = None
+    config_sha: Optional[str] = None
+    issuer_sha: Optional[str] = None
+    git_commit: Optional[str] = None
+    git_commit_error: Optional[str] = None
+    writer: Optional[ScreenerRunWriter] = None
+    policy = None
+    clock: Dict[str, Any] = {}
+    _finalize_done = False
 
-    def _persist_run_meta(
+    try:
+        policy = resolve_run_mode_policy(
+            explicit_run_mode=run_mode or os.getenv("SCREENER_RUN_MODE"),
+            force=force,
+            trade_date=date_str,
+            market=market,
+            invoked_by=invoked_by or os.getenv("SCREENER_INVOKED_BY") or "cli",
+            allow_decision_overwrite=allow_decision_overwrite
+            or str(os.getenv("SCREENER_ALLOW_DECISION_OVERWRITE", "")).lower() in ("1", "true", "yes"),
+            explicit_replay_type=replay_type or os.getenv("SCREENER_REPLAY_TYPE"),
+            fixed_artifact_exists=production_fixed_exists(date_str, market, sess, OUTPUT_DIR),
+            now_kst=run_started_at,
+        )
+    except FrozenReplayNotImplemented as e:
+        logger.error("%s", e)
+        raise
+    except ArtifactError as e:
+        logger.error("run_mode 해석 실패: %s", e)
+        raise
+
+    for w in policy.warnings:
+        logger.warning("[RUN_MODE] %s", w)
+    logger.info(
+        "[RUN_MODE] mode=%s replay_type=%s decision_artifact=%s allow_fixed_update=%s "
+        "invoked_by=%s reason=%s",
+        policy.run_mode,
+        policy.replay_type,
+        policy.decision_artifact,
+        policy.allow_fixed_update,
+        policy.invoked_by,
+        policy.reason,
+    )
+
+    clock = resolve_data_clock(market=market, trade_date=date_str, as_of_kst=run_started_at)
+    preferred_run_id = run_id or os.getenv("SCREENER_RUN_ID") or os.getenv("RUN_ID") or generate_run_id(run_started_at)
+    writer = ScreenerRunWriter(
+        output_dir=OUTPUT_DIR,
+        market=market,
+        trade_date=date_str,
+        session=sess,
+        run_mode=policy.run_mode,
+        run_id=preferred_run_id,
+        policy=policy,
+        clock=clock,
+        started_at_kst=run_started_at.isoformat(),
+    )
+    os.environ["SCREENER_RUN_ID"] = writer.run_id
+    os.environ["SCREENER_RUN_MODE"] = policy.run_mode
+    logger.info(
+        "[RUN_ID] %s dir=%s as_of_kst=%s market_session_state=%s daily_bar_status=%s",
+        writer.run_id,
+        writer.final_dir,
+        clock.get("as_of_kst"),
+        clock.get("market_session_state"),
+        clock.get("daily_bar_status"),
+    )
+
+    def _finalize_run(
         *,
         status: str,
         result_status: str,
@@ -2825,12 +2913,24 @@ def run_screener(
         top_scores: Optional[List[Dict[str, Any]]] = None,
         production_candidates: Optional[List[Dict[str, Any]]] = None,
         shadow_candidates: Optional[List[Dict[str, Any]]] = None,
+        scores_records: Optional[List[Dict[str, Any]]] = None,
+        promote: Optional[bool] = None,
     ) -> Dict[str, Any]:
+        nonlocal _finalize_done
+        if _finalize_done:
+            return {}
         funnel_dicts, repaired = funnel.sanitize_for_storage()
         final_status = status
         if repaired and status == "SUCCESS":
             final_status = "SUCCESS_WITH_WARNINGS"
         finished = datetime.now(KST)
+        score_count = int((score_dist or {}).get("count") or len(scores_records or []) or 0)
+        shadow_thr = (shadow or {}).get("threshold")
+        shadow_cnt = int((shadow or {}).get("candidate_count") or 0)
+        decision_flag = bool(
+            policy.decision_artifact and str(final_status).startswith("SUCCESS")
+        )
+        integrity_preview = writer.artifact_digest_map() if writer else {}
         meta = build_run_meta(
             market=market,
             trade_date=fixed_date,
@@ -2854,29 +2954,33 @@ def run_screener(
             shadow=shadow,
             production_shadow_difference={
                 "production_candidate_count": candidate_count,
-                "shadow_candidate_count": (shadow or {}).get("candidate_count", 0),
+                "shadow_candidate_count": shadow_cnt,
                 "threshold_delta": (
                     None
-                    if shadow is None or shadow.get("threshold") is None
-                    else round(float(shadow["threshold"]) - float(configured_threshold), 4)
+                    if shadow is None or shadow_thr is None
+                    else round(float(shadow_thr) - float(configured_threshold), 4)
                 ),
             },
+            run_id=writer.run_id,
+            run_mode=policy.run_mode,
+            replay_type=policy.replay_type,
+            decision_artifact=decision_flag,
+            invoked_by=policy.invoked_by,
+            source_run_id=writer.run_id,
+            run_directory=str(writer.final_dir),
+            as_of_kst=clock.get("as_of_kst"),
+            as_of_utc=clock.get("as_of_utc"),
+            data_cutoff_at_kst=clock.get("data_cutoff_at_kst"),
+            market_session_state=clock.get("market_session_state"),
+            daily_bar_status=clock.get("daily_bar_status"),
+            git_commit=git_commit,
+            config_sha256=config_sha,
+            issuer_groups_sha256=issuer_sha,
+            artifact_integrity=integrity_preview,
         )
-        meta_path = OUTPUT_DIR / format_pipeline_artifact(
-            "screener_run_meta", fixed_date, market, sess
-        )
-        atomic_write_json(meta_path, meta)
-        logger.info(
-            "run_meta 저장: %s status=%s result_status=%s empty_reason=%s",
-            meta_path,
-            meta.get("status"),
-            meta.get("result_status"),
-            meta.get("empty_reason"),
-        )
+        writer.write_json("screener_run_meta.json", meta)
         try:
-            review_path = OUTPUT_DIR / "reviews" / format_pipeline_artifact(
-                "screener_review", fixed_date, market, sess, suffix=".md"
-            )
+            review_path = writer.path("screener_review.md")
             write_review_markdown(
                 review_path,
                 meta,
@@ -2884,13 +2988,101 @@ def run_screener(
                 production_candidates=production_candidates or [],
                 shadow_candidates=shadow_candidates or [],
             )
-            logger.info("스크리너 리뷰 저장: %s", review_path)
+            writer._files["screener_review.md"] = review_path
         except Exception as e:
             logger.warning("스크리너 리뷰 저장 실패: %s", e)
+
+        if scores_records is not None and policy.run_mode == "DECISION":
+            try:
+                writer.write_inputs_json(
+                    "score_features.json",
+                    build_score_features_snapshot(
+                        scores_records,
+                        as_of=str(clock.get("as_of_kst") or ""),
+                        weighted_regime_score=weighted_regime_score,
+                        scoring_market_component=scoring_market_component,
+                    ),
+                )
+            except Exception as e:
+                logger.warning("score_features snapshot 실패: %s", e)
+
+        manifest = writer.build_manifest(
+            status=final_status,
+            result_status=result_status,
+            completed_at_kst=finished.isoformat(),
+            production_threshold=float(configured_threshold),
+            production_candidate_count=int(candidate_count),
+            shadow_threshold=shadow_thr,
+            shadow_candidate_count=shadow_cnt,
+            score_count=score_count,
+            config_sha256=config_sha,
+            issuer_groups_sha256=issuer_sha,
+            git_commit=git_commit,
+            git_commit_error=git_commit_error,
+            extra={
+                "empty_reason": empty_reason,
+                "weighted_regime_score": weighted_regime_score,
+                "scoring_market_component": scoring_market_component,
+                "advanced_market_confidence": market_state_payload.get(
+                    "advanced_market_confidence"
+                ),
+            },
+        )
+        # Refresh integrity on meta after all artifacts present
+        meta["artifact_integrity"] = manifest.get("artifacts") or {}
+        meta["manifest_path"] = str(writer.final_dir / "manifest.json")
+        writer.write_json("screener_run_meta.json", meta)
+
+        published = writer.publish(manifest)
+        logger.info(
+            "immutable run 저장: %s status=%s result_status=%s mode=%s",
+            published,
+            meta.get("status"),
+            meta.get("result_status"),
+            policy.run_mode,
+        )
+
+        do_promote = (
+            promote
+            if promote is not None
+            else (
+                policy.run_mode == "DECISION"
+                and policy.allow_fixed_update
+                and str(final_status).startswith("SUCCESS")
+            )
+        )
+        if do_promote:
+            try:
+                promote_fixed_artifacts(writer)
+                logger.info(
+                    "Production fixed artifacts 갱신 (run_id=%s, candidates=%d)",
+                    writer.run_id,
+                    candidate_count,
+                )
+            except ArtifactError as e:
+                logger.error("Production fixed 갱신 거부: %s", e)
+                raise
+        elif policy.run_mode == "DECISION" and not policy.allow_fixed_update:
+            logger.warning(
+                "DECISION run 저장됨(%s) but Production fixed files NOT updated "
+                "(pass --allow-decision-overwrite to overwrite)",
+                published,
+            )
+        else:
+            logger.info(
+                "REPLAY/non-promote: Production fixed artifacts unchanged (mode=%s)",
+                policy.run_mode,
+            )
+        _finalize_done = True
         return meta
+
+    # Back-compat alias used by early-exit paths
+    def _persist_run_meta(**kwargs):
+        return _finalize_run(**kwargs)
 
     start_msg = (
         f"▶ 스크리너 시작 (date={date_str}, session={sess}, market={market}, "
+        f"run_mode={policy.run_mode}, run_id={writer.run_id}, "
         f"workers={workers}, debug={debug}, refresh_amount5d={refresh_amount5d})"
     )
     logger.info(start_msg)
@@ -2917,6 +3109,8 @@ def run_screener(
         msg = f"휴장일이므로 screener를 건너뜁니다. (market={market})"
         logger.info(msg)
         _notify(f"ℹ️ {msg}", key="screener_holiday", cooldown_sec=600)
+        if writer:
+            writer.abandon_staging()
         return
     if force and not is_market_open_day(market=market):
         logger.warning("⚠️ --force: 휴장일 검사를 건너뛰고 스크리너를 실행합니다. (market=%s)", market)
@@ -2945,7 +3139,20 @@ def run_screener(
         msg = "설정 로딩 실패로 종료합니다."
         logger.error(msg)
         _notify(f"❌ {msg}", key="screener_config_err", cooldown_sec=60)
+        if writer:
+            writer.abandon_staging()
         return
+
+    try:
+        config_sha = sha256_json_payload(settings)
+        writer.write_inputs_json("config_snapshot.json", settings)
+    except Exception as e:
+        logger.warning("config snapshot 실패: %s", e)
+        config_sha = None
+
+    git_commit, git_commit_error = get_git_commit()
+    if git_commit_error:
+        logger.info("git commit 조회 실패(무시): %s", git_commit_error)
 
     # KIS 인스턴스
     broker_config = settings.get("kis_broker", {})
@@ -2955,6 +3162,8 @@ def run_screener(
         msg = "KIS API 인증 실패로 종료합니다."
         logger.error(msg)
         _notify(f"❌ {msg}", key="screener_kis_auth_fail", cooldown_sec=60)
+        if writer:
+            writer.abandon_staging()
         return
     logger.info("'%s' 모드로 KIS API 인증 완료.", trading_env)
     _KIS_INSTANCE = kis
@@ -2968,6 +3177,15 @@ def run_screener(
 
     screener_params = settings.get("screener_params", {})
     risk_params = settings.get("risk_params", {})
+
+    try:
+        _cfg_dir = Path(getattr(utils, "CONFIG_PATH", "/app/config/config.json")).parent
+        issuer_map_early = load_issuer_group_map(settings, config_dir=_cfg_dir)
+        issuer_sha = sha256_json_payload(issuer_map_early)
+        writer.write_inputs_json("issuer_groups_snapshot.json", issuer_map_early)
+    except Exception as e:
+        logger.warning("issuer_groups snapshot 실패: %s", e)
+        issuer_sha = None
 
     threshold_policy = screener_params.get("score_threshold_policy") or {}
     static_threshold = float(
@@ -3019,6 +3237,8 @@ def run_screener(
                 if f.get("code") == "UNIVERSE_EMPTY":
                     empty_reason = "UNIVERSE_EMPTY"
                     break
+            for name in ("screener_candidates_full.json", "screener_candidates.json", "screener_scores.json"):
+                writer.write_json(name, [])
             _persist_run_meta(
                 status="SUCCESS",
                 result_status="EMPTY_DATA_QUALITY",
@@ -3027,12 +3247,6 @@ def run_screener(
                 effective_threshold=configured_threshold,
                 candidate_count=0,
             )
-            # Keep empty candidate artifacts for downstream safety
-            for prefix in ("screener_candidates_full", "screener_candidates", "screener_scores"):
-                atomic_write_json(
-                    OUTPUT_DIR / format_pipeline_artifact(prefix, fixed_date, market, sess),
-                    [],
-                )
             return
 
     # KIS 1회 호출로 섹터+상장일 동시 조회 → 이후 섹터 보강/상장일 프리패치는 캐시만 사용
@@ -3048,8 +3262,12 @@ def run_screener(
 
     with stage("시장 레짐 계산", notify_key="screener_regime"):
         # 기존 시장 레짐 계산
+        # weighted_regime_score = equal-weight average of regime components
+        # scoring_market_component = value injected into stock scores
         regime = _get_market_regime_score(fixed_date, market)
         market_score = 0.7 * regime + 0.3 * 0.5
+        weighted_regime_score = float(regime) if regime is not None else None
+        scoring_market_component = float(market_score) if market_score is not None else None
         comps = _get_market_regime_components(fixed_date, market)
         market_trend = get_market_trend(fixed_date)
         regime_meta: Dict[str, Any] = {}
@@ -3060,7 +3278,11 @@ def run_screener(
                 regime_meta = get_last_us_regime_meta()
             except Exception:
                 regime_meta = {}
-        logger.info("시장 레짐 스코어 (가중치 적용): %.3f", market_score)
+        logger.info(
+            "weighted_regime_score(components_avg)=%.3f scoring_market_component=%.3f",
+            float(weighted_regime_score or 0.0),
+            float(scoring_market_component or 0.0),
+        )
         logger.info(
             "레짐 구성요소: above_ma50=%.2f, ma50>ma200=%.2f, rsi_term=%.2f",
             comps["above_ma50"], comps["ma50_gt_ma200"], comps["rsi_term"],
@@ -3071,6 +3293,17 @@ def run_screener(
         market_analyzer = MarketAnalyzer(settings, kis=kis, market=market, date_str=fixed_date)
         market_state = market_analyzer.analyze_market_state()
         logger.info("고급 시장 분석: %s", market_analyzer.get_market_summary(market_state))
+        adv_conf = float(getattr(market_state, "confidence", 0.0) or 0.0)
+
+        clarified = clarify_regime_fields(
+            components_avg=weighted_regime_score,
+            scoring_market_component=scoring_market_component,
+            advanced_market_confidence=adv_conf,
+            components=comps,
+            trend=getattr(market_state, "trend_direction", None),
+            volatility=getattr(market_state, "volatility_level", None),
+            regime_label=getattr(getattr(market_state, "regime", None), "value", None),
+        )
 
         # market_state sidecar 저장 (trader의 dynamic_cash_management가 재사용)
         try:
@@ -3078,36 +3311,56 @@ def run_screener(
                 "generated_at": datetime.now(KST).isoformat(),
                 "date": fixed_date,
                 "market": market,
-                "regime": getattr(getattr(market_state, "regime", None), "value", None),
-                "volatility_level": getattr(market_state, "volatility_level", None),
-                "trend_direction": getattr(market_state, "trend_direction", None),
-                "confidence": float(getattr(market_state, "confidence", 0.0) or 0.0),
+                "as_of_kst": clock.get("as_of_kst"),
+                "as_of_utc": clock.get("as_of_utc"),
+                "market_session_state": clock.get("market_session_state"),
+                "daily_bar_status": clock.get("daily_bar_status"),
+                "data_cutoff_at_kst": clock.get("data_cutoff_at_kst"),
+                "regime": clarified.get("regime"),
+                "volatility_level": clarified.get("volatility"),
+                "trend_direction": clarified.get("trend"),
+                "confidence": adv_conf,
+                "advanced_market_confidence": adv_conf,
                 "regime_components": comps,
-                "regime_score": float(regime) if regime is not None else None,
-                "market_score": float(market_score) if market_score is not None else None,
+                "weighted_regime_score": weighted_regime_score,
+                "scoring_market_component": scoring_market_component,
+                # deprecated: alias of weighted_regime_score only (never scoring blend)
+                "regime_score": weighted_regime_score,
+                "regime_score_deprecated_alias_of": "weighted_regime_score",
                 "market_trend": market_trend,
                 "benchmark_source": regime_meta.get("benchmark_source"),
                 "benchmark_symbol": regime_meta.get("benchmark_symbol"),
                 "benchmark_market_code": regime_meta.get("benchmark_market_code"),
                 "benchmark_bars": regime_meta.get("benchmark_bars"),
+                "source_run_id": writer.run_id,
+                "run_mode": policy.run_mode,
             }
-            p = OUTPUT_DIR / format_pipeline_artifact(
-                "market_state", fixed_date, market, sess
+            writer.write_json("market_state.json", out)
+            writer.write_inputs_json(
+                "market_regime_inputs.json",
+                {
+                    "weighted_regime_score": weighted_regime_score,
+                    "scoring_market_component": scoring_market_component,
+                    "components": comps,
+                    "market_trend": market_trend,
+                    "benchmark": regime_meta,
+                    "as_of_kst": clock.get("as_of_kst"),
+                    "market_session_state": clock.get("market_session_state"),
+                    "daily_bar_status": clock.get("daily_bar_status"),
+                },
             )
-            with open(p, "w", encoding="utf-8") as f:
-                json.dump(out, f, ensure_ascii=False, indent=2)
-            logger.info("시장 상태 저장: %s", p)
+            logger.info("시장 상태 저장(run): %s", writer.path("market_state.json"))
         except Exception as e:
             logger.warning("시장 상태 저장 실패: %s", e)
         
         # 시장 상태를 전역 변수로 저장 (후속 단계에서 사용)
         _CURRENT_MARKET_STATE = market_state
         market_state_payload = {
-            "regime_score": float(regime) if regime is not None else None,
-            "trend": getattr(market_state, "trend_direction", None),
-            "volatility": getattr(market_state, "volatility_level", None),
-            "regime": getattr(getattr(market_state, "regime", None), "value", None),
-            "confidence": float(getattr(market_state, "confidence", 0.0) or 0.0),
+            **clarified,
+            "market_session_state": clock.get("market_session_state"),
+            "daily_bar_status": clock.get("daily_bar_status"),
+            "as_of_kst": clock.get("as_of_kst"),
+            "confidence": adv_conf,
         }
 
     with stage("섹터 트렌드 계산", notify_key="screener_sector_trend"):
@@ -3145,6 +3398,13 @@ def run_screener(
             funnel.record_not_run("SCORING", reason="NO_INPUT")
             for st_name in ("MIN_SCORE", "MOMENTUM", "VOLATILITY", "SECTOR_DIVERSIFICATION"):
                 funnel.record_not_run(st_name, reason="NO_INPUT")
+            for name in (
+                "screener_scores.json",
+                "screener_candidates_full.json",
+                "screener_candidates.json",
+                "screener_shadow_candidates.json",
+            ):
+                writer.write_json(name, [])
             _persist_run_meta(
                 status="SUCCESS",
                 result_status="EMPTY_DATA_QUALITY",
@@ -3280,15 +3540,13 @@ def run_screener(
             msg = f"❌ 2차 스크리닝 결과, 최종 후보가 없습니다. (실패원인: {analysis_str})"
             logger.warning(msg)
             _notify(msg, key="screener_no_candidates_stage2", cooldown_sec=60)
-            atomic_write_json(
-                OUTPUT_DIR / format_pipeline_artifact("screener_scores", fixed_date, market, sess),
-                [],
-            )
-            for prefix in ("screener_candidates_full", "screener_candidates", "screener_shadow_candidates"):
-                atomic_write_json(
-                    OUTPUT_DIR / format_pipeline_artifact(prefix, fixed_date, market, sess),
-                    [],
-                )
+            for name in (
+                "screener_scores.json",
+                "screener_candidates_full.json",
+                "screener_candidates.json",
+                "screener_shadow_candidates.json",
+            ):
+                writer.write_json(name, [])
             _persist_run_meta(
                 status="SUCCESS",
                 result_status="EMPTY_DATA_QUALITY",
@@ -3547,46 +3805,60 @@ def run_screener(
         aff_req = bool(settings.get("screener_params", {}).get("affordability_filter", False))
         for df_ in (final_candidates_full, final_candidates_slim):
             df_["affordability_filter_requested"] = aff_req
+            df_["source_run_id"] = writer.run_id
+            df_["run_mode"] = policy.run_mode
 
-        # 파일 경로
-        cands_full_json = OUTPUT_DIR / format_pipeline_artifact(
-            "screener_candidates_full", fixed_date, market, sess
-        )
-        cands_slim_json = OUTPUT_DIR / format_pipeline_artifact(
-            "screener_candidates", fixed_date, market, sess
-        )
-        scores_json = OUTPUT_DIR / format_pipeline_artifact(
-            "screener_scores", fixed_date, market, sess
-        )
-        shadow_json = OUTPUT_DIR / format_pipeline_artifact(
-            "screener_shadow_candidates", fixed_date, market, sess
-        )
-        holdings_json = OUTPUT_DIR / format_pipeline_artifact(
-            "screener_holdings", fixed_date, market, sess
-        )
-
-        # Production candidates (trader / news / gpt input)
-        final_candidates_full.to_json(cands_full_json, orient="records", indent=2, force_ascii=False)
-        final_candidates_slim.to_json(cands_slim_json, orient="records", indent=2, force_ascii=False)
-
-        # Full scored universe (NOT limited to final candidates)
+        # Immutable run artifacts first (Production fixed files updated only on DECISION promote)
         scores_records = scores_records_for_export(scored_all, trade_date=fixed_date)
-        atomic_write_json(scores_json, scores_records)
+        for rec in scores_records:
+            rec["as_of_kst"] = clock.get("as_of_kst")
+            rec["source_run_id"] = writer.run_id
+            rec["run_mode"] = policy.run_mode
 
-        # Shadow candidates — never used as trader input
+        cands_full_payload = json.loads(
+            final_candidates_full.to_json(orient="records", force_ascii=False)
+        )
+        cands_slim_payload = json.loads(
+            final_candidates_slim.to_json(orient="records", force_ascii=False)
+        )
         if shadow_candidates_df is not None and not shadow_candidates_df.empty:
             shadow_out = shadow_candidates_df.copy()
             shadow_out["schema_version"] = SCHEMA_VERSION
             shadow_out["generated_at"] = generated_at
             shadow_out["shadow"] = True
-            shadow_out.to_json(shadow_json, orient="records", indent=2, force_ascii=False)
+            shadow_out["source_run_id"] = writer.run_id
+            shadow_payload_rows = json.loads(
+                shadow_out.to_json(orient="records", force_ascii=False)
+            )
         else:
-            atomic_write_json(shadow_json, [])
+            shadow_payload_rows = []
+
+        writer.write_json("screener_candidates_full.json", cands_full_payload)
+        writer.write_json("screener_candidates.json", cands_slim_payload)
+        writer.write_json("screener_scores.json", scores_records)
+        writer.write_json("screener_shadow_candidates.json", shadow_payload_rows)
 
         if holdings_scores:
             holdings_list = list(holdings_scores.values())
-            atomic_write_json(holdings_json, holdings_list)
-            logger.info("보유 종목 스코어 저장: %s (%d개)", holdings_json, len(holdings_scores))
+            writer.write_json("screener_holdings.json", holdings_list)
+            logger.info("보유 종목 스코어 저장(run): %d개", len(holdings_scores))
+        else:
+            writer.write_json("screener_holdings.json", [])
+
+        try:
+            writer.write_inputs_json(
+                "universe_snapshot.json",
+                {
+                    "trade_date": fixed_date,
+                    "market": market,
+                    "as_of_kst": clock.get("as_of_kst"),
+                    "tickers": [str(t) for t in list(df_filtered.index)],
+                    "count": int(len(df_filtered)),
+                    "amount5d_cache": stage1_meta.get("amount5d_cache"),
+                },
+            )
+        except Exception as e:
+            logger.warning("universe snapshot 실패: %s", e)
 
         stage_durations["final_selection"] = round(time.perf_counter() - finalize_t0, 3)
 
@@ -3633,12 +3905,18 @@ def run_screener(
             shadow_candidates=shadow_candidates_df.to_dict(orient="records")
             if shadow_candidates_df is not None and not shadow_candidates_df.empty
             else [],
+            scores_records=scores_records,
         )
 
-        logger.info("최종 후보(풀) 저장: %s (%d)", cands_full_json, len(final_candidates))
-        logger.info("✅ 스크리닝 완료. 후보(슬림) 저장: %s (%d)", cands_slim_json, len(final_candidates))
-        logger.info("스코어 전체 저장: %s (%d)", scores_json, len(scores_records))
-        logger.info("Shadow 후보 저장: %s (%d)", shadow_json, len(shadow_candidates_df) if shadow_candidates_df is not None else 0)
+        logger.info(
+            "최종 후보 저장(run=%s): full=%d slim=%d scores=%d shadow=%d mode=%s",
+            writer.run_id,
+            len(final_candidates),
+            len(final_candidates),
+            len(scores_records),
+            len(shadow_payload_rows),
+            policy.run_mode,
+        )
 
         try:
             _top_cols = ["Ticker", "Name", "Sector", "Price", "목표가", "손절가", "Score"]
@@ -3681,12 +3959,44 @@ def parse_args():
     parser.add_argument(
         "--force",
         action="store_true",
-        help="휴장일/주말에도 실행 (로컬 테스트용)",
+        help="휴장일/주말에도 실행 (로컬 테스트용). 기본 run_mode=REPLAY — Production 고정 파일을 덮어쓰지 않음",
     )
     parser.add_argument(
         "--refresh-amount5d",
         action="store_true",
         help="Amount5D 캐시를 무시하고 KIS에서 재조회",
+    )
+    parser.add_argument(
+        "--run-mode",
+        choices=["decision", "replay", "DECISION", "REPLAY"],
+        default=None,
+        help="DECISION=정규 의사결정 보존 / REPLAY=재계산(기본: CLI는 REPLAY)",
+    )
+    parser.add_argument(
+        "--run-id",
+        default=None,
+        help="실행 ID (미지정 시 KST 시각+random 생성)",
+    )
+    parser.add_argument(
+        "--allow-decision-overwrite",
+        action="store_true",
+        help="기존 Production 고정 Artifact를 DECISION으로 덮어쓸 때 필요",
+    )
+    parser.add_argument(
+        "--invoked-by",
+        default=None,
+        help="호출자 식별 (예: integrated_manager, cli)",
+    )
+    parser.add_argument(
+        "--replay-type",
+        choices=[
+            "current_data_recalculation",
+            "frozen_input_replay",
+            "CURRENT_DATA_RECALCULATION",
+            "FROZEN_INPUT_REPLAY",
+        ],
+        default=None,
+        help="REPLAY 유형 (frozen은 현재 NOT_IMPLEMENTED)",
     )
     return parser.parse_args()
 
@@ -3704,28 +4014,57 @@ if __name__ == "__main__":
             pipeline_session=args.session,
             force=args.force,
             refresh_amount5d=args.refresh_amount5d,
+            run_mode=args.run_mode,
+            run_id=args.run_id,
+            allow_decision_overwrite=args.allow_decision_overwrite,
+            invoked_by=args.invoked_by,
+            replay_type=args.replay_type,
         )
+    except FrozenReplayNotImplemented as e:
+        logger.error("%s", e)
+        sys.exit(2)
+    except ArtifactError as e:
+        logger.error("Artifact policy error: %s", e)
+        sys.exit(2)
     except Exception as e:
         logger.critical("스크리너 치명적 오류: %s", e, exc_info=True)
         try:
             sess = (args.session or os.getenv("PIPELINE_SESSION") or "pm").lower()
             if sess not in ("am", "pm"):
                 sess = "pm"
+            # FAILED runs must never update Production fixed files.
+            # Best-effort: write a failed manifest under runs/ if a staging writer is unavailable.
+            fail_run_id = os.getenv("SCREENER_RUN_ID") or generate_run_id()
+            fail_mode = (os.getenv("SCREENER_RUN_MODE") or "REPLAY").upper()
+            if fail_mode not in ("DECISION", "REPLAY"):
+                fail_mode = "REPLAY"
+            from screener_artifacts import run_directory as _run_directory
+
+            fail_dir = _run_directory(
+                market=args.market,
+                trade_date=args.date,
+                session=sess,
+                run_mode=fail_mode,
+                run_id=fail_run_id,
+                output_dir=OUTPUT_DIR,
+            )
+            fail_dir.mkdir(parents=True, exist_ok=True)
             fail_meta = {
                 "schema_version": "1.0",
                 "market": args.market,
                 "trade_date": args.date,
                 "session": sess,
+                "run_id": fail_run_id,
+                "run_mode": fail_mode,
+                "decision_artifact": False,
+                "replay": fail_mode == "REPLAY",
                 "status": "FAILED",
                 "result_status": "FAILED",
                 "empty_reason": "UNHANDLED_EXCEPTION",
                 "error": f"{type(e).__name__}: {e}",
             }
-            atomic_write_json(
-                OUTPUT_DIR
-                / format_pipeline_artifact("screener_run_meta", args.date, args.market, sess),
-                fail_meta,
-            )
+            atomic_write_json(fail_dir / "manifest.json", {**fail_meta, "schema_version": 1})
+            atomic_write_json(fail_dir / "screener_run_meta.json", fail_meta)
         except Exception:
             pass
         sys.exit(1)

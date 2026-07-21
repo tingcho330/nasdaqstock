@@ -689,19 +689,100 @@ class Trader:
 
     # ── 스크리너 전체 데이터 로드 ──────────────────────────────────────
     def _load_all_stock_data(self) -> Dict[str, Dict]:
-        # 확장된 Screener 데이터 우선 로드
-        patterns = [
-            "screener_scores_*_*.json",  # 확장된 데이터 우선
-            "screener_candidates_full_*_*.json",
-            "screener_rank_full_*_*.json",
-            "screener_candidates_*_*.json",
-        ]
-        picked = None
-        for pat in patterns:
-            f = find_latest_file(pat)
-            if f:
-                picked = f
-                break
+        # Prefer session-scoped Production fixed artifacts (DECISION only).
+        trade_date = (os.getenv("PIPELINE_TRADE_DATE") or "").strip()
+        session = (os.getenv("PIPELINE_SESSION") or "").strip().lower()
+        if trade_date and session in ("am", "pm"):
+            try:
+                from screener_artifacts import (
+                    fixed_artifact_path,
+                    validate_decision_artifacts_for_trader,
+                )
+
+                for prefix in (
+                    "screener_candidates",
+                    "screener_candidates_full",
+                    "screener_scores",
+                ):
+                    p = fixed_artifact_path(prefix, trade_date, self.market, session)
+                    if not p.exists():
+                        continue
+                    if "shadow" in p.name.lower():
+                        continue
+                    ok, msg, meta = validate_decision_artifacts_for_trader(
+                        trade_date=trade_date,
+                        market=self.market,
+                        session=session,
+                        candidates_path=fixed_artifact_path(
+                            "screener_candidates", trade_date, self.market, session
+                        ),
+                    )
+                    if not ok:
+                        logger.error(
+                            "trader blocked: Production screener artifact failed DECISION gate (%s)",
+                            msg,
+                        )
+                        _notify_text(
+                            f"❌ trader 차단: screener DECISION 검증 실패 — {msg}",
+                            key=f"phase:screener_gate:{self.run_id}",
+                            cooldown=600,
+                        )
+                        return {}
+                    logger.info(
+                        "DECISION screener artifact selected: %s (source_run_id=%s)",
+                        p.name,
+                        (meta or {}).get("source_run_id") or (meta or {}).get("run_id"),
+                    )
+                    picked = p
+                    break
+                else:
+                    picked = None
+            except Exception as e:
+                logger.warning("DECISION gate check error (fallback to find_latest): %s", e)
+                picked = None
+        else:
+            picked = None
+
+        # 확장된 Screener 데이터 우선 로드 (legacy fallback)
+        if picked is None:
+            patterns = [
+                "screener_scores_*_*.json",  # 확장된 데이터 우선
+                "screener_candidates_full_*_*.json",
+                "screener_rank_full_*_*.json",
+                "screener_candidates_*_*.json",
+            ]
+            for pat in patterns:
+                f = find_latest_file(pat)
+                if f and "shadow" in f.name.lower():
+                    continue
+                if f and "/runs/replay/" in str(f).replace("\\", "/"):
+                    logger.warning("skipping REPLAY path for trader: %s", f)
+                    continue
+                if f:
+                    # If run_meta exists beside date, require DECISION
+                    try:
+                        from screener_artifacts import validate_decision_artifacts_for_trader
+                        from utils import parse_pipeline_artifact_stem
+
+                        stem_meta = parse_pipeline_artifact_stem(f.stem)
+                        td = stem_meta.get("date")
+                        sess = stem_meta.get("session") or session or "pm"
+                        mkt = stem_meta.get("market") or self.market
+                        if td:
+                            ok, msg, _ = validate_decision_artifacts_for_trader(
+                                trade_date=td,
+                                market=mkt,
+                                session=sess,
+                            )
+                            if not ok:
+                                logger.warning(
+                                    "skipping non-DECISION screener file %s: %s", f.name, msg
+                                )
+                                continue
+                    except Exception:
+                        pass
+                    picked = f
+                    break
 
         if not picked:
             logger.info("스크리너 결과 파일을 찾지 못했습니다. (scores/candidates_full/rank_full/candidates)")
