@@ -46,6 +46,9 @@ ARTIFACT_NAMES = (
     "screener_candidates_full.json",
     "screener_candidates.json",
     "screener_shadow_candidates.json",
+    "screener_eligible_shadow_candidates.json",
+    "screener_liquidity_shadow_scores.json",
+    "screener_liquidity_shadow_candidates.json",
     "screener_holdings.json",
     "market_state.json",
     "screener.log",
@@ -179,7 +182,16 @@ def file_row_count(path: Path) -> Optional[int]:
 
 
 def get_git_commit(repo_root: Optional[Path] = None) -> Tuple[Optional[str], Optional[str]]:
-    """Return (commit_sha, error_reason). Never raises."""
+    """Return (commit_sha, error_reason). Never raises.
+
+    Priority:
+      1. APP_GIT_COMMIT environment variable
+      2. git rev-parse HEAD
+      3. (None, reason)
+    """
+    env_commit = (os.getenv("APP_GIT_COMMIT") or "").strip()
+    if env_commit:
+        return env_commit, None
     root = repo_root or Path(__file__).resolve().parents[1]
     try:
         proc = subprocess.run(
@@ -196,6 +208,30 @@ def get_git_commit(repo_root: Optional[Path] = None) -> Tuple[Optional[str], Opt
         return None, err[:200] or "git_rev_parse_failed"
     except Exception as e:
         return None, f"{type(e).__name__}: {e}"
+
+
+def resolve_build_identity(repo_root: Optional[Path] = None) -> Dict[str, Any]:
+    """Build identity for manifests. Missing git must not fail the screener."""
+    env_commit = (os.getenv("APP_GIT_COMMIT") or "").strip() or None
+    build_time = (os.getenv("APP_BUILD_TIME") or "").strip() or None
+    image_tag = (os.getenv("APP_IMAGE_TAG") or "").strip() or None
+    app_version = (os.getenv("APP_VERSION") or "").strip() or None
+
+    source = "environment"
+    git_commit = env_commit
+    git_error = None
+    if not git_commit:
+        git_commit, git_error = get_git_commit(repo_root)
+        source = "git" if git_commit else "unavailable"
+
+    return {
+        "git_commit": git_commit,
+        "build_time": build_time,
+        "image_tag": image_tag,
+        "app_version": app_version,
+        "source": source,
+        "git_commit_error": git_error,
+    }
 
 
 def resolve_data_clock(
@@ -615,6 +651,9 @@ class ScreenerRunWriter:
             "screener_candidates.json",
             "screener_candidates_full.json",
             "screener_shadow_candidates.json",
+            "screener_eligible_shadow_candidates.json",
+            "screener_liquidity_shadow_scores.json",
+            "screener_liquidity_shadow_candidates.json",
             "screener_holdings.json",
             "market_state.json",
             "screener_review.md",
@@ -668,7 +707,12 @@ class ScreenerRunWriter:
             "policy_warnings": list(self.policy.warnings),
         }
         if extra:
+            if "build_identity" not in extra and git_commit is not None:
+                extra = dict(extra)
             manifest.update(extra)
+            if "build_identity" in manifest:
+                bi = manifest["build_identity"] or {}
+                manifest.setdefault("git_commit", bi.get("git_commit"))
         return manifest
 
     def publish(self, manifest: Dict[str, Any]) -> Path:
@@ -883,6 +927,11 @@ def validate_decision_artifacts_for_trader(
     # Never treat shadow file as trader input
     if "shadow" in cands_path.name.lower():
         return False, "shadow candidates are not trader inputs", meta
+    if any(
+        tok in cands_path.name.lower()
+        for tok in ("eligible_shadow", "liquidity_shadow", "screener_quality", "observation")
+    ):
+        return False, "observation/shadow artifacts are not trader inputs", meta
 
     return True, "ok", meta
 

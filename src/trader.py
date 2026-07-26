@@ -709,6 +709,10 @@ class Trader:
                         continue
                     if "shadow" in p.name.lower():
                         continue
+                    if "eligible_shadow" in p.name.lower() or "liquidity_shadow" in p.name.lower():
+                        continue
+                    if "screener_quality" in p.name.lower() or "observation" in p.name.lower():
+                        continue
                     ok, msg, meta = validate_decision_artifacts_for_trader(
                         trade_date=trade_date,
                         market=self.market,

@@ -15,16 +15,16 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
 import pandas as pd
 
 logger = logging.getLogger("screener_ops")
 
-RUN_META_SCHEMA = "1.0"
+RUN_META_SCHEMA = "3"
 AMOUNT5D_CACHE_SCHEMA = "2"
-SCORE_EXPORT_SCHEMA = "1.3"
+SCORE_EXPORT_SCHEMA = "1.4"
 
 # Lines from child screener stdout that should surface at INFO in the parent.
 _SCREENER_SUMMARY_PATTERNS = [
@@ -511,8 +511,33 @@ def classify_empty_result(
     data_quality_codes: Sequence[str],
     min_score_pass: int,
     empty_after_min_score: bool,
+    funnel_stages: Optional[Sequence[Any]] = None,
+    threshold_pass_rows: Any = None,
 ) -> Tuple[str, str, Optional[str]]:
-    """Return (status, result_status, empty_reason)."""
+    """Return (status, result_status, empty_reason).
+
+    When funnel_stages are provided, prefer the detailed v2 classifier so
+    ALREADY_HELD / issuer / sector drops are not collapsed into a generic
+    NO_CANDIDATES_AFTER_FILTERS reason.
+    """
+    if funnel_stages is not None:
+        try:
+            from screener_diagnostics import classify_empty_result_v2
+
+            status, result_status, empty_reason, _detail = classify_empty_result_v2(
+                candidate_count=candidate_count,
+                scored_count=scored_count,
+                universe_count=universe_count,
+                amount5d_pass=amount5d_pass,
+                scoring_failures_all=scoring_failures_all,
+                data_quality_codes=data_quality_codes,
+                funnel_stages=funnel_stages,
+                threshold_pass_rows=threshold_pass_rows,
+            )
+            return status, result_status, empty_reason
+        except Exception as e:
+            logger.warning("empty_reason v2 failed, falling back: %s", e)
+
     if candidate_count > 0:
         return "SUCCESS", "HAS_CANDIDATES", None
 
@@ -528,12 +553,12 @@ def classify_empty_result(
     if amount5d_pass <= 0 and "AMOUNT5D_DATA_UNAVAILABLE" in data_quality_codes:
         return "SUCCESS", "EMPTY_DATA_QUALITY", "AMOUNT5D_DATA_UNAVAILABLE"
     if scoring_failures_all or scored_count <= 0:
-        return "SUCCESS", "EMPTY_DATA_QUALITY", "SCORING_FAILURE_ALL"
+        return "SUCCESS", "EMPTY_DATA_QUALITY", "SCORING_FAILED"
     if dq_hit and scored_count <= 0:
         return "SUCCESS", "EMPTY_DATA_QUALITY", dq_hit[0]
     if empty_after_min_score or min_score_pass == 0:
         return "SUCCESS", "EMPTY_VALID", "MIN_SCORE_THRESHOLD_NOT_MET"
-    return "SUCCESS", "EMPTY_VALID", "NO_CANDIDATES_AFTER_FILTERS"
+    return "SUCCESS", "EMPTY_VALID", "NO_ELIGIBLE_NEW_BUY_CANDIDATES"
 
 
 def eligibility_for_row(
@@ -715,6 +740,10 @@ def scores_records_for_export(df: pd.DataFrame, *, trade_date: str) -> List[Dict
             "pattern_score": _num(row.get("PatternScore")),
             "vol_kki": _num(row.get("VolKki")),
             "pos_52w": _num(row.get("Pos52w")),
+            "financial_score": _num(row.get("FinScore")),
+            "technical_score": _num(row.get("TechScore")),
+            "volatility_score": _num(row.get("VolKki")),
+            "position_52w_score": _num(row.get("Pos52w")),
             "rsi": _num(row.get("RSI")),
             "atr": _num(row.get("ATR")),
             "ma50": _num(row.get("MA50")),
@@ -730,9 +759,47 @@ def scores_records_for_export(df: pd.DataFrame, *, trade_date: str) -> List[Dict
             "momentum_pass": bool(row.get("momentum_pass", True)),
             "volatility_pass": bool(row.get("volatility_pass", True)),
             "eligibility_status": str(row.get("eligibility_status") or "UNKNOWN"),
+            "eligibility_pass": _nullable_bool(row.get("eligibility_pass")),
+            "issuer_dedup_pass": _nullable_bool(row.get("issuer_dedup_pass")),
+            "issuer_dedup_reason": row.get("issuer_dedup_reason"),
+            "sector_diversification_pass": _nullable_bool(row.get("sector_diversification_pass")),
+            "sector_diversification_reason": row.get("sector_diversification_reason"),
+            "production_candidate": bool(row.get("production_candidate", False)),
+            "high_conviction_shadow_candidate": bool(row.get("high_conviction_shadow_candidate", False)),
+            "eligible_shadow_candidate": bool(row.get("eligible_shadow_candidate", False)),
+            "liquidity_shadow_candidate": bool(row.get("liquidity_shadow_candidate", False)),
             "updated_at": trade_date,
             "schema_version": SCORE_EXPORT_SCHEMA,
         }
+        # Diagnostic fields (optional; never affect Production)
+        for key in (
+            "return_1d_pct",
+            "return_3d_pct",
+            "return_5d_pct",
+            "price_vs_ma50_pct",
+            "price_vs_ma200_pct",
+            "ma50_vs_ma200_pct",
+            "max_drawdown_5d_pct",
+            "max_drawdown_20d_pct",
+            "atr_14",
+            "atr_14_pct",
+            "gap_pct",
+            "recent_drop_1d",
+            "recent_drop_3d",
+            "recent_drop_5d",
+            "diagnostic_flags",
+        ):
+            if key in row.index:
+                val = row.get(key)
+                if key == "diagnostic_flags":
+                    rec[key] = list(val) if isinstance(val, (list, tuple)) else []
+                else:
+                    rec[key] = _num(val)
+        if "diagnostic_flags" not in rec:
+            rec["diagnostic_flags"] = []
+        rec["diagnostic_only"] = True
+        rec["used_in_production_score"] = False
+        rec["used_by_trader"] = False
         # Optional extras
         for src, dst in (
             ("EXCD", "excd"),
@@ -744,6 +811,19 @@ def scores_records_for_export(df: pd.DataFrame, *, trade_date: str) -> List[Dict
                 rec[dst] = _num(row.get(src)) if src in ("Amount5D", "Marcap") else row.get(src)
         records.append(rec)
     return records
+
+
+def _nullable_bool(v: Any) -> Optional[bool]:
+    if v is None:
+        return None
+    try:
+        if isinstance(v, float) and math.isnan(v):
+            return None
+        if pd.isna(v):
+            return None
+    except Exception:
+        pass
+    return bool(v)
 
 
 def _num(v: Any) -> Optional[float]:
@@ -786,19 +866,30 @@ def select_candidates_pipeline(
     require_eligible: bool = True,
     max_candidates: Optional[int] = None,
 ) -> Tuple[pd.DataFrame, List[StageResult]]:
-    """Apply min-score → momentum/vol → issuer dedupe → sector diversify.
+    """Apply min-score → momentum/vol → eligibility → issuer dedupe → sector diversify.
 
     Returns (candidates_df, ordered StageResult list for MIN_SCORE..SECTOR).
     When a stage receives 0 input, subsequent stages are NOT_RUN/NO_INPUT.
     Disabled momentum/vol with input>0 → SKIPPED (pass-through).
+
+    ALREADY_HELD / RSI / UP_STREAK drops are recorded under ELIGIBILITY, not
+    SECTOR_DIVERSIFICATION. Issuer duplicates are ISSUER_DEDUP. Sector cap only
+    under SECTOR_DIVERSIFICATION.
     """
     stages: List[StageResult] = []
     empty = scored_df.iloc[0:0] if scored_df is not None else pd.DataFrame()
     cur = scored_df.copy() if scored_df is not None and not scored_df.empty else empty
 
+    post_min_order = [
+        "MOMENTUM",
+        "VOLATILITY",
+        "ELIGIBILITY",
+        "ISSUER_DEDUP",
+        "SECTOR_DIVERSIFICATION",
+    ]
+
     def _tail_not_run_from(start_name: str) -> None:
-        order = ["MIN_SCORE", "MOMENTUM", "VOLATILITY", "SECTOR_DIVERSIFICATION"]
-        # issuer is folded into sector diversification stage for meta schema compatibility
+        order = ["MIN_SCORE"] + post_min_order
         started = False
         for name in order:
             if name == start_name:
@@ -811,7 +902,7 @@ def select_candidates_pipeline(
         _tail_not_run_from("MIN_SCORE")
         return empty, stages
 
-    # MIN_SCORE: score threshold only (eligibility applied later in SECTOR stage)
+    # MIN_SCORE: score threshold only
     passed = cur[cur["Score"] >= float(threshold)].copy()
     stages.append(
         StageResult("MIN_SCORE", "APPLIED", n_in, len(passed), threshold=float(threshold))
@@ -821,9 +912,8 @@ def select_candidates_pipeline(
     # MOMENTUM
     n_in = len(cur)
     if n_in == 0:
-        stages.append(StageResult("MOMENTUM", "NOT_RUN", 0, 0, reason="NO_INPUT"))
-        stages.append(StageResult("VOLATILITY", "NOT_RUN", 0, 0, reason="NO_INPUT"))
-        stages.append(StageResult("SECTOR_DIVERSIFICATION", "NOT_RUN", 0, 0, reason="NO_INPUT"))
+        for name in post_min_order:
+            stages.append(StageResult(name, "NOT_RUN", 0, 0, reason="NO_INPUT"))
         return empty, stages
     if require_positive_momentum:
         cur = cur[cur["momentum_pass"] == True].copy()  # noqa: E712
@@ -834,8 +924,8 @@ def select_candidates_pipeline(
     # VOLATILITY
     n_in = len(cur)
     if n_in == 0:
-        stages.append(StageResult("VOLATILITY", "NOT_RUN", 0, 0, reason="NO_INPUT"))
-        stages.append(StageResult("SECTOR_DIVERSIFICATION", "NOT_RUN", 0, 0, reason="NO_INPUT"))
+        for name in ("VOLATILITY", "ELIGIBILITY", "ISSUER_DEDUP", "SECTOR_DIVERSIFICATION"):
+            stages.append(StageResult(name, "NOT_RUN", 0, 0, reason="NO_INPUT"))
         return empty, stages
     if exclude_high_volatility:
         cur = cur[cur["volatility_pass"] == True].copy()  # noqa: E712
@@ -843,10 +933,11 @@ def select_candidates_pipeline(
     else:
         stages.append(StageResult("VOLATILITY", "SKIPPED", n_in, n_in, reason="DISABLED_IN_CONFIG"))
 
-    # SECTOR_DIVERSIFICATION: eligibility + issuer dedupe + sector cap
+    # ELIGIBILITY (ALREADY_HELD, RSI_OVERHEATED, UP_STREAK, …)
     n_in = len(cur)
     if n_in == 0:
-        stages.append(StageResult("SECTOR_DIVERSIFICATION", "NOT_RUN", 0, 0, reason="NO_INPUT"))
+        for name in ("ELIGIBILITY", "ISSUER_DEDUP", "SECTOR_DIVERSIFICATION"):
+            stages.append(StageResult(name, "NOT_RUN", 0, 0, reason="NO_INPUT"))
         return empty, stages
 
     work = cur
@@ -855,15 +946,51 @@ def select_candidates_pipeline(
             work = work[work["eligibility_status"] == "ELIGIBLE"].copy()
         elif "exclude_reasons" in work.columns:
             work = work[work["exclude_reasons"].apply(_is_clean_exclude_reasons)].copy()
-    if apply_issuer_dedupe and not work.empty:
-        work = dedupe_by_issuer_group(work)
+        stages.append(StageResult("ELIGIBILITY", "APPLIED", n_in, len(work)))
+    else:
+        stages.append(
+            StageResult("ELIGIBILITY", "SKIPPED", n_in, n_in, reason="REQUIRE_ELIGIBLE_FALSE")
+        )
+    cur = work
+
+    # ISSUER_DEDUP
+    n_in = len(cur)
+    if n_in == 0:
+        stages.append(StageResult("ISSUER_DEDUP", "NOT_RUN", 0, 0, reason="NO_INPUT"))
+        stages.append(StageResult("SECTOR_DIVERSIFICATION", "NOT_RUN", 0, 0, reason="NO_INPUT"))
+        return empty, stages
+
+    if apply_issuer_dedupe:
+        before_tickers = set(cur["Ticker"].astype(str).str.upper()) if "Ticker" in cur.columns else set()
+        cur = dedupe_by_issuer_group(cur)
+        after_tickers = set(cur["Ticker"].astype(str).str.upper()) if "Ticker" in cur.columns else set()
+        dropped = sorted(before_tickers - after_tickers)
+        stages.append(
+            StageResult(
+                "ISSUER_DEDUP",
+                "APPLIED",
+                n_in,
+                len(cur),
+                extra={"dropped_tickers": dropped} if dropped else {},
+            )
+        )
+    else:
+        stages.append(
+            StageResult("ISSUER_DEDUP", "SKIPPED", n_in, n_in, reason="DISABLED_IN_CONFIG")
+        )
+
+    # SECTOR_DIVERSIFICATION (sector cap only — not eligibility / issuer)
+    n_in = len(cur)
+    if n_in == 0:
+        stages.append(StageResult("SECTOR_DIVERSIFICATION", "NOT_RUN", 0, 0, reason="NO_INPUT"))
+        return empty, stages
 
     limit_n = int(max_candidates) if max_candidates is not None else int(top_n)
-    if work.empty:
+    if cur.empty:
         stages.append(StageResult("SECTOR_DIVERSIFICATION", "APPLIED", n_in, 0))
         return empty, stages
 
-    indexed = work.set_index("Ticker") if "Ticker" in work.columns else work
+    indexed = cur.set_index("Ticker") if "Ticker" in cur.columns else cur
     diversified = diversify_fn(indexed, limit_n, sector_cap)
     if diversified is None or diversified.empty:
         stages.append(StageResult("SECTOR_DIVERSIFICATION", "APPLIED", n_in, 0))
@@ -871,11 +998,106 @@ def select_candidates_pipeline(
     out = diversified.reset_index() if "Ticker" not in getattr(diversified, "columns", []) else diversified
     if "Ticker" not in out.columns and out.index.name == "Ticker":
         out = out.reset_index()
-    # Do not reintroduce excluded filler names
+    # Safety: do not reintroduce excluded filler when require_eligible
     if require_eligible and "exclude_reasons" in out.columns:
         out = out[out["exclude_reasons"].apply(_is_clean_exclude_reasons)].copy()
     stages.append(StageResult("SECTOR_DIVERSIFICATION", "APPLIED", n_in, len(out)))
     return out, stages
+
+
+def extract_pipeline_pass_sets(
+    scored_df: pd.DataFrame,
+    stages: List[StageResult],
+    final_candidates: pd.DataFrame,
+    *,
+    threshold: float,
+    require_eligible: bool = True,
+    apply_issuer_dedupe: bool = True,
+) -> Dict[str, Any]:
+    """Derive ticker sets at each post-score stage for score-row annotation."""
+    empty: Set[str] = set()
+    if scored_df is None or scored_df.empty:
+        return {
+            "threshold_pass": empty,
+            "eligibility_pass": empty,
+            "issuer_pass": None,
+            "sector_pass": None,
+            "issuer_drop_reasons": {},
+            "sector_drop_reasons": {},
+        }
+
+    thr_df = scored_df[scored_df["Score"] >= float(threshold)]
+    threshold_pass = set(thr_df["Ticker"].astype(str).str.upper()) if not thr_df.empty else set()
+
+    by = {s.stage: s for s in stages}
+    elig_status = by.get("ELIGIBILITY")
+    issuer_status = by.get("ISSUER_DEDUP")
+    sector_status = by.get("SECTOR_DIVERSIFICATION")
+
+    # Reconstruct eligibility pass from scored rows among threshold passers
+    if require_eligible and elig_status and elig_status.status == "APPLIED":
+        if "eligibility_status" in scored_df.columns:
+            elig_df = thr_df[thr_df["eligibility_status"] == "ELIGIBLE"]
+        else:
+            elig_df = thr_df[
+                thr_df["exclude_reasons"].apply(_is_clean_exclude_reasons)
+            ] if "exclude_reasons" in thr_df.columns else thr_df
+        eligibility_pass = (
+            set(elig_df["Ticker"].astype(str).str.upper()) if not elig_df.empty else set()
+        )
+    elif elig_status and elig_status.status == "SKIPPED":
+        eligibility_pass = set(threshold_pass)
+    elif elig_status and elig_status.status == "NOT_RUN":
+        eligibility_pass = set()
+    else:
+        eligibility_pass = set(threshold_pass)
+
+    issuer_pass: Optional[Set[str]]
+    issuer_drop_reasons: Dict[str, str] = {}
+    if issuer_status is None or issuer_status.status == "NOT_RUN":
+        issuer_pass = None if not eligibility_pass else None
+        # NOT_RUN → not evaluated
+        issuer_pass = None
+    elif issuer_status.status == "SKIPPED":
+        issuer_pass = set(eligibility_pass)
+    else:
+        # Reconstruct issuer survivors from eligibility pass
+        if apply_issuer_dedupe and eligibility_pass:
+            elig_rows = scored_df[
+                scored_df["Ticker"].astype(str).str.upper().isin(eligibility_pass)
+            ].copy()
+            kept = dedupe_by_issuer_group(elig_rows)
+            issuer_pass = (
+                set(kept["Ticker"].astype(str).str.upper()) if not kept.empty else set()
+            )
+            dropped = eligibility_pass - issuer_pass
+            for t in dropped:
+                issuer_drop_reasons[t] = "ISSUER_DUPLICATE"
+        else:
+            issuer_pass = set(eligibility_pass)
+
+    sector_pass: Optional[Set[str]]
+    sector_drop_reasons: Dict[str, str] = {}
+    if sector_status is None or sector_status.status == "NOT_RUN":
+        sector_pass = None
+    else:
+        sector_pass = (
+            set(final_candidates["Ticker"].astype(str).str.upper())
+            if final_candidates is not None and not final_candidates.empty
+            else set()
+        )
+        if issuer_pass is not None:
+            for t in issuer_pass - sector_pass:
+                sector_drop_reasons[t] = "SECTOR_CAP"
+
+    return {
+        "threshold_pass": threshold_pass,
+        "eligibility_pass": eligibility_pass,
+        "issuer_pass": issuer_pass,
+        "sector_pass": sector_pass,
+        "issuer_drop_reasons": issuer_drop_reasons,
+        "sector_drop_reasons": sector_drop_reasons,
+    }
 
 
 def build_run_meta(
@@ -917,6 +1139,15 @@ def build_run_meta(
     config_sha256: Optional[str] = None,
     issuer_groups_sha256: Optional[str] = None,
     artifact_integrity: Optional[Dict[str, Any]] = None,
+    stage_drop_summary: Optional[Dict[str, int]] = None,
+    exclusion_summary: Optional[Dict[str, int]] = None,
+    candidate_availability: Optional[Dict[str, Any]] = None,
+    empty_reason_detail: Optional[Dict[str, Any]] = None,
+    eligible_shadow: Optional[Dict[str, Any]] = None,
+    liquidity_shadow: Optional[Dict[str, Any]] = None,
+    diagnostics: Optional[Dict[str, Any]] = None,
+    market_regime_shadow: Optional[Dict[str, Any]] = None,
+    build_identity: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     ms = dict(market_state or {})
     meta: Dict[str, Any] = {
@@ -940,7 +1171,25 @@ def build_run_meta(
         "candidate_count": candidate_count,
         "data_quality_findings": data_quality_findings or [],
         "stage_durations_sec": stage_durations_sec or {},
+        "stage_drop_summary": stage_drop_summary or {},
+        "exclusion_summary": exclusion_summary or {},
+        "candidate_availability": candidate_availability
+        or {
+            "threshold_pass_count": 0,
+            "eligible_new_buy_count": 0,
+            "issuer_dedup_count": 0,
+            "sector_diversified_count": 0,
+            "production_candidate_count": candidate_count,
+        },
+        "eligible_shadow": eligible_shadow or {},
+        "liquidity_shadow": liquidity_shadow or {},
+        "diagnostics": diagnostics or {},
+        "market_regime_shadow": market_regime_shadow or {},
     }
+    if empty_reason_detail is not None:
+        meta["empty_reason_detail"] = empty_reason_detail
+    if build_identity is not None:
+        meta["build_identity"] = build_identity
     if run_id is not None:
         meta["run_id"] = run_id
         meta["source_run_id"] = source_run_id or run_id
@@ -988,9 +1237,14 @@ def build_run_meta(
     if amount5d_cache_stats is not None:
         meta["amount5d_cache"] = amount5d_cache_stats
     if shadow is not None:
-        meta["shadow"] = shadow
-        meta["shadow_threshold"] = shadow.get("threshold")
-        meta["shadow_candidate_count"] = shadow.get("candidate_count", 0)
+        # Clarify high-conviction naming while keeping legacy keys
+        shadow_out = dict(shadow)
+        shadow_out.setdefault("type", "HIGH_CONVICTION")
+        shadow_out.setdefault("population", "ALL_SCORED")
+        shadow_out.setdefault("used_by_trader", False)
+        meta["shadow"] = shadow_out
+        meta["shadow_threshold"] = shadow_out.get("threshold")
+        meta["shadow_candidate_count"] = shadow_out.get("candidate_count", 0)
     if production_shadow_difference is not None:
         meta["production_shadow_difference"] = production_shadow_difference
     return meta
@@ -1004,6 +1258,8 @@ def write_review_markdown(
     production_candidates: List[Dict[str, Any]],
     shadow_candidates: List[Dict[str, Any]],
     previous_meta: Optional[Dict[str, Any]] = None,
+    eligible_shadow_candidates: Optional[List[Dict[str, Any]]] = None,
+    liquidity_shadow_candidates: Optional[List[Dict[str, Any]]] = None,
 ) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1031,7 +1287,12 @@ def write_review_markdown(
     lines.append(f"- as_of_kst: `{meta.get('as_of_kst')}`")
     lines.append(f"- market_session_state: `{meta.get('market_session_state')}`")
     lines.append(f"- daily_bar_status: `{meta.get('daily_bar_status')}`")
-    lines.append(f"- git_commit: `{meta.get('git_commit')}`")
+    bi = meta.get("build_identity") or {}
+    lines.append(f"- git_commit: `{meta.get('git_commit') or bi.get('git_commit')}`")
+    if bi:
+        lines.append(f"- build_identity.source: `{bi.get('source')}`")
+        lines.append(f"- build_identity.image_tag: `{bi.get('image_tag')}`")
+        lines.append(f"- build_identity.app_version: `{bi.get('app_version')}`")
     lines.append(f"- config_sha256: `{meta.get('config_sha256')}`")
     lines.append("")
     integrity = meta.get("artifact_integrity") or {}
@@ -1053,6 +1314,8 @@ def write_review_markdown(
     lines.append(f"- status: `{meta.get('status')}`")
     lines.append(f"- result_status: `{meta.get('result_status')}`")
     lines.append(f"- empty_reason: `{meta.get('empty_reason')}`")
+    if meta.get("empty_reason_detail"):
+        lines.append(f"- empty_reason_detail: `{meta.get('empty_reason_detail')}`")
     lines.append(f"- duration_sec: {meta.get('duration_sec')}")
     lines.append("")
     ms = meta.get("market_state") or {}
@@ -1060,15 +1323,14 @@ def write_review_markdown(
     wrs = meta.get("weighted_regime_score", ms.get("weighted_regime_score"))
     smc = meta.get("scoring_market_component", ms.get("scoring_market_component"))
     amc = meta.get("advanced_market_confidence", ms.get("advanced_market_confidence", ms.get("confidence")))
-    lines.append(f"- weighted_regime_score: {wrs}  # equal-weight average of regime components")
-    lines.append(f"- scoring_market_component: {smc}  # value injected into stock MktScore (0.7*weighted+0.3*0.5)")
+    lines.append(f"- weighted_regime_score (Production): {wrs}  # equal-weight average of regime components")
+    lines.append(f"- scoring_market_component (Production): {smc}  # value injected into stock MktScore")
     lines.append(f"- advanced_market_confidence: {amc}  # MarketAnalyzer confidence")
     lines.append(f"- market_session_state: {meta.get('market_session_state') or ms.get('market_session_state')}")
     lines.append(f"- daily_bar_status: {meta.get('daily_bar_status') or ms.get('daily_bar_status')}")
     lines.append(f"- as_of_kst: {meta.get('as_of_kst')}")
     lines.append(f"- trend: {ms.get('trend')}")
     lines.append(f"- volatility: {ms.get('volatility')}")
-    # deprecated alias note (must not mix values)
     if ms.get("regime_score") is not None and wrs is not None and ms.get("regime_score") != wrs:
         lines.append(
             f"- WARNING: deprecated regime_score={ms.get('regime_score')} differs from weighted_regime_score"
@@ -1077,6 +1339,17 @@ def write_review_markdown(
         lines.append(
             f"- regime_score (deprecated alias of weighted_regime_score): {ms.get('regime_score')}"
         )
+    lines.append("")
+    mrs = meta.get("market_regime_shadow") or {}
+    lines.append("## Market Regime Comparison")
+    lines.append(f"- Production weighted regime: {mrs.get('production_weighted_regime_score', wrs)}")
+    lines.append(f"- Smooth shadow regime: {mrs.get('smooth_weighted_regime_score')}")
+    lines.append(f"- distance_to_ma50_pct: {mrs.get('distance_to_ma50_pct')}")
+    lines.append(f"- production_above_ma50_binary: {mrs.get('production_above_ma50_binary')}")
+    lines.append(f"- smooth_above_ma50_score: {mrs.get('smooth_above_ma50_score')}")
+    lines.append(f"- daily_bar_status: {meta.get('daily_bar_status') or ms.get('daily_bar_status')}")
+    lines.append(f"- market_session_state: {meta.get('market_session_state') or ms.get('market_session_state')}")
+    lines.append(f"- used_in_production_score: {mrs.get('used_in_production_score', False)}")
     lines.append("")
     lines.append("## Funnel")
     lines.append("| stage | status | in | out | drop | reason |")
@@ -1087,6 +1360,27 @@ def write_review_markdown(
             f"{st.get('output_count')} | {st.get('dropped_count')} | {st.get('reason', '')} |"
         )
     lines.append("")
+    sds = meta.get("stage_drop_summary") or {}
+    if sds:
+        lines.append("### Stage Drop Summary (unique tickers removed)")
+        for k in ("MIN_SCORE", "ELIGIBILITY", "ISSUER_DEDUP", "SECTOR_DIVERSIFICATION"):
+            if k in sds:
+                lines.append(f"- {k}: {sds.get(k)}")
+        lines.append("")
+    lines.append("## Exclusion Summary")
+    ex = meta.get("exclusion_summary") or {}
+    for k in ("ALREADY_HELD", "RSI_OVERHEATED", "UP_STREAK", "ISSUER_DUPLICATE", "SECTOR_CAP"):
+        lines.append(f"- {k}: {ex.get(k, 0)}")
+    lines.append("")
+    avail = meta.get("candidate_availability") or {}
+    lines.append("## Candidate Availability")
+    lines.append(f"- threshold_pass_count: {avail.get('threshold_pass_count')}")
+    lines.append(f"- eligible_new_buy_count: {avail.get('eligible_new_buy_count')}")
+    lines.append(f"- issuer_dedup_count: {avail.get('issuer_dedup_count')}")
+    lines.append(f"- sector_diversified_count: {avail.get('sector_diversified_count')}")
+    lines.append(f"- production_candidate_count: {avail.get('production_candidate_count', meta.get('production_candidate_count'))}")
+    lines.append(f"- empty_reason: `{meta.get('empty_reason')}`")
+    lines.append("")
     sd = meta.get("score_distribution") or {}
     lines.append("## Score Distribution")
     lines.append(
@@ -1095,9 +1389,64 @@ def write_review_markdown(
     )
     lines.append(f"- production_threshold: {meta.get('production_threshold')}")
     lines.append(f"- production_candidate_count: {meta.get('production_candidate_count')}")
+    lines.append("")
     shadow = meta.get("shadow") or {}
-    lines.append(f"- shadow_threshold: {shadow.get('threshold')}")
-    lines.append(f"- shadow_candidate_count: {shadow.get('candidate_count')}")
+    lines.append("## High-Conviction Shadow")
+    lines.append(f"- type: {shadow.get('type', 'HIGH_CONVICTION')}")
+    lines.append(f"- population: {shadow.get('population', 'ALL_SCORED')}")
+    lines.append(f"- threshold: {shadow.get('threshold')}")
+    lines.append(f"- candidate_count: {shadow.get('candidate_count')}")
+    lines.append(f"- used_by_trader: {shadow.get('used_by_trader', False)}")
+    lines.append("")
+    es = meta.get("eligible_shadow") or {}
+    lines.append("## Eligible-only Shadow")
+    lines.append(f"- eligible population count: {es.get('population_count')}")
+    lines.append(f"- eligible P90: {es.get('population_p90')}")
+    lines.append(f"- floor: {es.get('floor')}")
+    lines.append(f"- threshold: {es.get('threshold')}")
+    lines.append(f"- threshold_mode: {es.get('threshold_mode')}")
+    lines.append(f"- candidate_count: {es.get('candidate_count')}")
+    lines.append(f"- used_by_trader: {es.get('used_by_trader', False)}")
+    elig_rows = eligible_shadow_candidates or []
+    if elig_rows:
+        for c in elig_rows:
+            lines.append(f"- candidate: {c.get('Ticker') or c.get('ticker')}: {c.get('Score') or c.get('score')}")
+    lines.append("")
+    ls = meta.get("liquidity_shadow") or {}
+    lines.append("## Liquidity Shadow")
+    lines.append(f"- Production Amount5D threshold: {ls.get('production_liquidity_threshold')}")
+    lines.append(f"- Production liquidity universe count: {ls.get('production_liquidity_pass_count')}")
+    lines.append(f"- Shadow liquidity threshold: {ls.get('shadow_liquidity_threshold')}")
+    lines.append(f"- Shadow universe count: {ls.get('universe_count')}")
+    lines.append(f"- scored count: {ls.get('scored_count')}")
+    lines.append(f"- candidate count: {ls.get('candidate_count')}")
+    lines.append(f"- duration_sec: {ls.get('duration_sec')}")
+    lines.append(f"- status: {ls.get('status')}")
+    if ls.get("warnings"):
+        lines.append(f"- warnings: {ls.get('warnings')}")
+    if ls.get("errors"):
+        lines.append(f"- errors: {ls.get('errors')}")
+    lines.append(f"- used_by_trader: {ls.get('used_by_trader', False)}")
+    liq_rows = liquidity_shadow_candidates or []
+    for c in liq_rows[:10]:
+        lines.append(f"- candidate: {c.get('ticker') or c.get('Ticker')}: score={c.get('score') or c.get('Score')}")
+    lines.append("")
+    diag = meta.get("diagnostics") or {}
+    lines.append("## Diagnostics")
+    flags = diag.get("tickers_by_flag") or {}
+    lines.append(f"- HIGH_TECH_LOW_FIN: {flags.get('HIGH_TECH_LOW_FIN', [])}")
+    lines.append(f"- SHORT_TERM_DROP: {flags.get('SHORT_TERM_DROP', [])}")
+    lines.append(f"- HIGH_ATR: {flags.get('HIGH_ATR', [])}")
+    near = diag.get("near_miss") or []
+    if near:
+        lines.append("- near-miss:")
+        for n in near[:10]:
+            lines.append(
+                f"  - {n.get('ticker')}: score={n.get('score')} delta={n.get('threshold_delta')}"
+            )
+    else:
+        lines.append("- near-miss: (none)")
+    lines.append(f"- diagnostic_only: {diag.get('diagnostic_only', True)}")
     lines.append("")
     lines.append("## Top 10 Scores")
     for i, row in enumerate(top_scores[:10], 1):
@@ -1114,7 +1463,7 @@ def write_review_markdown(
         for c in production_candidates:
             lines.append(f"- {c.get('Ticker') or c.get('ticker')}: {c.get('Score') or c.get('score')}")
     lines.append("")
-    lines.append("## Shadow Candidates (not used by trader)")
+    lines.append("## High-Conviction Shadow Candidates (not used by trader)")
     if not shadow_candidates:
         lines.append("(none)")
     else:

@@ -81,6 +81,52 @@
       "shadow_mode": "percentile",
       "shadow_percentile": 0.90,
       "shadow_min_threshold": 500000000
+    },
+    // Eligible-only Shadow (관찰용, trader 미사용)
+    "eligible_shadow_policy": {
+      "enabled": true,
+      "mode": "hybrid_percentile",
+      "floor": 0.42,
+      "percentile": 0.90,
+      "max_candidates": 5,
+      "min_population": 5,
+      "exclude_production_candidates": true,
+      "used_by_trader": false
+    },
+    // Liquidity Shadow (Production Amount5D 5B 불변, 관찰용)
+    "liquidity_shadow_policy": {
+      "enabled": true,
+      "threshold_mode": "percentile",
+      "percentile": 0.90,
+      "max_universe": 60,
+      "max_candidates": 10,
+      "used_by_trader": false,
+      "failure_policy": "WARN_AND_CONTINUE",
+      "run_after_production_artifacts_saved": true,
+      "time_budget_sec": 90
+    },
+    // Diagnostic flags (Production 제외 사유로 사용 금지)
+    "diagnostic_policy": {
+      "enabled": true,
+      "high_tech_low_fin_financial_max": 0.10,
+      "high_tech_low_fin_technical_min": 0.85,
+      "short_term_drop_1d_pct": -3.0,
+      "short_term_drop_3d_pct": -5.0,
+      "short_term_drop_5d_pct": -8.0,
+      "extended_above_ma50_pct": 8.0,
+      "high_atr_pct": 5.0,
+      "gap_up_pct": 2.0,
+      "gap_down_pct": -2.0,
+      "rsi_overheated_threshold": 70.0,
+      "rsi_oversold_threshold": 30.0,
+      "used_in_production_score": false,
+      "used_by_trader": false
+    },
+    // Smooth market regime shadow (Production binary 불변)
+    "market_regime_shadow_policy": {
+      "enabled": true,
+      "transition_band_pct": 2.0,
+      "used_in_production_score": false
     }
   },
 

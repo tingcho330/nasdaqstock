@@ -60,6 +60,7 @@ from screener_ops import (
     compute_shadow_liquidity_threshold,
     compute_shadow_score_threshold,
     enrich_scored_dataframe,
+    extract_pipeline_pass_sets,
     load_amount5d_cache,
     load_issuer_group_map,
     marcap_filter_decision,
@@ -81,10 +82,26 @@ from screener_artifacts import (
     get_git_commit,
     production_fixed_exists,
     promote_fixed_artifacts,
+    resolve_build_identity,
     resolve_data_clock,
     resolve_run_mode_policy,
     sha256_file,
     sha256_json_payload,
+)
+
+from screener_diagnostics import (
+    annotate_stage_outcomes,
+    build_liquidity_shadow_rows,
+    classify_empty_result_v2,
+    compute_eligible_shadow,
+    compute_exclusion_summary,
+    compute_liquidity_shadow_universe,
+    compute_market_regime_shadow,
+    compute_price_diagnostics,
+    compute_stage_drop_summary,
+    evaluate_diagnostic_flags,
+    select_liquidity_shadow_candidates,
+    summarize_diagnostics,
 )
 
 # 시장 분석 모듈 (screener_core에서 통합)
@@ -1757,6 +1774,8 @@ def _get_market_regime_components(date_str: str, market: str) -> Dict[str, float
                 "ma50_gt_ma200": 0.5 if pd.isna(ma200) else (1.0 if ma50 > ma200 else 0.0),
                 "rsi_term": max(0.0, 1 - abs(rsi - 50) / 50) if not pd.isna(rsi) else 0.5,
                 "benchmark": us_regime_benchmark(market) or "SPX",
+                "index_close": float(close.iloc[-1]),
+                "index_ma50": float(ma50) if not pd.isna(ma50) else None,
             }
 
         kis = _KIS_INSTANCE
@@ -1775,6 +1794,8 @@ def _get_market_regime_components(date_str: str, market: str) -> Dict[str, float
             "above_ma50": 1.0 if (not pd.isna(ma50) and close.iloc[-1] > ma50) else 0.0,
             "ma50_gt_ma200": 0.5 if pd.isna(ma200) else (1.0 if ma50 > ma200 else 0.0),
             "rsi_term": max(0.0, 1 - abs(rsi - 50) / 50) if not pd.isna(rsi) else 0.5,
+            "index_close": float(close.iloc[-1]),
+            "index_ma50": float(ma50) if not pd.isna(ma50) else None,
         }
     except Exception:
         return {"above_ma50": 0.5, "ma50_gt_ma200": 0.5, "rsi_term": 0.5}
@@ -2141,6 +2162,12 @@ def _filter_initial_stocks(
     ).fillna(0)
     amt_dist = amount5d_distribution(amt_num.tolist(), float(min_amt))
     stage1_meta["amount5d_distribution"] = amt_dist
+    # Full Amount5D map for Liquidity Shadow (observation only)
+    stage1_meta["amount5d_by_ticker"] = {
+        str(idx).upper(): float(val)
+        for idx, val in amt_num.items()
+        if pd.notna(val)
+    }
 
     # Shadow liquidity (record only — do not apply to production filter)
     liq_policy = (cfg.get("amount5d_policy") or {})
@@ -2834,6 +2861,17 @@ def run_screener(
     fixed_date = date_str
     weighted_regime_score: Optional[float] = None
     scoring_market_component: Optional[float] = None
+    market_regime_shadow_payload: Dict[str, Any] = {}
+    eligible_shadow_meta: Dict[str, Any] = {}
+    liquidity_shadow_meta: Dict[str, Any] = {}
+    exclusion_summary_payload: Dict[str, int] = {}
+    stage_drop_summary_payload: Dict[str, int] = {}
+    candidate_availability_payload: Dict[str, Any] = {}
+    diagnostics_payload: Dict[str, Any] = {}
+    empty_reason_detail_payload: Optional[Dict[str, Any]] = None
+    eligible_shadow_rows: List[Dict[str, Any]] = []
+    liquidity_shadow_candidate_rows: List[Dict[str, Any]] = []
+    build_identity: Dict[str, Any] = {}
     config_sha: Optional[str] = None
     issuer_sha: Optional[str] = None
     git_commit: Optional[str] = None
@@ -2915,6 +2953,16 @@ def run_screener(
         shadow_candidates: Optional[List[Dict[str, Any]]] = None,
         scores_records: Optional[List[Dict[str, Any]]] = None,
         promote: Optional[bool] = None,
+        eligible_shadow: Optional[Dict[str, Any]] = None,
+        liquidity_shadow: Optional[Dict[str, Any]] = None,
+        eligible_shadow_candidates: Optional[List[Dict[str, Any]]] = None,
+        liquidity_shadow_candidates: Optional[List[Dict[str, Any]]] = None,
+        diagnostics: Optional[Dict[str, Any]] = None,
+        market_regime_shadow: Optional[Dict[str, Any]] = None,
+        exclusion_summary: Optional[Dict[str, int]] = None,
+        stage_drop_summary: Optional[Dict[str, int]] = None,
+        candidate_availability: Optional[Dict[str, Any]] = None,
+        empty_reason_detail: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         nonlocal _finalize_done
         if _finalize_done:
@@ -2977,6 +3025,17 @@ def run_screener(
             config_sha256=config_sha,
             issuer_groups_sha256=issuer_sha,
             artifact_integrity=integrity_preview,
+            stage_drop_summary=stage_drop_summary or stage_drop_summary_payload,
+            exclusion_summary=exclusion_summary or exclusion_summary_payload,
+            candidate_availability=candidate_availability or candidate_availability_payload,
+            empty_reason_detail=empty_reason_detail
+            if empty_reason_detail is not None
+            else empty_reason_detail_payload,
+            eligible_shadow=eligible_shadow or eligible_shadow_meta,
+            liquidity_shadow=liquidity_shadow or liquidity_shadow_meta,
+            diagnostics=diagnostics or diagnostics_payload,
+            market_regime_shadow=market_regime_shadow or market_regime_shadow_payload,
+            build_identity=build_identity,
         )
         writer.write_json("screener_run_meta.json", meta)
         try:
@@ -2987,6 +3046,9 @@ def run_screener(
                 top_scores=top_scores or [],
                 production_candidates=production_candidates or [],
                 shadow_candidates=shadow_candidates or [],
+                eligible_shadow_candidates=eligible_shadow_candidates or eligible_shadow_rows,
+                liquidity_shadow_candidates=liquidity_shadow_candidates
+                or liquidity_shadow_candidate_rows,
             )
             writer._files["screener_review.md"] = review_path
         except Exception as e:
@@ -3026,6 +3088,7 @@ def run_screener(
                 "advanced_market_confidence": market_state_payload.get(
                     "advanced_market_confidence"
                 ),
+                "build_identity": build_identity,
             },
         )
         # Refresh integrity on meta after all artifacts present
@@ -3150,9 +3213,17 @@ def run_screener(
         logger.warning("config snapshot 실패: %s", e)
         config_sha = None
 
-    git_commit, git_commit_error = get_git_commit()
+    build_identity = resolve_build_identity()
+    git_commit = build_identity.get("git_commit")
+    git_commit_error = build_identity.get("git_commit_error")
     if git_commit_error:
         logger.info("git commit 조회 실패(무시): %s", git_commit_error)
+    else:
+        logger.info(
+            "build_identity source=%s commit=%s",
+            build_identity.get("source"),
+            (git_commit or "")[:12],
+        )
 
     # KIS 인스턴스
     broker_config = settings.get("kis_broker", {})
@@ -3229,16 +3300,27 @@ def run_screener(
             logger.warning(msg)
             _notify(msg, key="screener_no_candidates_stage1", cooldown_sec=60)
             # Mark downstream stages as NOT_RUN
-            for st_name in ("SCORING", "MIN_SCORE", "MOMENTUM", "VOLATILITY", "SECTOR_DIVERSIFICATION"):
+            for st_name in (
+                "SCORING",
+                "MIN_SCORE",
+                "MOMENTUM",
+                "VOLATILITY",
+                "ELIGIBILITY",
+                "ISSUER_DEDUP",
+                "SECTOR_DIVERSIFICATION",
+            ):
                 if not any(s.stage == st_name for s in funnel.stages):
                     funnel.record_not_run(st_name, reason="NO_INPUT")
             empty_reason = "AMOUNT5D_DATA_UNAVAILABLE"
             for f in funnel.findings:
                 if f.get("code") == "UNIVERSE_EMPTY":
-                    empty_reason = "UNIVERSE_EMPTY"
+                    empty_reason = "EMPTY_DATA_QUALITY"
                     break
             for name in ("screener_candidates_full.json", "screener_candidates.json", "screener_scores.json"):
                 writer.write_json(name, [])
+            writer.write_json("screener_eligible_shadow_candidates.json", [])
+            writer.write_json("screener_liquidity_shadow_scores.json", [])
+            writer.write_json("screener_liquidity_shadow_candidates.json", [])
             _persist_run_meta(
                 status="SUCCESS",
                 result_status="EMPTY_DATA_QUALITY",
@@ -3288,12 +3370,27 @@ def run_screener(
             comps["above_ma50"], comps["ma50_gt_ma200"], comps["rsi_term"],
         )
         logger.info("시장 단기 추세(60D MA5/MA20): %s", market_trend)
+
+        regime_shadow_policy = (screener_params.get("market_regime_shadow_policy") or {})
+        market_regime_shadow_payload = compute_market_regime_shadow(
+            index_close=comps.get("index_close"),
+            index_ma50=comps.get("index_ma50"),
+            production_above_ma50_binary=comps.get("above_ma50"),
+            ma50_gt_ma200=comps.get("ma50_gt_ma200"),
+            rsi_term=comps.get("rsi_term"),
+            production_weighted_regime_score=weighted_regime_score,
+            scoring_market_component=scoring_market_component,
+            advanced_market_confidence=None,
+            transition_band_pct=float(regime_shadow_policy.get("transition_band_pct", 2.0) or 2.0),
+            enabled=bool(regime_shadow_policy.get("enabled", True)),
+        )
         
         # MarketAnalyzer를 통한 고급 시장 분석
         market_analyzer = MarketAnalyzer(settings, kis=kis, market=market, date_str=fixed_date)
         market_state = market_analyzer.analyze_market_state()
         logger.info("고급 시장 분석: %s", market_analyzer.get_market_summary(market_state))
         adv_conf = float(getattr(market_state, "confidence", 0.0) or 0.0)
+        market_regime_shadow_payload["advanced_market_confidence"] = adv_conf
 
         clarified = clarify_regime_fields(
             components_avg=weighted_regime_score,
@@ -3396,7 +3493,7 @@ def run_screener(
         if df_filtered.empty:
             logger.warning("스코어링 대상 종목이 없어 상세 분석을 건너뜁니다.")
             funnel.record_not_run("SCORING", reason="NO_INPUT")
-            for st_name in ("MIN_SCORE", "MOMENTUM", "VOLATILITY", "SECTOR_DIVERSIFICATION"):
+            for st_name in ("MIN_SCORE", "MOMENTUM", "VOLATILITY", "ELIGIBILITY", "ISSUER_DEDUP", "SECTOR_DIVERSIFICATION"):
                 funnel.record_not_run(st_name, reason="NO_INPUT")
             for name in (
                 "screener_scores.json",
@@ -3525,7 +3622,7 @@ def run_screener(
                 logger.debug("컨텍스트 저장 실패: %s", _e)
 
             funnel.add_finding("SCORING_FAILURE_ALL", "ERROR")
-            for st_name in ("MIN_SCORE", "MOMENTUM", "VOLATILITY", "SECTOR_DIVERSIFICATION"):
+            for st_name in ("MIN_SCORE", "MOMENTUM", "VOLATILITY", "ELIGIBILITY", "ISSUER_DEDUP", "SECTOR_DIVERSIFICATION"):
                 funnel.record_not_run(st_name, reason="NO_INPUT")
             fail_analysis = []
             if _fail_stats.get("newly_listed_skip", 0) > 0:
@@ -3679,7 +3776,7 @@ def run_screener(
             _sec_dist = final_candidates_base["Sector"].value_counts().to_dict()
             logger.info("최종 후보 섹터 분포: %s", _sec_dist)
 
-        # Shadow mode (never feeds trader)
+        # High-Conviction Shadow (never feeds trader) — same calculation as before
         shadow_payload: Optional[Dict[str, Any]] = None
         shadow_candidates_df = final_candidates_base.iloc[0:0]
         shadow_thr = compute_shadow_score_threshold(
@@ -3702,19 +3799,159 @@ def run_screener(
             )
             shadow_payload = {
                 "enabled": True,
+                "type": "HIGH_CONVICTION",
+                "population": "ALL_SCORED",
                 "mode": threshold_policy.get("shadow_mode", "hybrid"),
                 "floor": threshold_policy.get("shadow_floor"),
                 "percentile": threshold_policy.get("shadow_percentile"),
                 "threshold": round(float(shadow_thr), 4),
                 "candidate_count": int(len(shadow_candidates_df)),
                 "stages": [s.to_dict() for s in shadow_stages],
+                "used_by_trader": False,
                 "note": "Shadow candidates are NOT used as trader input",
             }
             logger.info(
-                "Shadow mode: threshold=%.4f candidates=%d (not used by trader)",
+                "High-Conviction Shadow: threshold=%.4f candidates=%d (not used by trader)",
                 float(shadow_thr),
                 len(shadow_candidates_df),
             )
+
+        # Eligible-only Shadow (observation; trader never reads)
+        eligible_shadow_df = scored_all.iloc[0:0]
+        try:
+            elig_policy = screener_params.get("eligible_shadow_policy") or {}
+            prod_tickers = (
+                set(final_candidates_base["Ticker"].astype(str).str.upper())
+                if not final_candidates_base.empty
+                else set()
+            )
+            eligible_shadow_df, eligible_shadow_meta = compute_eligible_shadow(
+                scored_all,
+                policy=elig_policy,
+                production_tickers=prod_tickers,
+                diversify_fn=diversify_by_sector,
+                top_n=top_n,
+                sector_cap=sector_cap,
+                apply_issuer_dedupe=bool(screener_params.get("issuer_dedupe_enabled", True)),
+            )
+            logger.info(
+                "Eligible-only Shadow: pop=%s thr=%s candidates=%d (not used by trader)",
+                eligible_shadow_meta.get("population_count"),
+                eligible_shadow_meta.get("threshold"),
+                eligible_shadow_meta.get("candidate_count"),
+            )
+        except Exception as e:
+            logger.warning("Eligible-only Shadow failed (Production unchanged): %s", e)
+            funnel.add_finding("ELIGIBLE_SHADOW_FAILED", "WARNING")
+            eligible_shadow_meta = {
+                "enabled": True,
+                "failed": True,
+                "error": str(e),
+                "used_by_trader": False,
+            }
+
+        pass_sets = extract_pipeline_pass_sets(
+            scored_all,
+            sel_stages,
+            final_candidates_base,
+            threshold=configured_threshold,
+            require_eligible=True,
+            apply_issuer_dedupe=bool(screener_params.get("issuer_dedupe_enabled", True)),
+        )
+        hc_tickers = (
+            set(shadow_candidates_df["Ticker"].astype(str).str.upper())
+            if shadow_candidates_df is not None and not shadow_candidates_df.empty
+            else set()
+        )
+        elig_shadow_tickers = (
+            set(eligible_shadow_df["Ticker"].astype(str).str.upper())
+            if eligible_shadow_df is not None and not eligible_shadow_df.empty
+            else set()
+        )
+        scored_all = annotate_stage_outcomes(
+            scored_all,
+            production_tickers=(
+                set(final_candidates_base["Ticker"].astype(str).str.upper())
+                if not final_candidates_base.empty
+                else set()
+            ),
+            eligibility_pass_tickers=pass_sets.get("eligibility_pass") or set(),
+            issuer_pass_tickers=pass_sets.get("issuer_pass"),
+            sector_pass_tickers=pass_sets.get("sector_pass"),
+            high_conviction_shadow_tickers=hc_tickers,
+            eligible_shadow_tickers=elig_shadow_tickers,
+            issuer_drop_reasons=pass_sets.get("issuer_drop_reasons") or {},
+            sector_drop_reasons=pass_sets.get("sector_drop_reasons") or {},
+        )
+
+        # Diagnostic features (do not affect Production scores/candidates)
+        diag_policy = screener_params.get("diagnostic_policy") or {}
+        if bool(diag_policy.get("enabled", True)) and not scored_all.empty:
+            diag_rows = []
+            for _, row in scored_all.iterrows():
+                closes: List[float] = []
+                opens: List[float] = []
+                try:
+                    price_data = get_historical_prices(
+                        str(row.get("Ticker")),
+                        (datetime.strptime(fixed_date, "%Y%m%d") - timedelta(days=40)).strftime("%Y%m%d"),
+                        fixed_date,
+                    )
+                    if price_data is not None and not price_data.empty:
+                        close_col = next(
+                            (c for c in ("Close", "close", "종가") if c in price_data.columns),
+                            None,
+                        )
+                        open_col = next(
+                            (c for c in ("Open", "open", "시가") if c in price_data.columns),
+                            None,
+                        )
+                        if close_col:
+                            closes = [float(x) for x in price_data[close_col].tolist() if pd.notna(x)]
+                        if open_col:
+                            opens = [float(x) for x in price_data[open_col].tolist() if pd.notna(x)]
+                except Exception:
+                    pass
+                px_diag = compute_price_diagnostics(
+                    closes,
+                    opens=opens or None,
+                    ma50=row.get("MA50"),
+                    ma200=row.get("MA200"),
+                    atr_14=row.get("ATR"),
+                )
+                flags = evaluate_diagnostic_flags(
+                    financial_score=float(row["FinScore"]) if pd.notna(row.get("FinScore")) else None,
+                    technical_score=float(row["TechScore"]) if pd.notna(row.get("TechScore")) else None,
+                    return_1d_pct=px_diag.get("return_1d_pct"),
+                    return_3d_pct=px_diag.get("return_3d_pct"),
+                    return_5d_pct=px_diag.get("return_5d_pct"),
+                    price_vs_ma50_pct=px_diag.get("price_vs_ma50_pct"),
+                    atr_14_pct=px_diag.get("atr_14_pct"),
+                    gap_pct=px_diag.get("gap_pct"),
+                    rsi=float(row["RSI"]) if pd.notna(row.get("RSI")) else None,
+                    policy=diag_policy,
+                )
+                diag_rows.append({**px_diag, "diagnostic_flags": flags})
+            diag_df = pd.DataFrame(diag_rows, index=scored_all.index)
+            for col in diag_df.columns:
+                scored_all[col] = diag_df[col]
+
+        stage_drop_summary_payload = compute_stage_drop_summary(sel_stages)
+        exclusion_summary_payload = compute_exclusion_summary(
+            scored_all,
+            issuer_dup_tickers=set((pass_sets.get("issuer_drop_reasons") or {}).keys()),
+            sector_cap_tickers=set((pass_sets.get("sector_drop_reasons") or {}).keys()),
+        )
+        by_sel = {s.stage: s for s in sel_stages}
+        candidate_availability_payload = {
+            "threshold_pass_count": int(getattr(by_sel.get("MIN_SCORE"), "output_count", 0) or 0),
+            "eligible_new_buy_count": int(getattr(by_sel.get("ELIGIBILITY"), "output_count", 0) or 0),
+            "issuer_dedup_count": int(getattr(by_sel.get("ISSUER_DEDUP"), "output_count", 0) or 0),
+            "sector_diversified_count": int(
+                getattr(by_sel.get("SECTOR_DIVERSIFICATION"), "output_count", 0) or 0
+            ),
+            "production_candidate_count": int(len(final_candidates_base)),
+        }
 
         # ── 레벨 계산 ──
         # Phase 1: config에서 읽기
@@ -3814,6 +4051,8 @@ def run_screener(
             rec["as_of_kst"] = clock.get("as_of_kst")
             rec["source_run_id"] = writer.run_id
             rec["run_mode"] = policy.run_mode
+            rec["production_threshold"] = configured_threshold
+        diagnostics_payload = summarize_diagnostics(scores_records)
 
         cands_full_payload = json.loads(
             final_candidates_full.to_json(orient="records", force_ascii=False)
@@ -3826,6 +4065,7 @@ def run_screener(
             shadow_out["schema_version"] = SCHEMA_VERSION
             shadow_out["generated_at"] = generated_at
             shadow_out["shadow"] = True
+            shadow_out["shadow_type"] = "HIGH_CONVICTION"
             shadow_out["source_run_id"] = writer.run_id
             shadow_payload_rows = json.loads(
                 shadow_out.to_json(orient="records", force_ascii=False)
@@ -3833,10 +4073,29 @@ def run_screener(
         else:
             shadow_payload_rows = []
 
+        if eligible_shadow_df is not None and not eligible_shadow_df.empty:
+            elig_out = eligible_shadow_df.copy()
+            elig_out["schema_version"] = SCHEMA_VERSION
+            elig_out["generated_at"] = generated_at
+            elig_out["shadow"] = True
+            elig_out["shadow_type"] = "ELIGIBLE_ONLY"
+            elig_out["used_by_trader"] = False
+            elig_out["source_run_id"] = writer.run_id
+            eligible_shadow_rows = json.loads(
+                elig_out.to_json(orient="records", force_ascii=False)
+            )
+        else:
+            eligible_shadow_rows = []
+
+        # Production artifacts BEFORE observation-only liquidity shadow
         writer.write_json("screener_candidates_full.json", cands_full_payload)
         writer.write_json("screener_candidates.json", cands_slim_payload)
         writer.write_json("screener_scores.json", scores_records)
         writer.write_json("screener_shadow_candidates.json", shadow_payload_rows)
+        writer.write_json("screener_eligible_shadow_candidates.json", eligible_shadow_rows)
+        # Placeholder liquidity artifacts (filled after Production finalize when possible)
+        writer.write_json("screener_liquidity_shadow_scores.json", [])
+        writer.write_json("screener_liquidity_shadow_candidates.json", [])
 
         if holdings_scores:
             holdings_list = list(holdings_scores.values())
@@ -3865,7 +4124,12 @@ def run_screener(
         min_score_pass = next(
             (s.output_count for s in sel_stages if s.stage == "MIN_SCORE"), 0
         )
-        status, result_status, empty_reason = classify_empty_result(
+        thr_rows = (
+            scored_all[scored_all["Score"] >= float(configured_threshold)].copy()
+            if not scored_all.empty
+            else scored_all
+        )
+        status, result_status, empty_reason, empty_reason_detail_payload = classify_empty_result_v2(
             candidate_count=len(final_candidates),
             scored_count=len(scored_all),
             universe_count=next(
@@ -3876,9 +4140,11 @@ def run_screener(
             ),
             scoring_failures_all=False,
             data_quality_codes=[f.get("code", "") for f in funnel.findings],
-            min_score_pass=min_score_pass,
-            empty_after_min_score=(min_score_pass == 0 and len(scored_all) > 0),
+            funnel_stages=list(funnel.stages),
+            threshold_pass_rows=thr_rows,
         )
+        if any(f.get("code") == "ELIGIBLE_SHADOW_FAILED" for f in funnel.findings) and status == "SUCCESS":
+            status = "SUCCESS_WITH_WARNINGS"
         if empty_reason:
             logger.info(
                 "EMPTY reason=%s result_status=%s (production candidates=%d, scores=%d)",
@@ -3887,6 +4153,10 @@ def run_screener(
                 len(final_candidates),
                 len(scores_records),
             )
+
+        # Snapshot Production candidate SHA before liquidity shadow (must remain unchanged)
+        prod_cands_path = writer.path("screener_candidates.json")
+        prod_sha_before_liq = sha256_file(prod_cands_path) if prod_cands_path.exists() else None
 
         top_score_rows = scores_records[:10]
         _persist_run_meta(
@@ -3906,15 +4176,165 @@ def run_screener(
             if shadow_candidates_df is not None and not shadow_candidates_df.empty
             else [],
             scores_records=scores_records,
+            eligible_shadow=eligible_shadow_meta,
+            eligible_shadow_candidates=eligible_shadow_rows,
+            diagnostics=diagnostics_payload,
+            market_regime_shadow=market_regime_shadow_payload,
+            exclusion_summary=exclusion_summary_payload,
+            stage_drop_summary=stage_drop_summary_payload,
+            candidate_availability=candidate_availability_payload,
+            empty_reason_detail=empty_reason_detail_payload,
         )
 
+        # Liquidity Shadow AFTER Production artifacts saved/promoted (failure isolated)
+        liq_policy = screener_params.get("liquidity_shadow_policy") or {}
+        liquidity_shadow_meta = {
+            "enabled": bool(liq_policy.get("enabled", True)),
+            "used_by_trader": False,
+            "status": "SKIPPED",
+        }
+        liquidity_shadow_candidate_rows = []
+        if bool(liq_policy.get("enabled", True)):
+            liq_t0 = time.perf_counter()
+            try:
+                amount_map = stage1_meta.get("amount5d_by_ticker") or {}
+                prod_amt_thr = float(
+                    (screener_params.get("amount5d_policy") or {}).get(
+                        "static_threshold",
+                        screener_params.get("min_trading_value_5d_avg_us", 5_000_000_000),
+                    )
+                )
+                universe, liq_meta = compute_liquidity_shadow_universe(
+                    amount_map,
+                    policy=liq_policy,
+                    production_threshold=prod_amt_thr,
+                )
+                liquidity_shadow_meta = dict(liq_meta)
+                scored_lookup = {
+                    str(r.get("ticker") or "").upper(): r for r in scores_records
+                }
+                liq_score_rows: List[Dict[str, Any]] = []
+                budget = float(liq_policy.get("time_budget_sec", 90) or 90)
+                partial = False
+                unscored = 0
+                for t in universe:
+                    if time.perf_counter() - liq_t0 > budget:
+                        partial = True
+                        break
+                    if t in scored_lookup:
+                        liq_score_rows.append(dict(scored_lookup[t]))
+                    else:
+                        # Observation-only: do not block Production to score extras;
+                        # leave row stub for universe membership tracking.
+                        unscored += 1
+                        liq_score_rows.append(
+                            {
+                                "ticker": t,
+                                "score": None,
+                                "amount5d": amount_map.get(t),
+                                "scored": False,
+                                "used_by_trader": False,
+                                "diagnostic_only": True,
+                            }
+                        )
+                liquidity_shadow_meta["scored_count"] = sum(
+                    1 for r in liq_score_rows if r.get("score") is not None
+                )
+                liquidity_shadow_meta["unscored_count"] = unscored
+                liquidity_shadow_meta["duration_sec"] = round(time.perf_counter() - liq_t0, 3)
+                liquidity_shadow_meta["status"] = "PARTIAL_SHADOW" if partial else "OK"
+                if partial:
+                    liquidity_shadow_meta["warnings"] = ["TIME_BUDGET_EXCEEDED"]
+                elif unscored:
+                    liquidity_shadow_meta["warnings"] = ["UNIVERSE_OUTSIDE_PRODUCTION_SCORES"]
+                    liquidity_shadow_meta["status"] = "PARTIAL_SHADOW"
+                liq_score_rows = build_liquidity_shadow_rows(
+                    scored_rows=liq_score_rows,
+                    amount_by_ticker=amount_map,
+                    production_threshold=prod_amt_thr,
+                    shadow_threshold=float(
+                        liquidity_shadow_meta.get("shadow_liquidity_threshold") or 0
+                    ),
+                    production_tickers=set(final_candidates["Ticker"].astype(str).str.upper())
+                    if not final_candidates.empty
+                    else set(),
+                    eligible_shadow_tickers=elig_shadow_tickers,
+                )
+                liquidity_shadow_candidate_rows = select_liquidity_shadow_candidates(
+                    liq_score_rows,
+                    max_candidates=int(liq_policy.get("max_candidates", 10) or 10),
+                    min_score=None,
+                )
+                liquidity_shadow_meta["candidate_count"] = len(liquidity_shadow_candidate_rows)
+                # Write into published run directory (observation only)
+                try:
+                    atomic_write_json(
+                        writer.final_dir / "screener_liquidity_shadow_scores.json",
+                        liq_score_rows,
+                    )
+                    atomic_write_json(
+                        writer.final_dir / "screener_liquidity_shadow_candidates.json",
+                        liquidity_shadow_candidate_rows,
+                    )
+                    # Patch run meta liquidity section without rewriting Production candidates
+                    meta_path = writer.final_dir / "screener_run_meta.json"
+                    if meta_path.exists():
+                        with open(meta_path, "r", encoding="utf-8") as f:
+                            meta_obj = json.load(f)
+                        meta_obj["liquidity_shadow"] = liquidity_shadow_meta
+                        if liquidity_shadow_meta.get("status") == "PARTIAL_SHADOW" and str(
+                            meta_obj.get("status")
+                        ).startswith("SUCCESS"):
+                            meta_obj["status"] = "SUCCESS_WITH_WARNINGS"
+                        atomic_write_json(meta_path, meta_obj)
+                except Exception as e:
+                    logger.warning("Liquidity Shadow artifact write failed: %s", e)
+                logger.info(
+                    "Liquidity Shadow: universe=%s scored=%s candidates=%s status=%s",
+                    liquidity_shadow_meta.get("universe_count"),
+                    liquidity_shadow_meta.get("scored_count"),
+                    liquidity_shadow_meta.get("candidate_count"),
+                    liquidity_shadow_meta.get("status"),
+                )
+            except Exception as e:
+                logger.warning("Liquidity Shadow failed (Production unchanged): %s", e)
+                liquidity_shadow_meta = {
+                    "enabled": True,
+                    "status": "LIQUIDITY_SHADOW_FAILED",
+                    "errors": [str(e)],
+                    "used_by_trader": False,
+                    "failure_policy": liq_policy.get("failure_policy", "WARN_AND_CONTINUE"),
+                }
+                try:
+                    meta_path = writer.final_dir / "screener_run_meta.json"
+                    if meta_path.exists():
+                        with open(meta_path, "r", encoding="utf-8") as f:
+                            meta_obj = json.load(f)
+                        meta_obj["liquidity_shadow"] = liquidity_shadow_meta
+                        if str(meta_obj.get("status")).startswith("SUCCESS"):
+                            meta_obj["status"] = "SUCCESS_WITH_WARNINGS"
+                        findings = list(meta_obj.get("data_quality_findings") or [])
+                        findings.append({"code": "LIQUIDITY_SHADOW_FAILED", "severity": "WARNING"})
+                        meta_obj["data_quality_findings"] = findings
+                        atomic_write_json(meta_path, meta_obj)
+                except Exception:
+                    pass
+
+        if prod_sha_before_liq:
+            prod_sha_after = sha256_file(writer.final_dir / "screener_candidates.json")
+            if prod_sha_after != prod_sha_before_liq:
+                logger.error(
+                    "INVARIANT VIOLATION: Production candidates SHA changed after Liquidity Shadow"
+                )
+
         logger.info(
-            "최종 후보 저장(run=%s): full=%d slim=%d scores=%d shadow=%d mode=%s",
+            "최종 후보 저장(run=%s): full=%d slim=%d scores=%d shadow=%d eligible_shadow=%d mode=%s",
             writer.run_id,
             len(final_candidates),
             len(final_candidates),
             len(scores_records),
             len(shadow_payload_rows),
+            len(eligible_shadow_rows),
             policy.run_mode,
         )
 

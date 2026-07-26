@@ -53,12 +53,17 @@
 
 - **SP500 유니버스** — `frgn_code.mst`(S&P500=1) ∩ NAS/NYS/AMS 해외 마스터 (~500종, 티커별 거래소)
 - **US 스크리닝** — 5일 평균 거래대금(`min_trading_value_5d_avg_us`), 최소 점수·모멘텀·변동성 필터, 섹터 다양화
-- **스크리너 운영 가시성** — `screener_ops.py`: StageResult 퍼널(SKIPPED/NOT_RUN 구분)·`screener_run_meta_*`·Markdown 리뷰·후보 0건 분류(`EMPTY_VALID`/`EMPTY_DATA_QUALITY`/`FAILED`)
+- **스크리너 운영 가시성** — `screener_ops.py`: StageResult 퍼널(`ELIGIBILITY`/`ISSUER_DEDUP`/`SECTOR_DIVERSIFICATION` 분리)·`screener_run_meta_*`(schema v3)·Markdown 리뷰·구체적 `empty_reason`(`ALL_THRESHOLD_PASSERS_ALREADY_HELD` 등)·`exclusion_summary`/`stage_drop_summary`
 - **DECISION / REPLAY 격리** — `screener_artifacts.py`: 정규 실행은 `DECISION`(불변 `output/runs/decision/...` + Production 고정 파일), 수동·`--force`·장 마감 후 재계산은 기본 `REPLAY`(`output/runs/replay/...`만, **고정 파일·trader 입력 미갱신**)
 - **데이터 기준시각** — meta/manifest에 `as_of_kst`·`market_session_state`(OPEN/CLOSED/…)·`daily_bar_status`(INTRADAY_PARTIAL/FINAL/…) 기록. 레짐은 `weighted_regime_score`와 `scoring_market_component`를 분리 저장
-- **screener_scores 전체 보존** — 최소점수 미달이어도 스코어링 성공 종목 전부 저장(`held`·`exclusion_reasons`·`issuer_group` 포함). trader 입력은 **성공 DECISION**의 `screener_candidates_*`만
+- **screener_scores 전체 보존** — 스코어링 성공 종목 전부 저장(`held`·`exclusion_reasons`·단계별 pass/`null`·diagnostic flags 포함). trader 입력은 **성공 DECISION**의 `screener_candidates_*`만
 - **Amount5D 캐시** — `output/cache/amount5d_{market}_{date}_v2.json` · 동일일 재실행 시 KIS 재조회 생략 · `--refresh-amount5d`
-- **Shadow Mode (임계값 비교만)** — Production은 `mode=static`(기본 0.48) 유지. Shadow hybrid(`max(floor, P90)`) 후보는 `screener_shadow_candidates_*`에만 기록 (**trader 미사용**)
+- **High-Conviction Shadow** — Production은 `mode=static`(기본 0.48) 유지. 전체 스코어 P90 hybrid(`max(floor, P90)`) 후보는 `screener_shadow_candidates_*`에만 기록 (**trader 미사용**)
+- **Eligible-only Shadow** — 신규 매수 가능(near-miss) 관찰용 · `screener_eligible_shadow_candidates_*` · Production 후보·trader 미사용
+- **Liquidity Shadow** — Amount5D P90 universe 관찰 · Production 5B 불변 · Production Artifact 저장 후 실행 · 실패해도 Production/`FAILED` 미승격 (**trader 미사용**)
+- **진단·레짐 Shadow** — `screener_diagnostics.py`: HIGH_TECH_LOW_FIN·급락/ATR/gap flags · smooth MA50 regime 비교 (Production 점수·제외 사유 미사용)
+- **다일간 Quality Report** — `screener_quality.py`: Decision-only 집계 · `output/quality/screener_quality_*.{json,md}` · observation ledger (`screener_candidate_observations.jsonl`)
+- **Build identity** — `APP_GIT_COMMIT`/`APP_IMAGE_TAG`/`APP_BUILD_TIME`/`APP_VERSION` 우선, 없으면 `git rev-parse` · 실패해도 스크리너 계속
 - **동일 발행사 중복 제거** — `config/issuer_groups.json`(GOOG/GOOGL→ALPHABET 등) · 최고점 1종만 최종 후보
 - **티커 정규화** — `utils.normalize_ticker_6()` / `norm_ticker` (`MARKET` 기준: US 심볼·KR 6자리). `trader`는 `self._t()` 헬퍼 사용
 - **KIS 해외 시세·일봉** — `overseas_price`(실시간), `overseas_daily_price`(일봉), `overseas_price_detail`(PER/PBR) (`api/overseas_stock/`)
@@ -326,9 +331,13 @@ screener.py --run-mode decision           health_check.py (AAPL @ NAS)
 | `screener_candidates_{date}_{am\|pm}_SP500.json` | **호환용 고정 복사본** — 최신 성공 DECISION만 갱신 · **trader/news/gpt 입력** |
 | `screener_candidates_full_*` | 고정 복사본 — Production 정책 통과 후보 전체 필드 |
 | `screener_scores_*` | 고정 복사본 — **스코어링 성공 전체** |
-| `screener_shadow_candidates_*` | Shadow 동적 임계값 후보 (**trader 미사용**) |
-| `screener_run_meta_*` | 고정 복사본 — 퍼널·점수분포·`run_mode`/`source_run_id`/`as_of_*`·레짐 필드·EMPTY reason |
-| `reviews/screener_review_{date}_{am\|pm}_SP500.md` | 고정 복사본 — Run Identity·Artifact Integrity·Market Regime 섹션 |
+| `screener_shadow_candidates_*` | High-Conviction Shadow (**trader 미사용**) |
+| `screener_eligible_shadow_candidates_*` | Eligible-only near-miss Shadow (**trader/GPT 미사용**) |
+| `screener_liquidity_shadow_{scores\|candidates}_*` | Liquidity Shadow (P90 Amount5D universe, **trader 미사용**) |
+| `screener_run_meta_*` | 고정 복사본 — 퍼널·`empty_reason`·exclusion/stage_drop·후보 가용성·3종 Shadow·diagnostics·regime shadow·`build_identity` |
+| `reviews/screener_review_{date}_{am\|pm}_SP500.md` | 고정 복사본 — Funnel·Exclusion·Candidate Availability·Shadows·Diagnostics·Market Regime Comparison |
+| `quality/screener_quality_{start}_{end}_{MARKET}.{json,md}` | `screener_quality.py` — Decision-only 다일간 품질 집계 |
+| `quality/screener_candidate_observations.jsonl` | 후보/Shadow 성과 관찰 ledger (멱등 upsert, **주문 성과와 분리**) |
 | `screener_holdings_*` | `screener.py` — 보유 종목 스코어 |
 | `market_state_{date}_{am\|pm}_SP500.json` | `screener.py` |
 | `cache/amount5d_{market}_{date}_v2.json` | `screener.py` — Amount5D 캐시 |
@@ -485,8 +494,10 @@ api/kis_auth.KIS (DomesticStock + OverseasStock)
 | 파일 | 역할 |
 |------|------|
 | `screener.py` | `--market SP500`, `--run-mode decision\|replay`(CLI 기본 replay), `--run-id`, `--allow-decision-overwrite`, `--force`(휴장 우회·기본 REPLAY), `--refresh-amount5d` |
-| `screener_artifacts.py` | DECISION/REPLAY·불변 run dir·manifest/SHA·fixed promote·as_of/장상태·trader/pipeline gate |
-| `screener_ops.py` | StageResult 퍼널·Amount5D 캐시·Shadow 임계값·issuer 중복제거·run meta/review·atomic JSON |
+| `screener_artifacts.py` | DECISION/REPLAY·불변 run dir·manifest/SHA·fixed promote·`build_identity`·as_of/장상태·trader/pipeline gate |
+| `screener_ops.py` | StageResult 퍼널(ELIGIBILITY/ISSUER_DEDUP/SECTOR 분리)·Amount5D 캐시·Shadow 임계값·issuer 중복제거·run meta/review·atomic JSON |
+| `screener_diagnostics.py` | 관찰 전용: 진단 flags·Eligible/Liquidity Shadow 헬퍼·smooth regime·empty_reason v2 |
+| `screener_quality.py` | Decision-only 다일간 quality report · observation ledger CLI |
 | `screener_core.py` | 지표·점수·`MarketState` (US: pykrx/fdr 지연 로드 스킵) |
 | `kis_master.py` | 국내/해외 `.mst`·`.cod` 다운로드·캐시 |
 | `health_check.py` | US: `AAPL` @ `NAS`, KR: `005930` |
@@ -597,7 +608,7 @@ PYTHONPATH=src OUTPUT_DIR=./output_test CONFIG_PATH=config/config.json \
   - `snapshot_ts_kst`가 `trade_date` 대비 **2일 이상 차이** → **ERROR**
   - `generated_at_kst`가 review scope와 **명백히 무관(2일 이상 차이)** → **ERROR**
 
-**테스트:** `tests/test_performance_review_kis_endpoints.py` + `tests/test_broker_ledger_integrity.py` + `tests/test_daily_balance_session.py` + `tests/test_screener_ops.py` + `tests/test_screener_artifacts.py` (DECISION/REPLAY 격리·manifest SHA·장상태·trader gate·20260720 acceptance) — 전체 **192** 케이스
+**테스트:** `tests/test_performance_review_kis_endpoints.py` + `tests/test_broker_ledger_integrity.py` + `tests/test_daily_balance_session.py` + `tests/test_screener_ops.py` + `tests/test_screener_artifacts.py` + `tests/test_screener_quality.py` (퍼널 분리·empty_reason·Eligible/Liquidity Shadow·diagnostics·quality report·20260722–24 acceptance) — 전체 **220** 케이스
 
 ---
 
@@ -702,8 +713,12 @@ DISCORD_WEBHOOK_URL_RISK=https://discord.com/api/webhooks/.../risk
 | `min_trading_value_5d_avg_us` | `5000000000` | 5일 평균 거래대금 하한(USD) — **운영값 즉시 완화 금지**(분포·Shadow만 메타에 기록) |
 | `min_market_cap_us` | `5000000000` | 시총 하한. 유효 Marcap 비율 `< min_valid_marcap_ratio`(기본 0.8)이면 **SKIPPED** (`MARKET_CAP_DATA_UNAVAILABLE`) — “501 통과”로 오표현하지 않음 |
 | `min_score_threshold` | `0.48` | Production 최종 점수 컷 (스크리너·리밸런스·GPT `initial_filter` 동기화) |
-| `score_threshold_policy` | `mode=static` | Production은 static 유지. `shadow_enabled` 시 hybrid `max(shadow_floor, P90)` 비교만 (`screener_shadow_candidates_*`) |
-| `amount5d_policy` | `mode=static` | Amount5D 운영 임계값 static. Shadow percentile은 메타데이터만 |
+| `score_threshold_policy` | `mode=static` | Production은 static 유지. `shadow_enabled` 시 High-Conviction hybrid `max(shadow_floor, P90)` 비교만 (`screener_shadow_candidates_*`) |
+| `amount5d_policy` | `mode=static` | Amount5D 운영 임계값 **5B static**. Shadow percentile은 메타/Liquidity Shadow만 |
+| `eligible_shadow_policy` | `enabled=true` | 신규 매수 가능 near-miss 관찰 · floor 0.42 · P90 · **trader 미사용** |
+| `liquidity_shadow_policy` | `enabled=true` | Amount5D P90 universe · Production 저장 후 실행 · 실패 isolation · **trader 미사용** |
+| `diagnostic_policy` | `enabled=true` | HIGH_TECH_LOW_FIN 등 진단 flags — Production 제외/점수 **미사용** |
+| `market_regime_shadow_policy` | `enabled=true` | smooth MA50 regime 비교 — Production binary/weighted **미변경** |
 | `require_positive_momentum` | `false` | `true`면 20일 모멘텀 < 0 종목 제외 |
 | `exclude_high_volatility` | `false` | `true`면 `volatility_threshold` 초과 종목 제외 |
 | `volatility_threshold` | `0.90` | 연율화 변동성 상한 (`exclude_high_volatility=true`일 때) |
@@ -719,10 +734,12 @@ DISCORD_WEBHOOK_URL_RISK=https://discord.com/api/webhooks/.../risk
 |------|------|
 | `runs/decision/.../{run_id}/` | 정규 의사결정 **불변** 원본 (manifest SHA·inputs snapshot) |
 | `runs/replay/.../{run_id}/` | 수동/사후 재계산 — Production과 분리 |
-| `screener_scores_*` (고정) | 최신 성공 DECISION의 스코어링 성공 **전체** 호환 복사본 |
+| `screener_scores_*` (고정) | 최신 성공 DECISION의 스코어링 성공 **전체** 호환 복사본 (단계 pass/`null`·diagnostic 포함) |
 | `screener_candidates_full_*` / `screener_candidates_*` (고정) | Production 정책 통과 → news/gpt/trader (**REPLAY 미갱신**) |
-| `screener_shadow_candidates_*` | Shadow만 — **trader 입력 금지** |
-| `screener_run_meta_*` (고정) | `run_mode`/`source_run_id`/`as_of_*`·퍼널·분포·레짐 필드·EMPTY reason |
+| `screener_shadow_candidates_*` | High-Conviction Shadow만 — **trader 입력 금지** |
+| `screener_eligible_shadow_candidates_*` / `screener_liquidity_shadow_*` | 관찰용 Shadow — **trader/GPT 입력 금지** |
+| `screener_run_meta_*` (고정) | schema v3 · 퍼널·empty_reason·exclusion/stage_drop·3종 Shadow·diagnostics·`build_identity` |
+| `quality/screener_quality_*` · `screener_candidate_observations.jsonl` | 다일간 Decision-only 품질 집계 · 후보 관찰 ledger |
 | `latest/screener_decision_*` | 최신 DECISION 포인터 |
 
 ### 6.4 뉴스 수집 (`config.json` → `news_params`)
@@ -837,6 +854,13 @@ docker compose exec integrated_manager python /app/src/screener.py \
 ls output/runs/decision/SP500/*/pm/
 cat output/latest/screener_decision_SP500_pm.json
 sha256sum output/screener_candidates_*_pm_SP500.json
+
+# 다일간 스크리너 품질 보고서 (Decision-only, trader 무관)
+docker compose exec integrated_manager sh -lc '
+PYTHONPATH=/app/src OUTPUT_DIR=/app/output \
+python /app/src/screener_quality.py --market SP500 --session pm --days 20 --decision-only
+'
+ls -lt output/quality/screener_quality_* | head
 ```
 
 > **주말·휴장일·사후 재실행:** `--force`는 휴장 검사만 건너뜁니다. **CLI 기본 `run_mode=REPLAY`** 이므로 과거일·익일 아침 재계산이 Production `screener_candidates_*` / `run_meta_*` / review를 덮어쓰지 않습니다. 동일 `trade_date`라도 장중(OPEN/INTRADAY_PARTIAL)과 장후(CLOSED/FINAL) 데이터 기준시각이 다르면 점수·후보가 달라질 수 있으며, 그것이 REPLAY 격리의 이유입니다. SP500 실행 시 pykrx(KRX)는 **로드하지 않습니다**. Amount5D 캐시는 REPLAY에서도 그대로 사용됩니다.
@@ -942,6 +966,7 @@ python3 trader.py --date ${DATE}
 | `DB_RECORD_DEBUG` | `1` 시 DB·리컨실 단계별 `[DB_DEBUG]` 로그 |
 | `PERF_REVIEW_PERIOD` | `integrated_manager` 월간/주간 유지보수 시 `monthly` / `weekly` |
 | `EVIDENCE_RETAIN_TRADING_DAYS` | `cleanup_output` evidence JSON 보존 거래일 (기본 20) |
+| `APP_GIT_COMMIT` / `APP_IMAGE_TAG` / `APP_BUILD_TIME` / `APP_VERSION` | 스크리너/manifest build identity (컨테이너에 git 없을 때 권장) |
 
 ---
 
@@ -965,6 +990,7 @@ trading_bot_260530_NASDAQ/
 │   │       └── overseas_stock_functions.py
 │   ├── kis_master.py            # KOSPI/KOSDAQ + SP500 마스터
 │   ├── screener.py / screener_core.py / screener_ops.py / screener_artifacts.py
+│   ├── screener_diagnostics.py / screener_quality.py
 │   ├── news_collector.py / gpt_analyzer.py
 │   ├── kis_overseas_account.py  # 해외 잔고 → balance/summary JSON (USD)
 │   ├── trader.py / risk_manager.py / account.py
@@ -986,7 +1012,8 @@ trading_bot_260530_NASDAQ/
 │   ├── test_ledger_repair_from_ccnl.py
 │   ├── test_daily_balance_session.py   # 세션 identity·pairing·통화·migration
 │   ├── test_screener_ops.py            # 퍼널·캐시·Shadow·scores 보존
-│   └── test_screener_artifacts.py      # DECISION/REPLAY·manifest·trader gate
+│   ├── test_screener_artifacts.py      # DECISION/REPLAY·manifest·trader gate
+│   └── test_screener_quality.py        # 퍼널 분리·empty_reason·Eligible/Liquidity·diagnostics·quality
 ├── run_integrated_manager.py
 ├── run_background_risk_manager.py
 ├── docker-compose.yml
@@ -1002,15 +1029,19 @@ trading_bot_260530_NASDAQ/
 | 영역 | 상태 |
 |------|------|
 | SP500 마스터·1·2차 스크리닝 | ✅ 동작 확인 |
-| 스크리너 퍼널·run meta·review | ✅ StageResult · SKIPPED/NOT_RUN · `screener_run_meta_*` · Markdown review |
+| 스크리너 퍼널·run meta·review | ✅ ELIGIBILITY/ISSUER_DEDUP/SECTOR 분리 · schema v3 · 구체적 empty_reason · exclusion/stage_drop |
 | DECISION/REPLAY Artifact 격리 | ✅ 불변 `runs/{decision\|replay}/…` · fixed는 성공 DECISION만 · CLI 기본 REPLAY |
 | as_of·장상태·레짐 필드 분리 | ✅ `market_session_state`/`daily_bar_status` · `weighted_regime_score`≠`scoring_market_component` |
-| screener_scores 전체 보존 | ✅ 최소점수 미달·보유·과열도 scores에 유지 (candidates만 제외) |
+| screener_scores 전체 보존 | ✅ 최소점수 미달·보유·과열도 scores에 유지 (candidates만 제외) · 단계 pass/`null` |
 | Amount5D 캐시 · `--refresh-amount5d` | ✅ `cache/amount5d_*_v2.json` · 동일일 재실행 단축 |
-| Shadow score/liquidity (비교만) | ✅ Production static 유지 · shadow 파일은 trader 미사용 |
+| High-Conviction Shadow | ✅ Production static 0.48 유지 · `screener_shadow_candidates_*` · trader 미사용 |
+| Eligible-only / Liquidity Shadow | ✅ near-miss·P90 Amount5D 관찰 · Production 저장 후·실패 isolation · trader/GPT 미사용 |
+| Diagnostics · smooth regime shadow | ✅ HIGH_TECH_LOW_FIN 등 · Production 점수/제외 미사용 |
+| Quality report · observation ledger | ✅ `screener_quality.py` Decision-only · `INSUFFICIENT_SAMPLE_FOR_POLICY_CHANGE` |
+| Build identity (env/git) | ✅ `APP_GIT_COMMIT` 우선 · git 없어도 스크리너 계속 |
 | issuer_group 중복 제거 | ✅ `config/issuer_groups.json` (GOOG/GOOGL 등) |
 | subprocess 스크리너 로그 보존 | ✅ `output/logs/screener_*` + run dir `screener.log` + INFO 요약 |
-| trader DECISION gate | ✅ REPLAY/hash mismatch/shadow 입력 차단 · pipeline gate |
+| trader DECISION gate | ✅ REPLAY/hash mismatch/shadow·eligible·liquidity·quality 입력 차단 · pipeline gate |
 | 해외 시세·Amount5D·PER/PBR | ✅ KIS TR |
 | US 실시간 시세·호가 (`trader`·`risk_manager`) | ✅ `overseas_price` (국내 `inquire-price` 미사용) |
 | US 일봉·RSI·손절/ATR (`kis_market_data`) | ✅ `HHDFS76240000`; US pykrx/fdr **미로드** |
@@ -1061,7 +1092,7 @@ trading_bot_260530_NASDAQ/
 | `dynamic_cash_management` | ⚠️ 보유 0·현금 100% 시 가용금 축소 가능 → 설정 확인 |
 | KIS endpoint performance review | ✅ artifact/DB/log · broker-only/`PERFORMANCE_DATA_INCOMPLETE` · API 직접 호출 없음 |
 | `resolve_pipeline_context` live trade_date | ✅ `resolve_market_trade_date` · stale `PIPELINE_TRADE_DATE` 재계산 |
-| `tests/` (performance + broker ledger + daily balance + screener_ops + screener_artifacts) | ✅ **192** passed |
+| `tests/` (performance + broker ledger + daily balance + screener_ops + screener_artifacts + screener_quality) | ✅ **220** passed |
 | FROZEN_INPUT_REPLAY 실행 | ⚠️ 입력 snapshot 저장까지 · 실행 경로 `NOT_IMPLEMENTED` (CURRENT_DATA_RECALCULATION 사용) |
 
 실전 미국 매매 전: **`vps` → health_check → account → 스크리너 → 뉴스 → GPT → (선택) trader** 순으로 검증하세요.  

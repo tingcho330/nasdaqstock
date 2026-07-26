@@ -13,6 +13,7 @@ import re
 import numpy as np
 import requests
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple, Sequence
 from dataclasses import dataclass
 from enum import Enum
@@ -1179,11 +1180,14 @@ def run_review() -> Dict[str, Any]:
     news = collect_kospi_news(lookback_days)
     logger.info(f"[news] 수집 {len(news)}건")
 
-    # 5) config 로드
+    # 5) config 로드 (JSONC runtime loader — raw json.load 금지)
     config_path = CONFIG_PATH
     try:
-        with open(config_path, "r", encoding="utf-8") as f:
-            cfg = json.load(f)
+        from utils import get_cfg, load_json_config
+
+        cfg = get_cfg(config_path)
+        if not cfg:
+            cfg = load_json_config(Path(config_path))
     except Exception as e:
         logger.error(f"config 로드 실패({config_path}): {e}")
         cfg = None
