@@ -1,6 +1,9 @@
 """Multi-day screener quality reports and candidate observation ledger.
 
 Decision-run only by default. Never feeds trader / GPT order inputs.
+
+Run directories are discovered case-insensitively under output/runs/{decision|DECISION}/…
+because ScreenerRunWriter stores mode segments in lowercase.
 """
 from __future__ import annotations
 
@@ -10,15 +13,17 @@ import logging
 import math
 import os
 import sys
-from collections import Counter, defaultdict
+from collections import Counter
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 logger = logging.getLogger("screener_quality")
 
 INSUFFICIENT_SAMPLE = "INSUFFICIENT_SAMPLE_FOR_POLICY_CHANGE"
 MIN_SAMPLE_FOR_POLICY = 15
+NOT_AVAILABLE = "NOT_AVAILABLE"
 
 
 def _safe_float(v: Any) -> Optional[float]:
@@ -47,7 +52,7 @@ def _load_json(path: Path) -> Optional[Any]:
 def load_runtime_config(config_path: Optional[Path] = None) -> Dict[str, Any]:
     """Reuse the screener's JSONC config loader (comments, defaults)."""
     try:
-        from utils import CONFIG_PATH, get_cfg, load_config
+        from utils import CONFIG_PATH, get_cfg
 
         path = Path(config_path) if config_path else CONFIG_PATH
         cfg = get_cfg(path)
@@ -57,6 +62,120 @@ def load_runtime_config(config_path: Optional[Path] = None) -> Dict[str, Any]:
         return {}
 
 
+def _market_dirs_match(dir_name: str, market: str) -> bool:
+    return str(dir_name).upper() == str(market).upper()
+
+
+def _parse_ts(value: Any) -> Optional[datetime]:
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    try:
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        dt = datetime.fromisoformat(s)
+        # Normalize to naive UTC-ish comparable values (strip tzinfo for ordering)
+        if dt.tzinfo is not None:
+            dt = dt.replace(tzinfo=None)
+        return dt
+    except Exception:
+        return None
+
+
+def _run_recency_key(merged: Dict[str, Any], run_dir: Path) -> Tuple[Any, ...]:
+    """Prefer completed_at_kst / started_at_kst, then mtime."""
+    completed = _parse_ts(merged.get("completed_at_kst") or merged.get("finished_at_kst"))
+    started = _parse_ts(merged.get("started_at_kst"))
+    try:
+        mtime = run_dir.stat().st_mtime
+    except Exception:
+        mtime = 0.0
+    return (
+        completed or datetime.min,
+        started or datetime.min,
+        float(mtime),
+        str(run_dir.name),
+    )
+
+
+def merge_manifest_and_meta(
+    manifest: Optional[Dict[str, Any]],
+    meta: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Identity from manifest; operational fields from meta; cross-fallback."""
+    man = dict(manifest or {})
+    met = dict(meta or {})
+    merged = dict(met)
+    merged.update(man)  # manifest wins for overlapping identity keys first
+
+    # Identity: manifest preferred (already applied), then meta fallback
+    for key in (
+        "run_id",
+        "run_mode",
+        "market",
+        "session",
+        "trade_date",
+        "status",
+        "decision_artifact",
+        "schema_version",
+        "completed_at_kst",
+        "started_at_kst",
+        "git_commit",
+        "build_identity",
+    ):
+        if merged.get(key) is None and met.get(key) is not None:
+            merged[key] = met.get(key)
+        if key in ("run_id", "run_mode", "market", "session", "trade_date", "status", "decision_artifact"):
+            if man.get(key) is not None:
+                merged[key] = man.get(key)
+
+    # Operational: meta preferred
+    for key in (
+        "result_status",
+        "empty_reason",
+        "empty_reason_detail",
+        "score_distribution",
+        "production_candidate_count",
+        "candidate_count",
+        "shadow",
+        "eligible_shadow",
+        "liquidity_shadow",
+        "funnel",
+        "stage_drop_summary",
+        "exclusion_summary",
+        "candidate_availability",
+        "diagnostics",
+        "market_regime_shadow",
+        "amount5d_distribution",
+        "amount5d_cache",
+        "stage_durations_sec",
+        "data_quality_findings",
+        "production_threshold",
+        "configured_threshold",
+    ):
+        if met.get(key) is not None:
+            merged[key] = met.get(key)
+        elif man.get(key) is not None and merged.get(key) is None:
+            merged[key] = man.get(key)
+
+    return merged
+
+
+@dataclass
+class DiscoveryResult:
+    run_dirs: List[Path] = field(default_factory=list)
+    merged_by_run: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    discovery: Dict[str, Any] = field(default_factory=dict)
+
+    def __iter__(self):
+        return iter(self.run_dirs)
+
+    def __len__(self) -> int:
+        return len(self.run_dirs)
+
+
 def discover_decision_runs(
     output_dir: Path,
     *,
@@ -64,48 +183,259 @@ def discover_decision_runs(
     session: Optional[str] = None,
     days: int = 20,
     decision_only: bool = True,
-) -> List[Path]:
-    """Find immutable run directories under output/runs/DECISION/..."""
+) -> DiscoveryResult:
+    """Find immutable run dirs under output/runs/{decision|DECISION|…}/…
+
+    Directory names are matched case-insensitively. Manifest ``run_mode`` is the
+    source of truth for DECISION vs REPLAY inclusion.
+    """
     runs_root = Path(output_dir) / "runs"
-    modes = ["DECISION"] if decision_only else ["DECISION", "REPLAY"]
-    found: List[Tuple[str, Path]] = []
-    for mode in modes:
-        base = runs_root / mode / str(market).upper()
-        if not base.exists():
+    allowed = {"DECISION"} if decision_only else {"DECISION", "REPLAY"}
+    market_u = str(market).upper()
+    session_l = str(session).lower() if session else None
+
+    manifest_count = 0
+    skip_reasons: Counter = Counter()
+    # key=(trade_date, session) -> (recency_key, run_dir, merged)
+    best: Dict[Tuple[str, str], Tuple[Tuple[Any, ...], Path, Dict[str, Any]]] = {}
+    # Track older duplicates for skip accounting after selection
+    candidates: List[Tuple[Tuple[str, str], Tuple[Any, ...], Path, Dict[str, Any]]] = []
+
+    if not runs_root.exists():
+        disc = {
+            "manifest_count": 0,
+            "included_run_count": 0,
+            "excluded_run_count": 0,
+            "skip_reasons": {},
+            "runs_root": str(runs_root),
+            "decision_only": decision_only,
+            "warning": "RUNS_ROOT_MISSING",
+        }
+        logger.warning("quality discovery: runs root missing: %s", runs_root)
+        return DiscoveryResult(discovery=disc)
+
+    for mode_dir in sorted(runs_root.iterdir()):
+        if not mode_dir.is_dir():
             continue
-        for date_dir in sorted(base.iterdir()):
-            if not date_dir.is_dir() or not date_dir.name.isdigit():
+        normalized_mode = mode_dir.name.upper()
+        if normalized_mode not in ("DECISION", "REPLAY"):
+            continue
+        # Still walk both modes so we can count REPLAY_EXCLUDED when decision_only
+        for mkt_dir in sorted(mode_dir.iterdir()):
+            if not mkt_dir.is_dir():
                 continue
-            for sess_dir in sorted(date_dir.iterdir()):
-                if not sess_dir.is_dir():
+            if not _market_dirs_match(mkt_dir.name, market_u):
+                # Only count skips under allowed mode dirs that have manifests
+                continue
+            for date_dir in sorted(mkt_dir.iterdir()):
+                if not date_dir.is_dir() or not date_dir.name.isdigit():
                     continue
-                if session and sess_dir.name != session:
-                    continue
-                for run_dir in sorted(sess_dir.iterdir()):
-                    if not run_dir.is_dir():
+                for sess_dir in sorted(date_dir.iterdir()):
+                    if not sess_dir.is_dir():
                         continue
-                    meta_path = run_dir / "screener_run_meta.json"
-                    if not meta_path.exists():
-                        continue
-                    found.append((date_dir.name, run_dir))
+                    if session_l and sess_dir.name.lower() != session_l:
+                        # Defer SESSION_MISMATCH until we see a manifest
+                        pass
+                    for run_dir in sorted(sess_dir.iterdir()):
+                        if not run_dir.is_dir():
+                            continue
+                        man_path = run_dir / "manifest.json"
+                        meta_path = run_dir / "screener_run_meta.json"
+                        if not man_path.exists() and not meta_path.exists():
+                            continue
+                        if man_path.exists():
+                            manifest_count += 1
+                        manifest = _load_json(man_path) if man_path.exists() else None
+                        if man_path.exists() and manifest is None:
+                            skip_reasons["MANIFEST_READ_FAILED"] += 1
+                            logger.debug("skip %s: MANIFEST_READ_FAILED", run_dir)
+                            continue
+                        if manifest is not None and not isinstance(manifest, dict):
+                            skip_reasons["MANIFEST_READ_FAILED"] += 1
+                            logger.debug("skip %s: MANIFEST_READ_FAILED (not dict)", run_dir)
+                            continue
+                        meta = _load_json(meta_path) if meta_path.exists() else None
+                        if meta is not None and not isinstance(meta, dict):
+                            meta = None
+                        if not meta_path.exists() or meta is None:
+                            skip_reasons["META_MISSING"] += 1
+                            logger.debug("skip %s: META_MISSING", run_dir)
+                            continue
 
-    # Keep latest run per trade_date+session
-    by_key: Dict[Tuple[str, str], Path] = {}
-    for trade_date, run_dir in found:
-        sess = run_dir.parent.name
-        key = (trade_date, sess)
-        # lexicographic run_id / mtime preference: last wins in sorted order
-        by_key[key] = run_dir
+                        merged = merge_manifest_and_meta(
+                            manifest if isinstance(manifest, dict) else {},
+                            meta,
+                        )
 
-    ordered = sorted(by_key.items(), key=lambda kv: kv[0][0])
+                        # Path vs manifest mode conflict
+                        man_mode = str(merged.get("run_mode") or "").upper()
+                        if man_mode and man_mode != normalized_mode:
+                            skip_reasons["RUN_MODE_MISMATCH"] += 1
+                            logger.debug(
+                                "skip %s: RUN_MODE_MISMATCH path=%s manifest=%s",
+                                run_dir,
+                                normalized_mode,
+                                man_mode,
+                            )
+                            continue
+                        if not man_mode:
+                            # Fall back to path mode only as hint, still require validation
+                            man_mode = normalized_mode
+                            merged["run_mode"] = man_mode
+
+                        if decision_only and man_mode != "DECISION":
+                            skip_reasons["REPLAY_EXCLUDED"] += 1
+                            logger.debug("skip %s: REPLAY_EXCLUDED", run_dir)
+                            continue
+                        if man_mode not in allowed:
+                            skip_reasons["REPLAY_EXCLUDED"] += 1
+                            logger.debug("skip %s: mode %s not allowed", run_dir, man_mode)
+                            continue
+
+                        mkt_val = str(merged.get("market") or mkt_dir.name).upper()
+                        if mkt_val != market_u:
+                            skip_reasons["MARKET_MISMATCH"] += 1
+                            logger.debug("skip %s: MARKET_MISMATCH %s", run_dir, mkt_val)
+                            continue
+
+                        sess_val = str(merged.get("session") or sess_dir.name).lower()
+                        if session_l and sess_val != session_l:
+                            skip_reasons["SESSION_MISMATCH"] += 1
+                            logger.debug("skip %s: SESSION_MISMATCH %s", run_dir, sess_val)
+                            continue
+
+                        status = str(merged.get("status") or "")
+                        if status and not status.startswith("SUCCESS"):
+                            skip_reasons["STATUS_NOT_SUCCESS"] += 1
+                            logger.debug("skip %s: STATUS_NOT_SUCCESS %s", run_dir, status)
+                            continue
+
+                        trade_date = str(merged.get("trade_date") or date_dir.name)
+                        if not (trade_date.isdigit() and len(trade_date) == 8):
+                            skip_reasons["TRADE_DATE_INVALID"] += 1
+                            logger.debug("skip %s: TRADE_DATE_INVALID %s", run_dir, trade_date)
+                            continue
+
+                        # decision_artifact soft check: prefer true, but don't exclude
+                        # legacy schema_version=1 that may omit it when run_mode=DECISION
+                        if (
+                            decision_only
+                            and merged.get("decision_artifact") is False
+                            and man_mode == "DECISION"
+                        ):
+                            skip_reasons["DECISION_ARTIFACT_FALSE"] += 1
+                            logger.debug("skip %s: DECISION_ARTIFACT_FALSE", run_dir)
+                            continue
+
+                        key = (trade_date, sess_val)
+                        recency = _run_recency_key(merged, run_dir)
+                        candidates.append((key, recency, run_dir, merged))
+
+    for key, recency, run_dir, merged in candidates:
+        prev = best.get(key)
+        if prev is None:
+            best[key] = (recency, run_dir, merged)
+            continue
+        prev_recency, prev_dir, _prev_merged = prev
+        if recency > prev_recency:
+            skip_reasons["DUPLICATE_TRADE_DATE_OLDER_RUN"] += 1
+            logger.debug(
+                "skip older duplicate %s (kept %s)",
+                prev_dir,
+                run_dir,
+            )
+            best[key] = (recency, run_dir, merged)
+        else:
+            skip_reasons["DUPLICATE_TRADE_DATE_OLDER_RUN"] += 1
+            logger.debug(
+                "skip older duplicate %s (kept %s)",
+                run_dir,
+                prev_dir,
+            )
+
+    ordered_keys = sorted(best.keys(), key=lambda k: k[0])
     if days > 0:
-        ordered = ordered[-int(days) :]
-    return [p for _, p in ordered]
+        # Unique trade dates (session aware): keep last N trade_date groups
+        # Group by trade_date preserving order
+        by_date: Dict[str, List[Tuple[str, str]]] = {}
+        for k in ordered_keys:
+            by_date.setdefault(k[0], []).append(k)
+        date_keys = sorted(by_date.keys())
+        keep_dates = set(date_keys[-int(days) :])
+        ordered_keys = [k for k in ordered_keys if k[0] in keep_dates]
+
+    run_dirs: List[Path] = []
+    merged_by_run: Dict[str, Dict[str, Any]] = {}
+    for k in ordered_keys:
+        _rec, run_dir, merged = best[k]
+        run_dirs.append(run_dir)
+        merged_by_run[str(run_dir)] = merged
+
+    included = len(run_dirs)
+    excluded = int(sum(skip_reasons.values()))
+    disc = {
+        "manifest_count": manifest_count,
+        "included_run_count": included,
+        "excluded_run_count": excluded,
+        "skip_reasons": dict(skip_reasons),
+        "runs_root": str(runs_root),
+        "decision_only": decision_only,
+        "market": market_u,
+        "session": session_l,
+    }
+    if manifest_count > 0 and included == 0:
+        disc["warning"] = "MANIFESTS_FOUND_BUT_NONE_INCLUDED"
+        logger.warning(
+            "quality discovery: found %d manifest(s) but included_run_count=0 skip_reasons=%s",
+            manifest_count,
+            dict(skip_reasons),
+        )
+    elif included == 0:
+        disc["warning"] = "NO_DECISION_RUNS_FOUND"
+        logger.warning("quality discovery: no decision runs under %s", runs_root)
+
+    logger.info(
+        "quality discovery: manifests=%d included=%d excluded=%d skip=%s",
+        manifest_count,
+        included,
+        excluded,
+        dict(skip_reasons),
+    )
+    return DiscoveryResult(run_dirs=run_dirs, merged_by_run=merged_by_run, discovery=disc)
+
+
+# Back-compat: older tests may expect a list of Paths
+def discover_decision_run_paths(
+    output_dir: Path,
+    *,
+    market: str,
+    session: Optional[str] = None,
+    days: int = 20,
+    decision_only: bool = True,
+) -> List[Path]:
+    return discover_decision_runs(
+        output_dir,
+        market=market,
+        session=session,
+        days=days,
+        decision_only=decision_only,
+    ).run_dirs
 
 
 def _meta_of(run_dir: Path) -> Dict[str, Any]:
     data = _load_json(run_dir / "screener_run_meta.json") or {}
     return data if isinstance(data, dict) else {}
+
+
+def _manifest_of(run_dir: Path) -> Dict[str, Any]:
+    data = _load_json(run_dir / "manifest.json") or {}
+    return data if isinstance(data, dict) else {}
+
+
+def _merged_of(run_dir: Path, cache: Optional[Dict[str, Dict[str, Any]]] = None) -> Dict[str, Any]:
+    if cache and str(run_dir) in cache:
+        return cache[str(run_dir)]
+    return merge_manifest_and_meta(_manifest_of(run_dir), _meta_of(run_dir))
 
 
 def _candidates_of(run_dir: Path, name: str = "screener_candidates.json") -> List[Dict[str, Any]]:
@@ -126,12 +456,25 @@ def _ticker(row: Dict[str, Any]) -> str:
     return str(row.get("Ticker") or row.get("ticker") or "").upper()
 
 
+def _optional_section(meta: Dict[str, Any], key: str) -> Any:
+    """Legacy schema may omit v3 fields — return NOT_AVAILABLE sentinel, never invent 0."""
+    if key not in meta:
+        return NOT_AVAILABLE
+    val = meta.get(key)
+    if val is None:
+        return None
+    return val
+
+
 def aggregate_quality_report(
     run_dirs: Sequence[Path],
     *,
     market: str,
     session: Optional[str] = None,
     min_sample_for_policy: int = MIN_SAMPLE_FOR_POLICY,
+    discovery: Optional[Dict[str, Any]] = None,
+    merged_by_run: Optional[Dict[str, Dict[str, Any]]] = None,
+    decision_only: bool = True,
 ) -> Dict[str, Any]:
     """Aggregate Decision-run observability into a quality report payload."""
     days_meta: List[Dict[str, Any]] = []
@@ -155,16 +498,16 @@ def aggregate_quality_report(
     score_series: List[Dict[str, Any]] = []
 
     for run_dir in run_dirs:
-        meta = _meta_of(run_dir)
-        if str(meta.get("run_mode") or "").upper() == "REPLAY":
-            # Extra guard even if discover filtered
+        meta = _merged_of(Path(run_dir), merged_by_run)
+        run_mode = str(meta.get("run_mode") or "").upper()
+        if decision_only and run_mode == "REPLAY":
             continue
-        trade_date = str(meta.get("trade_date") or run_dir.parent.parent.name)
-        prod = _candidates_of(run_dir, "screener_candidates.json")
-        hc = _candidates_of(run_dir, "screener_shadow_candidates.json")
-        elig = _candidates_of(run_dir, "screener_eligible_shadow_candidates.json")
-        liq = _candidates_of(run_dir, "screener_liquidity_shadow_candidates.json")
-        scores = _scores_of(run_dir)
+        trade_date = str(meta.get("trade_date") or Path(run_dir).parent.parent.name)
+        prod = _candidates_of(Path(run_dir), "screener_candidates.json")
+        hc = _candidates_of(Path(run_dir), "screener_shadow_candidates.json")
+        elig = _candidates_of(Path(run_dir), "screener_eligible_shadow_candidates.json")
+        liq = _candidates_of(Path(run_dir), "screener_liquidity_shadow_candidates.json")
+        scores = _scores_of(Path(run_dir))
 
         prod_set = {_ticker(r) for r in prod if _ticker(r)}
         for t in prod_set:
@@ -210,14 +553,20 @@ def aggregate_quality_report(
         if er:
             empty_reasons[str(er)] += 1
         sd = meta.get("score_distribution") or {}
+        prod_count = meta.get("production_candidate_count")
+        if prod_count is None:
+            prod_count = meta.get("candidate_count")
+        if prod_count is None:
+            prod_count = len(prod)
+
         score_series.append(
             {
                 "trade_date": trade_date,
-                "count": sd.get("count"),
-                "mean": sd.get("mean"),
-                "median": sd.get("median"),
-                "p90": sd.get("p90"),
-                "production_candidate_count": meta.get("production_candidate_count"),
+                "count": sd.get("count") if sd else None,
+                "mean": sd.get("mean") if sd else None,
+                "median": sd.get("median") if sd else None,
+                "p90": sd.get("p90") if sd else None,
+                "production_candidate_count": prod_count,
                 "empty_reason": er,
                 "result_status": meta.get("result_status"),
             }
@@ -234,22 +583,48 @@ def aggregate_quality_report(
         cache_miss += int(cache.get("miss") or cache.get("misses") or 0)
         cache_failed += int(cache.get("failed") or cache.get("failures") or 0)
 
-        avail = meta.get("candidate_availability") or {}
+        avail = _optional_section(meta, "candidate_availability")
+        shadow = _optional_section(meta, "shadow")
+        elig_sh = _optional_section(meta, "eligible_shadow")
+        liq_sh = _optional_section(meta, "liquidity_shadow")
+
+        def _shadow_count(section: Any, fallback_len: int) -> Any:
+            if section is NOT_AVAILABLE:
+                return NOT_AVAILABLE if fallback_len == 0 else fallback_len
+            if isinstance(section, dict):
+                if "candidate_count" in section:
+                    return section.get("candidate_count")
+                return fallback_len
+            return fallback_len
+
         days_meta.append(
             {
                 "trade_date": trade_date,
                 "run_id": meta.get("run_id"),
                 "run_directory": str(run_dir),
+                "schema_version": meta.get("schema_version"),
                 "result_status": meta.get("result_status"),
                 "empty_reason": er,
-                "production_candidate_count": meta.get("production_candidate_count", len(prod)),
-                "threshold_pass_count": avail.get("threshold_pass_count"),
-                "eligible_new_buy_count": avail.get("eligible_new_buy_count"),
-                "high_conviction_shadow_count": (meta.get("shadow") or {}).get("candidate_count", len(hc)),
-                "eligible_shadow_count": (meta.get("eligible_shadow") or {}).get("candidate_count", len(elig)),
-                "liquidity_shadow_count": (meta.get("liquidity_shadow") or {}).get("candidate_count", len(liq)),
-                "stage_drop_summary": meta.get("stage_drop_summary") or {},
-                "exclusion_summary": meta.get("exclusion_summary") or {},
+                "production_candidate_count": prod_count,
+                "threshold_pass_count": (
+                    avail.get("threshold_pass_count")
+                    if isinstance(avail, dict)
+                    else (None if avail is NOT_AVAILABLE else None)
+                ),
+                "eligible_new_buy_count": (
+                    avail.get("eligible_new_buy_count") if isinstance(avail, dict) else None
+                ),
+                "high_conviction_shadow_count": _shadow_count(shadow, len(hc)),
+                "eligible_shadow_count": _shadow_count(elig_sh, len(elig)),
+                "liquidity_shadow_count": _shadow_count(liq_sh, len(liq)),
+                "stage_drop_summary": _optional_section(meta, "stage_drop_summary"),
+                "exclusion_summary": _optional_section(meta, "exclusion_summary"),
+                "candidate_availability": avail,
+                "eligible_shadow": elig_sh,
+                "liquidity_shadow": liq_sh,
+                "diagnostics": _optional_section(meta, "diagnostics"),
+                "market_regime_shadow": _optional_section(meta, "market_regime_shadow"),
+                "build_identity": _optional_section(meta, "build_identity"),
                 "stage_durations_sec": meta.get("stage_durations_sec") or {},
                 "data_quality_findings": meta.get("data_quality_findings") or [],
             }
@@ -261,11 +636,13 @@ def aggregate_quality_report(
     sample_status = (
         INSUFFICIENT_SAMPLE if n_days < int(min_sample_for_policy) else "ADEQUATE_SAMPLE"
     )
+    if n_days == 0:
+        sample_status = "NO_DATA"
 
     start = days_meta[0]["trade_date"] if days_meta else None
     end = days_meta[-1]["trade_date"] if days_meta else None
 
-    return {
+    report = {
         "schema_version": 1,
         "market": market,
         "session": session,
@@ -312,18 +689,30 @@ def aggregate_quality_report(
         "min_sample_for_policy_change": int(min_sample_for_policy),
         "policy_change_recommendation": sample_status,
         "used_by_trader": False,
-        "decision_only": True,
+        "decision_only": decision_only,
+        "discovery": discovery
+        or {
+            "manifest_count": 0,
+            "included_run_count": n_days,
+            "excluded_run_count": 0,
+            "skip_reasons": {},
+        },
         "candidate_performance": {
             "note": "Returns are null when future price evidence is insufficient; never coerced to 0.",
             "horizons": ["next_decision", "1d", "3d", "5d"],
         },
+        "legacy_field_policy": {
+            "missing_v3_fields": NOT_AVAILABLE,
+            "note": "Absent schema v3 fields are NOT_AVAILABLE/null; never coerced to 0.",
+        },
     }
+    return report
 
 
 def render_quality_markdown(report: Dict[str, Any]) -> str:
     lines = [
         f"# Screener Quality Report — {report.get('market')} "
-        f"{report.get('start_trade_date')}→{report.get('end_trade_date')}",
+        f"{report.get('start_trade_date') or 'NO_DATA'}→{report.get('end_trade_date') or 'NO_DATA'}",
         "",
         f"- trading_days: {report.get('trading_days')}",
         f"- production_candidate_days: {report.get('production_candidate_days')}",
@@ -331,8 +720,17 @@ def render_quality_markdown(report: Dict[str, Any]) -> str:
         f"- sample_status: `{report.get('sample_status')}`",
         f"- used_by_trader: {report.get('used_by_trader', False)}",
         "",
-        "## Empty Reason Distribution",
+        "## Discovery",
     ]
+    disc = report.get("discovery") or {}
+    lines.append(f"- manifest_count: {disc.get('manifest_count')}")
+    lines.append(f"- included_run_count: {disc.get('included_run_count')}")
+    lines.append(f"- excluded_run_count: {disc.get('excluded_run_count')}")
+    lines.append(f"- skip_reasons: `{disc.get('skip_reasons')}`")
+    if disc.get("warning"):
+        lines.append(f"- warning: `{disc.get('warning')}`")
+    lines.append("")
+    lines.append("## Empty Reason Distribution")
     for k, v in (report.get("empty_reason_distribution") or {}).items():
         lines.append(f"- {k}: {v}")
     lines.append("")
@@ -354,6 +752,9 @@ def render_quality_markdown(report: Dict[str, Any]) -> str:
     lines.append("")
     if report.get("sample_status") == INSUFFICIENT_SAMPLE:
         lines.append(f"**{INSUFFICIENT_SAMPLE}** — do not change Production thresholds yet.")
+        lines.append("")
+    if report.get("sample_status") == "NO_DATA":
+        lines.append("**NO_DATA** — no qualifying Decision runs were included.")
         lines.append("")
     return "\n".join(lines) + "\n"
 
@@ -396,16 +797,15 @@ def upsert_observation_ledger(
         prev = existing.get(key, {})
         merged = dict(prev)
         merged.update(row)
-        # Preserve already-filled returns; never overwrite with null unless missing
-        for field in (
+        for field_name in (
             "return_1d_pct",
             "return_3d_pct",
             "return_5d_pct",
             "max_drawdown_5d_pct",
             "decision_price",
         ):
-            if merged.get(field) is None and prev.get(field) is not None:
-                merged[field] = prev.get(field)
+            if merged.get(field_name) is None and prev.get(field_name) is not None:
+                merged[field_name] = prev.get(field_name)
         if merged.get("outcome_status") is None:
             merged["outcome_status"] = "PENDING"
         existing[key] = merged
@@ -417,8 +817,8 @@ def upsert_observation_ledger(
 
 
 def build_observation_rows_from_run(run_dir: Path) -> List[Dict[str, Any]]:
-    meta = _meta_of(run_dir)
-    run_id = str(meta.get("run_id") or run_dir.name)
+    meta = _merged_of(Path(run_dir))
+    run_id = str(meta.get("run_id") or Path(run_dir).name)
     trade_date = str(meta.get("trade_date") or "")
     as_of = meta.get("as_of_kst")
     rows: List[Dict[str, Any]] = []
@@ -449,11 +849,22 @@ def build_observation_rows_from_run(run_dir: Path) -> List[Dict[str, Any]]:
                 }
             )
 
-    _add(_candidates_of(run_dir, "screener_candidates.json"), "PRODUCTION")
-    _add(_candidates_of(run_dir, "screener_shadow_candidates.json"), "HIGH_CONVICTION_SHADOW")
-    _add(_candidates_of(run_dir, "screener_eligible_shadow_candidates.json"), "ELIGIBLE_SHADOW")
-    _add(_candidates_of(run_dir, "screener_liquidity_shadow_candidates.json"), "LIQUIDITY_SHADOW")
+    rd = Path(run_dir)
+    _add(_candidates_of(rd, "screener_candidates.json"), "PRODUCTION")
+    _add(_candidates_of(rd, "screener_shadow_candidates.json"), "HIGH_CONVICTION_SHADOW")
+    _add(_candidates_of(rd, "screener_eligible_shadow_candidates.json"), "ELIGIBLE_SHADOW")
+    _add(_candidates_of(rd, "screener_liquidity_shadow_candidates.json"), "LIQUIDITY_SHADOW")
     return rows
+
+
+def quality_report_stem(report: Dict[str, Any], market: str) -> str:
+    """Build filename stem — never UNKNOWN_UNKNOWN."""
+    start = report.get("start_trade_date")
+    end = report.get("end_trade_date")
+    n = int(report.get("trading_days") or 0)
+    if n > 0 and start and end:
+        return f"screener_quality_{start}_{end}_{market}"
+    return f"screener_quality_NO_DATA_{market}"
 
 
 def write_quality_report(
@@ -464,9 +875,7 @@ def write_quality_report(
 ) -> Tuple[Path, Path]:
     out = Path(output_dir) / "quality"
     out.mkdir(parents=True, exist_ok=True)
-    start = report.get("start_trade_date") or "UNKNOWN"
-    end = report.get("end_trade_date") or "UNKNOWN"
-    stem = f"screener_quality_{start}_{end}_{market}"
+    stem = quality_report_stem(report, market)
     json_path = out / f"{stem}.json"
     md_path = out / f"{stem}.md"
     with open(json_path, "w", encoding="utf-8") as f:
@@ -490,11 +899,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--update-ledger", action="store_true", default=True)
     args = parser.parse_args(list(argv) if argv is not None else None)
 
-    # Prefer immutable Decision config snapshots when present; still load runtime cfg
     _ = load_runtime_config(Path(args.config) if args.config else None)
 
     decision_only = not bool(args.include_replay)
-    run_dirs = discover_decision_runs(
+    discovered = discover_decision_runs(
         Path(args.output_dir),
         market=args.market,
         session=args.session,
@@ -502,22 +910,43 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         decision_only=decision_only,
     )
     report = aggregate_quality_report(
-        run_dirs,
+        discovered.run_dirs,
         market=args.market,
         session=args.session,
+        discovery=discovered.discovery,
+        merged_by_run=discovered.merged_by_run,
+        decision_only=decision_only,
     )
     json_path, md_path = write_quality_report(report, Path(args.output_dir), market=args.market)
-    logger.info("quality report: %s / %s (days=%d)", json_path, md_path, report.get("trading_days"))
+    logger.info(
+        "quality report: %s / %s (days=%s)",
+        json_path,
+        md_path,
+        report.get("trading_days"),
+    )
 
-    if args.update_ledger:
+    if args.update_ledger and discovered.run_dirs:
         ledger = Path(args.output_dir) / "quality" / "screener_candidate_observations.jsonl"
         rows: List[Dict[str, Any]] = []
-        for rd in run_dirs:
+        for rd in discovered.run_dirs:
             rows.extend(build_observation_rows_from_run(rd))
         n = upsert_observation_ledger(ledger, rows)
         logger.info("observation ledger upserted entries=%d path=%s", n, ledger)
 
-    print(json.dumps({"json": str(json_path), "md": str(md_path), "days": report.get("trading_days")}, indent=2))
+    payload = {
+        "json": str(json_path),
+        "md": str(md_path),
+        "days": report.get("trading_days"),
+        "start_trade_date": report.get("start_trade_date"),
+        "end_trade_date": report.get("end_trade_date"),
+        "discovery": report.get("discovery"),
+        "sample_status": report.get("sample_status"),
+    }
+    print(json.dumps(payload, indent=2))
+
+    # NO_DATA is a warning report, not a Production pipeline failure.
+    if int(report.get("trading_days") or 0) == 0:
+        return 2
     return 0
 
 
