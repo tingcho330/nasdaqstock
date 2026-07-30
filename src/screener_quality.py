@@ -24,6 +24,9 @@ logger = logging.getLogger("screener_quality")
 INSUFFICIENT_SAMPLE = "INSUFFICIENT_SAMPLE_FOR_POLICY_CHANGE"
 MIN_SAMPLE_FOR_POLICY = 15
 NOT_AVAILABLE = "NOT_AVAILABLE"
+TRUSTED = "TRUSTED"
+UNTRUSTED = "UNTRUSTED"
+FAILED_STATUS = "FAILED"
 
 
 def _safe_float(v: Any) -> Optional[float]:
@@ -422,6 +425,232 @@ def discover_decision_run_paths(
     ).run_dirs
 
 
+NOT_AVAILABLE = "NOT_AVAILABLE"
+TRUSTED = "TRUSTED"
+UNTRUSTED = "UNTRUSTED"
+FAILED_STATUS = "FAILED"
+
+
+class RunArtifactCache:
+    """Load DECISION / diagnostics artifacts once per run for quality + ledger."""
+
+    def __init__(self) -> None:
+        self._json: Dict[str, Any] = {}
+        self._optional: Dict[str, Any] = {}
+
+    def load_json(self, path: Path) -> Optional[Any]:
+        key = str(path)
+        if key in self._json:
+            return self._json[key]
+        data = _load_json(path)
+        self._json[key] = data
+        return data
+
+    def load_optional_list(
+        self,
+        path: Path,
+        *,
+        schema_version: Any = None,
+        manifest_listed: bool = False,
+        label: str = "",
+    ) -> Tuple[Any, Optional[str]]:
+        """Return (rows_or_sentinel, trust_note).
+
+        Missing optional file on legacy schema → NOT_AVAILABLE (DEBUG/INFO, not WARNING).
+        """
+        key = f"opt:{path}:{schema_version}:{manifest_listed}"
+        if key in self._optional:
+            return self._optional[key]
+        if not path.exists():
+            # schema v1 / feature unsupported: missing is normal
+            try:
+                sv = int(schema_version) if schema_version is not None else 1
+            except Exception:
+                sv = 1
+            if not manifest_listed and sv <= 1:
+                logger.debug("optional artifact missing (NOT_AVAILABLE): %s", path)
+                result = (NOT_AVAILABLE, None)
+            elif manifest_listed:
+                logger.warning("manifest lists artifact but file missing: %s", path)
+                result = ([], "MANIFEST_LISTED_BUT_MISSING")
+            else:
+                logger.info("optional artifact missing: %s", path)
+                result = (NOT_AVAILABLE, None)
+            self._optional[key] = result
+            return result
+        data = self.load_json(path)
+        if data is None:
+            logger.warning("JSON parse failed for optional artifact: %s", path)
+            result = ([], "JSON_PARSE_FAILED")
+            self._optional[key] = result
+            return result
+        if isinstance(data, list):
+            rows = [r for r in data if isinstance(r, dict)]
+        else:
+            rows = []
+        result = (rows, None)
+        self._optional[key] = result
+        return result
+
+
+def discover_post_run_diagnostics(
+    output_dir: Path,
+    *,
+    source_run_id: str,
+    market: str,
+    trade_date: str,
+    session: str,
+) -> Optional[Path]:
+    """Locate post_run_diagnostics/{MARKET}/{date}/{session}/{source_run_id}."""
+    root = (
+        Path(output_dir)
+        / "post_run_diagnostics"
+        / str(market).upper()
+        / str(trade_date)
+        / str(session).lower()
+        / str(source_run_id)
+    )
+    if root.is_dir() and (root / "diagnostics_manifest.json").exists():
+        return root
+    return None
+
+
+def evaluate_liquidity_shadow_trust(
+    run_dir: Path,
+    *,
+    output_dir: Optional[Path] = None,
+    cache: Optional[RunArtifactCache] = None,
+) -> Dict[str, Any]:
+    """Assess whether Liquidity Shadow results are trusted for quality aggregates."""
+    from screener_artifacts import (
+        LEGACY_LIQUIDITY_SHADOW_ARTIFACTS,
+        sha256_file,
+        verify_manifest_integrity,
+    )
+
+    cache = cache or RunArtifactCache()
+    run_dir = Path(run_dir)
+    man = cache.load_json(run_dir / "manifest.json") or {}
+    meta = cache.load_json(run_dir / "screener_run_meta.json") or {}
+    merged = merge_manifest_and_meta(
+        man if isinstance(man, dict) else {},
+        meta if isinstance(meta, dict) else {},
+    )
+    market = str(merged.get("market") or "")
+    trade_date = str(merged.get("trade_date") or "")
+    session = str(merged.get("session") or "pm")
+    run_id = str(merged.get("run_id") or run_dir.name)
+    out_dir = Path(output_dir or run_dir.parents[4] if len(run_dir.parents) >= 5 else run_dir)
+
+    # Prefer guessing output root: .../output/runs/decision/MKT/date/sess/run_id
+    try:
+        # run_dir = output/runs/decision/SP500/date/pm/run_id → parents[4]=output
+        guessed = run_dir.parents[4]
+        if (guessed / "runs").exists():
+            out_dir = guessed
+    except Exception:
+        pass
+    if output_dir is not None:
+        out_dir = Path(output_dir)
+
+    result: Dict[str, Any] = {
+        "trust_status": NOT_AVAILABLE,
+        "candidates": [],
+        "meta": NOT_AVAILABLE,
+        "diagnostics_dir": None,
+        "reasons": [],
+    }
+
+    # Legacy mutation detection inside DECISION run
+    ok, issues = verify_manifest_integrity(run_dir)
+    legacy_mut = [i for i in issues if i.startswith("LEGACY_POST_FINALIZE_MUTATION")]
+    sha_mismatches = [i for i in issues if i.startswith("SHA_MISMATCH")]
+    if legacy_mut or any(
+        (run_dir / n).exists()
+        and ((man.get("artifacts") or {}).get(n) or {}).get("row_count") == 0
+        for n in LEGACY_LIQUIDITY_SHADOW_ARTIFACTS
+    ):
+        # Extra check: empty digest in manifest but non-empty file
+        for n in LEGACY_LIQUIDITY_SHADOW_ARTIFACTS:
+            p = run_dir / n
+            if not p.exists():
+                continue
+            art = (man.get("artifacts") or {}).get(n) or {}
+            expected = art.get("sha256")
+            try:
+                actual = sha256_file(p)
+            except Exception:
+                actual = None
+            if expected and actual and expected != actual:
+                result["trust_status"] = "LIQUIDITY_SHADOW_UNTRUSTED"
+                result["reasons"].append("LEGACY_POST_FINALIZE_MUTATION_DETECTED")
+                result["reasons"].append("MANIFEST_SHA_MISMATCH")
+                # Still try to read but mark untrusted — exclude from performance
+                data = cache.load_json(p)
+                if isinstance(data, list):
+                    result["candidates"] = [r for r in data if isinstance(r, dict)]
+                return result
+
+    diag_dir = discover_post_run_diagnostics(
+        out_dir,
+        source_run_id=run_id,
+        market=market,
+        trade_date=trade_date,
+        session=session,
+    )
+    if diag_dir is None:
+        # No diagnostics — normal for legacy runs
+        result["trust_status"] = NOT_AVAILABLE
+        result["reasons"].append("POST_RUN_DIAGNOSTICS_MISSING")
+        return result
+
+    result["diagnostics_dir"] = str(diag_dir)
+    dman = cache.load_json(diag_dir / "diagnostics_manifest.json")
+    if not isinstance(dman, dict):
+        result["trust_status"] = UNTRUSTED
+        result["reasons"].append("DIAGNOSTICS_MANIFEST_INVALID")
+        return result
+
+    # Verify diagnostics artifact digests
+    arts = dman.get("artifacts") or {}
+    for name, info in arts.items():
+        if not isinstance(info, dict):
+            continue
+        p = diag_dir / name
+        if not p.exists():
+            result["trust_status"] = UNTRUSTED
+            result["reasons"].append(f"DIAGNOSTICS_MISSING:{name}")
+            return result
+        expected = info.get("sha256")
+        if expected:
+            actual = sha256_file(p)
+            if actual != expected:
+                result["trust_status"] = UNTRUSTED
+                result["reasons"].append(f"DIAGNOSTICS_SHA_MISMATCH:{name}")
+                return result
+
+    status = str(dman.get("status") or "")
+    liq_meta = cache.load_json(diag_dir / "liquidity_shadow_meta.json")
+    if isinstance(liq_meta, dict):
+        result["meta"] = liq_meta
+        status = str(liq_meta.get("status") or status)
+
+    cands_path = diag_dir / "screener_liquidity_shadow_candidates.json"
+    cands_data = cache.load_json(cands_path)
+    cands = [r for r in cands_data if isinstance(r, dict)] if isinstance(cands_data, list) else []
+
+    if status == "FAILED" or status.endswith("FAILED"):
+        result["trust_status"] = FAILED_STATUS
+        result["candidates"] = cands
+        result["reasons"].append("DIAGNOSTICS_FAILED")
+        return result
+
+    result["trust_status"] = TRUSTED
+    result["candidates"] = cands
+    result["status"] = status
+    return result
+
+
 def _meta_of(run_dir: Path) -> Dict[str, Any]:
     data = _load_json(run_dir / "screener_run_meta.json") or {}
     return data if isinstance(data, dict) else {}
@@ -496,6 +725,7 @@ def aggregate_quality_report(
     prev_prod: Optional[Set[str]] = None
     turnover_rates: List[float] = []
     score_series: List[Dict[str, Any]] = []
+    artifact_cache = RunArtifactCache()
 
     for run_dir in run_dirs:
         meta = _merged_of(Path(run_dir), merged_by_run)
@@ -505,8 +735,31 @@ def aggregate_quality_report(
         trade_date = str(meta.get("trade_date") or Path(run_dir).parent.parent.name)
         prod = _candidates_of(Path(run_dir), "screener_candidates.json")
         hc = _candidates_of(Path(run_dir), "screener_shadow_candidates.json")
-        elig = _candidates_of(Path(run_dir), "screener_eligible_shadow_candidates.json")
-        liq = _candidates_of(Path(run_dir), "screener_liquidity_shadow_candidates.json")
+        schema_v = meta.get("schema_version")
+        man = _manifest_of(Path(run_dir))
+        man_arts = man.get("artifacts") or {}
+        elig, _elig_note = artifact_cache.load_optional_list(
+            Path(run_dir) / "screener_eligible_shadow_candidates.json",
+            schema_version=schema_v,
+            manifest_listed="screener_eligible_shadow_candidates.json" in man_arts,
+            label="eligible_shadow",
+        )
+        if elig is NOT_AVAILABLE:
+            elig = []
+        liq_trust = evaluate_liquidity_shadow_trust(
+            Path(run_dir),
+            cache=artifact_cache,
+        )
+        liq = liq_trust.get("candidates") or []
+        if liq_trust.get("trust_status") in (
+            UNTRUSTED,
+            "LIQUIDITY_SHADOW_UNTRUSTED",
+            NOT_AVAILABLE,
+            FAILED_STATUS,
+        ):
+            # Exclude untrusted / missing / failed from frequency aggregates
+            if liq_trust.get("trust_status") != TRUSTED:
+                liq = []
         scores = _scores_of(Path(run_dir))
 
         prod_set = {_ticker(r) for r in prod if _ticker(r)}
@@ -516,7 +769,7 @@ def aggregate_quality_report(
             t = _ticker(r)
             if t:
                 hc_freq[t] += 1
-        for r in elig:
+        for r in elig if isinstance(elig, list) else []:
             t = _ticker(r)
             if t:
                 elig_freq[t] += 1
@@ -586,7 +839,21 @@ def aggregate_quality_report(
         avail = _optional_section(meta, "candidate_availability")
         shadow = _optional_section(meta, "shadow")
         elig_sh = _optional_section(meta, "eligible_shadow")
-        liq_sh = _optional_section(meta, "liquidity_shadow")
+        # Prefer trusted diagnostics meta over DECISION PENDING stub
+        if liq_trust.get("trust_status") == TRUSTED and isinstance(liq_trust.get("meta"), dict):
+            liq_sh = liq_trust["meta"]
+        elif liq_trust.get("trust_status") == NOT_AVAILABLE:
+            liq_sh = NOT_AVAILABLE
+        elif liq_trust.get("trust_status") == FAILED_STATUS:
+            liq_sh = {"status": FAILED_STATUS, "trust_status": FAILED_STATUS}
+        elif liq_trust.get("trust_status") in (UNTRUSTED, "LIQUIDITY_SHADOW_UNTRUSTED"):
+            liq_sh = {
+                "status": "LIQUIDITY_SHADOW_UNTRUSTED",
+                "trust_status": "LIQUIDITY_SHADOW_UNTRUSTED",
+                "reasons": liq_trust.get("reasons"),
+            }
+        else:
+            liq_sh = _optional_section(meta, "liquidity_shadow")
 
         def _shadow_count(section: Any, fallback_len: int) -> Any:
             if section is NOT_AVAILABLE:
@@ -615,8 +882,12 @@ def aggregate_quality_report(
                     avail.get("eligible_new_buy_count") if isinstance(avail, dict) else None
                 ),
                 "high_conviction_shadow_count": _shadow_count(shadow, len(hc)),
-                "eligible_shadow_count": _shadow_count(elig_sh, len(elig)),
+                "eligible_shadow_count": _shadow_count(
+                    elig_sh, len(elig) if isinstance(elig, list) else 0
+                ),
                 "liquidity_shadow_count": _shadow_count(liq_sh, len(liq)),
+                "liquidity_shadow_trust": liq_trust.get("trust_status"),
+                "liquidity_shadow_reasons": liq_trust.get("reasons") or [],
                 "stage_drop_summary": _optional_section(meta, "stage_drop_summary"),
                 "exclusion_summary": _optional_section(meta, "exclusion_summary"),
                 "candidate_availability": avail,
@@ -816,7 +1087,12 @@ def upsert_observation_ledger(
     return len(existing)
 
 
-def build_observation_rows_from_run(run_dir: Path) -> List[Dict[str, Any]]:
+def build_observation_rows_from_run(
+    run_dir: Path,
+    *,
+    cache: Optional[RunArtifactCache] = None,
+) -> List[Dict[str, Any]]:
+    cache = cache or RunArtifactCache()
     meta = _merged_of(Path(run_dir))
     run_id = str(meta.get("run_id") or Path(run_dir).name)
     trade_date = str(meta.get("trade_date") or "")
@@ -852,8 +1128,17 @@ def build_observation_rows_from_run(run_dir: Path) -> List[Dict[str, Any]]:
     rd = Path(run_dir)
     _add(_candidates_of(rd, "screener_candidates.json"), "PRODUCTION")
     _add(_candidates_of(rd, "screener_shadow_candidates.json"), "HIGH_CONVICTION_SHADOW")
-    _add(_candidates_of(rd, "screener_eligible_shadow_candidates.json"), "ELIGIBLE_SHADOW")
-    _add(_candidates_of(rd, "screener_liquidity_shadow_candidates.json"), "LIQUIDITY_SHADOW")
+    elig, _ = cache.load_optional_list(
+        rd / "screener_eligible_shadow_candidates.json",
+        schema_version=meta.get("schema_version"),
+        manifest_listed="screener_eligible_shadow_candidates.json"
+        in ((_manifest_of(rd).get("artifacts") or {})),
+    )
+    if isinstance(elig, list):
+        _add(elig, "ELIGIBLE_SHADOW")
+    liq_trust = evaluate_liquidity_shadow_trust(rd, cache=cache)
+    if liq_trust.get("trust_status") == TRUSTED:
+        _add(list(liq_trust.get("candidates") or []), "LIQUIDITY_SHADOW")
     return rows
 
 

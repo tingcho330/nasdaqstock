@@ -38,6 +38,7 @@ RUN_MODE_REPLAY = "REPLAY"
 REPLAY_TYPE_CURRENT = "CURRENT_DATA_RECALCULATION"
 REPLAY_TYPE_FROZEN = "FROZEN_INPUT_REPLAY"
 
+# Production DECISION run artifacts (Liquidity Shadow lives under post_run_diagnostics/)
 ARTIFACT_NAMES = (
     "manifest.json",
     "screener_run_meta.json",
@@ -47,12 +48,19 @@ ARTIFACT_NAMES = (
     "screener_candidates.json",
     "screener_shadow_candidates.json",
     "screener_eligible_shadow_candidates.json",
-    "screener_liquidity_shadow_scores.json",
-    "screener_liquidity_shadow_candidates.json",
     "screener_holdings.json",
     "market_state.json",
     "screener.log",
 )
+
+# Legacy filenames that may exist inside older DECISION runs (untrusted for quality).
+LEGACY_LIQUIDITY_SHADOW_ARTIFACTS = (
+    "screener_liquidity_shadow_scores.json",
+    "screener_liquidity_shadow_candidates.json",
+)
+
+FINALIZED_MARKER = ".finalized"
+DIAGNOSTICS_MANIFEST_SCHEMA = 1
 
 FIXED_PREFIXES = (
     "screener_run_meta",
@@ -157,6 +165,11 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: f.read(1024 * 1024), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def compute_artifact_sha256(path: Path) -> str:
+    """Alias for sha256_file — preferred name for integrity helpers."""
+    return sha256_file(Path(path))
 
 
 def sha256_json_payload(payload: Any) -> str:
@@ -456,6 +469,27 @@ def runs_root(output_dir: Optional[Path] = None) -> Path:
     return Path(output_dir or OUTPUT_DIR) / "runs"
 
 
+def post_run_diagnostics_root(output_dir: Optional[Path] = None) -> Path:
+    return Path(output_dir or OUTPUT_DIR) / "post_run_diagnostics"
+
+
+def diagnostics_directory(
+    *,
+    market: str,
+    trade_date: str,
+    session: str,
+    source_run_id: str,
+    output_dir: Optional[Path] = None,
+) -> Path:
+    return (
+        post_run_diagnostics_root(output_dir)
+        / str(market).upper()
+        / str(trade_date)
+        / str(session).lower()
+        / str(source_run_id)
+    )
+
+
 def run_directory(
     *,
     market: str,
@@ -474,6 +508,123 @@ def run_directory(
         / str(session).lower()
         / str(run_id)
     )
+
+
+def is_finalized_run(run_dir: Path) -> bool:
+    """True when a published immutable run directory exists."""
+    run_dir = Path(run_dir)
+    if not run_dir.is_dir():
+        return False
+    marker = run_dir / FINALIZED_MARKER
+    if marker.exists():
+        return True
+    man_path = run_dir / "manifest.json"
+    if not man_path.exists():
+        return False
+    try:
+        with open(man_path, "r", encoding="utf-8") as f:
+            man = json.load(f)
+        if isinstance(man, dict) and man.get("immutable") is True:
+            return True
+        # Published DECISION/REPLAY dirs always have a manifest; treat as finalized
+        # when not under a staging prefix.
+        if run_dir.name.startswith(".staging-"):
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def reject_post_finalize_write(run_dir: Path, *, target: Optional[Path] = None) -> None:
+    """Raise ArtifactError if attempting to write into a finalized run directory."""
+    run_dir = Path(run_dir)
+    if not is_finalized_run(run_dir):
+        return
+    hint = f" target={target}" if target is not None else ""
+    raise ArtifactError(
+        f"post-finalize write rejected for immutable run directory: {run_dir}{hint}"
+    )
+
+
+def assert_run_directory_immutable(run_dir: Path) -> None:
+    """Verify finalized run is marked immutable and manifest is present."""
+    run_dir = Path(run_dir)
+    if not is_finalized_run(run_dir):
+        raise ArtifactError(f"run directory is not finalized/immutable: {run_dir}")
+    man_path = run_dir / "manifest.json"
+    if not man_path.exists():
+        raise ArtifactError(f"finalized run missing manifest.json: {run_dir}")
+
+
+def verify_manifest_integrity(run_dir: Path) -> Tuple[bool, List[str]]:
+    """Compare manifest artifact digests against on-disk files.
+
+    Returns (ok, list_of_issues). Does not mutate anything.
+    """
+    run_dir = Path(run_dir)
+    man_path = run_dir / "manifest.json"
+    issues: List[str] = []
+    if not man_path.exists():
+        return False, ["MANIFEST_MISSING"]
+    try:
+        with open(man_path, "r", encoding="utf-8") as f:
+            man = json.load(f)
+    except Exception as e:
+        return False, [f"MANIFEST_READ_FAILED:{e}"]
+    if not isinstance(man, dict):
+        return False, ["MANIFEST_NOT_DICT"]
+    artifacts = man.get("artifacts") or {}
+    if not isinstance(artifacts, dict):
+        return False, ["ARTIFACTS_SECTION_INVALID"]
+    for name, info in artifacts.items():
+        path = run_dir / name
+        if not path.exists():
+            issues.append(f"MISSING:{name}")
+            continue
+        if not isinstance(info, dict):
+            continue
+        expected = info.get("sha256")
+        if expected:
+            actual = sha256_file(path)
+            if actual != expected:
+                issues.append(f"SHA_MISMATCH:{name}")
+        exp_rc = info.get("row_count")
+        if exp_rc is not None:
+            actual_rc = file_row_count(path)
+            if actual_rc is not None and int(actual_rc) != int(exp_rc):
+                issues.append(f"ROW_COUNT_MISMATCH:{name}")
+    # Detect legacy post-finalize liquidity mutation: file present with non-empty
+    # content while manifest recorded empty/missing liquidity digests.
+    for legacy_name in LEGACY_LIQUIDITY_SHADOW_ARTIFACTS:
+        path = run_dir / legacy_name
+        if not path.exists():
+            continue
+        info = artifacts.get(legacy_name) or {}
+        expected = info.get("sha256")
+        actual = sha256_file(path)
+        if expected and expected != actual:
+            issues.append(f"LEGACY_POST_FINALIZE_MUTATION_DETECTED:{legacy_name}")
+        elif legacy_name not in artifacts:
+            # File appeared after finalize without being in manifest
+            issues.append(f"LEGACY_POST_FINALIZE_MUTATION_DETECTED:{legacy_name}")
+    return (len(issues) == 0), issues
+
+
+def directory_sha_snapshot(root: Path) -> Dict[str, str]:
+    """Map relative file paths → sha256 for all regular files under root."""
+    root = Path(root)
+    out: Dict[str, str] = {}
+    if not root.exists():
+        return out
+    for path in sorted(root.rglob("*")):
+        if not path.is_file():
+            continue
+        # Marker file is allowed after finalize and is not part of manifest digests
+        if path.name == FINALIZED_MARKER:
+            continue
+        rel = str(path.relative_to(root)).replace("\\", "/")
+        out[rel] = sha256_file(path)
+    return out
 
 
 def latest_decision_pointer_path(
@@ -595,6 +746,8 @@ class ScreenerRunWriter:
         return self.staging_dir / name
 
     def write_json(self, name: str, payload: Any) -> Path:
+        if self.published:
+            reject_post_finalize_write(self.final_dir, target=self.final_dir / name)
         p = self.path(name)
         p.parent.mkdir(parents=True, exist_ok=True)
         atomic_write_json(p, payload)
@@ -602,6 +755,8 @@ class ScreenerRunWriter:
         return p
 
     def write_text(self, name: str, text: str) -> Path:
+        if self.published:
+            reject_post_finalize_write(self.final_dir, target=self.final_dir / name)
         p = self.path(name)
         p.parent.mkdir(parents=True, exist_ok=True)
         atomic_write_text(p, text)
@@ -642,6 +797,7 @@ class ScreenerRunWriter:
         git_commit: Optional[str],
         git_commit_error: Optional[str] = None,
         extra: Optional[Dict[str, Any]] = None,
+        post_run_diagnostics_expected: bool = True,
     ) -> Dict[str, Any]:
         artifacts = self.artifact_digest_map()
         # include review/meta if written under alternate names
@@ -652,8 +808,6 @@ class ScreenerRunWriter:
             "screener_candidates_full.json",
             "screener_shadow_candidates.json",
             "screener_eligible_shadow_candidates.json",
-            "screener_liquidity_shadow_scores.json",
-            "screener_liquidity_shadow_candidates.json",
             "screener_holdings.json",
             "market_state.json",
             "screener_review.md",
@@ -705,6 +859,16 @@ class ScreenerRunWriter:
             "artifacts": artifacts,
             "policy_reason": self.policy.reason,
             "policy_warnings": list(self.policy.warnings),
+            "immutable": True,
+            "post_run_diagnostics_expected": bool(
+                post_run_diagnostics_expected and self.run_mode == RUN_MODE_DECISION
+            ),
+            "post_run_diagnostics_path": None,
+            "post_run_diagnostics_status": (
+                "PENDING"
+                if (post_run_diagnostics_expected and self.run_mode == RUN_MODE_DECISION)
+                else "NOT_APPLICABLE"
+            ),
         }
         if extra:
             if "build_identity" not in extra and git_commit is not None:
@@ -721,12 +885,163 @@ class ScreenerRunWriter:
             raise ArtifactError("run already published")
         if self.final_dir.exists():
             raise ArtifactError(f"refusing to overwrite existing run dir: {self.final_dir}")
+        # Ensure immutable flags are present before publish
+        if "immutable" not in manifest:
+            manifest = dict(manifest)
+            manifest["immutable"] = True
         self.write_json("manifest.json", manifest)
         # Final atomic publish
         os.replace(str(self.staging_dir), str(self.final_dir))
         self.published = True
         self.status = str(manifest.get("status") or self.status)
         self.staging_dir = self.final_dir  # subsequent paths resolve to final
+        # Marker outside manifest digests — write after rename so it is not hashed
+        try:
+            marker = self.final_dir / FINALIZED_MARKER
+            marker.write_text("1\n", encoding="utf-8")
+        except Exception as e:
+            logger.warning("failed to write finalize marker: %s", e)
+        return self.final_dir
+
+    def abandon_staging(self) -> None:
+        if self.published:
+            return
+        try:
+            if self.staging_dir.exists():
+                shutil.rmtree(self.staging_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+
+@dataclass
+class PostRunDiagnosticsWriter:
+    """Stage post-run diagnostics under a temp dir, then atomically publish."""
+
+    output_dir: Path
+    market: str
+    trade_date: str
+    session: str
+    source_run_id: str
+    source_decision_manifest_sha256: Optional[str]
+    started_at_kst: str
+    staging_dir: Path = field(init=False)
+    final_dir: Path = field(init=False)
+    published: bool = False
+    _files: Dict[str, Path] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.output_dir = Path(self.output_dir)
+        parent = (
+            post_run_diagnostics_root(self.output_dir)
+            / self.market
+            / self.trade_date
+            / self.session
+        )
+        parent.mkdir(parents=True, exist_ok=True)
+        self.final_dir = parent / self.source_run_id
+        if self.final_dir.exists():
+            raise ArtifactError(f"diagnostics directory already exists: {self.final_dir}")
+        self.staging_dir = parent / f".staging-diag-{self.source_run_id}-{secrets.token_hex(2)}"
+        self.staging_dir.mkdir(parents=True, exist_ok=False)
+        (self.staging_dir / "logs").mkdir(parents=True, exist_ok=True)
+
+    def path(self, name: str) -> Path:
+        return self.staging_dir / name
+
+    def write_json(self, name: str, payload: Any) -> Path:
+        if self.published:
+            reject_post_finalize_write(self.final_dir, target=self.final_dir / name)
+        p = self.path(name)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_json(p, payload)
+        self._files[name] = p
+        return p
+
+    def write_text(self, name: str, text: str) -> Path:
+        if self.published:
+            reject_post_finalize_write(self.final_dir, target=self.final_dir / name)
+        p = self.path(name)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(p, text)
+        self._files[name] = p
+        return p
+
+    def artifact_digest_map(self) -> Dict[str, Dict[str, Any]]:
+        out: Dict[str, Dict[str, Any]] = {}
+        for name, path in sorted(self._files.items()):
+            if name == "diagnostics_manifest.json":
+                continue
+            if not path.exists():
+                continue
+            info: Dict[str, Any] = {"sha256": sha256_file(path)}
+            rc = file_row_count(path)
+            if rc is not None:
+                info["row_count"] = rc
+            out[name] = info
+        return out
+
+    def build_manifest(
+        self,
+        *,
+        status: str,
+        completed_at_kst: str,
+        diagnostic_types: Optional[List[str]] = None,
+        diagnostics_run_id: Optional[str] = None,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        artifacts = self.artifact_digest_map()
+        for fname in (
+            "screener_liquidity_shadow_scores.json",
+            "screener_liquidity_shadow_candidates.json",
+            "liquidity_shadow_meta.json",
+            "liquidity_shadow_review.md",
+            "logs/liquidity_shadow.log",
+        ):
+            p = self.path(fname)
+            if p.exists() and fname not in artifacts:
+                info: Dict[str, Any] = {"sha256": sha256_file(p)}
+                rc = file_row_count(p)
+                if rc is not None:
+                    info["row_count"] = rc
+                artifacts[fname] = info
+        man: Dict[str, Any] = {
+            "schema_version": DIAGNOSTICS_MANIFEST_SCHEMA,
+            "diagnostics_run_id": diagnostics_run_id
+            or f"diag-{self.source_run_id}-{secrets.token_hex(3)}",
+            "source_decision_run_id": self.source_run_id,
+            "source_decision_manifest_sha256": self.source_decision_manifest_sha256,
+            "market": self.market,
+            "trade_date": self.trade_date,
+            "session": self.session,
+            "started_at_kst": self.started_at_kst,
+            "completed_at_kst": completed_at_kst,
+            "status": status,
+            "diagnostic_types": list(diagnostic_types or ["LIQUIDITY_SHADOW"]),
+            "used_by_trader": False,
+            "immutable": True,
+            "diagnostics_directory": str(self.final_dir),
+            "artifacts": artifacts,
+        }
+        if extra:
+            man.update(extra)
+        return man
+
+    def publish(self, manifest: Dict[str, Any]) -> Path:
+        if self.published:
+            raise ArtifactError("diagnostics already published")
+        if self.final_dir.exists():
+            raise ArtifactError(f"refusing to overwrite existing diagnostics dir: {self.final_dir}")
+        if "immutable" not in manifest:
+            manifest = dict(manifest)
+            manifest["immutable"] = True
+        self.write_json("diagnostics_manifest.json", manifest)
+        os.replace(str(self.staging_dir), str(self.final_dir))
+        self.published = True
+        self.staging_dir = self.final_dir
+        try:
+            (self.final_dir / FINALIZED_MARKER).write_text("1\n", encoding="utf-8")
+        except Exception as e:
+            logger.warning("failed to write diagnostics finalize marker: %s", e)
         return self.final_dir
 
     def abandon_staging(self) -> None:

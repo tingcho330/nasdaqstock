@@ -7,6 +7,12 @@ x-common: &common
   restart: always
   env_file:
     - ./config/.env
+  environment:
+    # Optional build identity (container usually has no .git). Unset → unavailable, never fails.
+    APP_GIT_COMMIT: ${APP_GIT_COMMIT:-}
+    APP_IMAGE_TAG: ${APP_IMAGE_TAG:-}
+    APP_BUILD_TIME: ${APP_BUILD_TIME:-}
+    APP_VERSION: ${APP_VERSION:-}
   volumes:
     - ./src:/app/src
     - ./config:/app/config

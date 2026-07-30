@@ -7,7 +7,7 @@ import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Dict, Optional, List, Any, Tuple
+from typing import Dict, Optional, List, Any, Tuple, Set
 from pathlib import Path
 import threading
 from collections import defaultdict
@@ -75,9 +75,11 @@ from screener_ops import (
 from screener_artifacts import (
     ArtifactError,
     FrozenReplayNotImplemented,
+    PostRunDiagnosticsWriter,
     ScreenerRunWriter,
     build_score_features_snapshot,
     clarify_regime_fields,
+    directory_sha_snapshot,
     generate_run_id,
     get_git_commit,
     production_fixed_exists,
@@ -95,13 +97,15 @@ from screener_diagnostics import (
     classify_empty_result_v2,
     compute_eligible_shadow,
     compute_exclusion_summary,
+    compute_liquidity_shadow_candidates,
     compute_liquidity_shadow_universe,
     compute_market_regime_shadow,
     compute_price_diagnostics,
     compute_stage_drop_summary,
     evaluate_diagnostic_flags,
-    select_liquidity_shadow_candidates,
     summarize_diagnostics,
+    summarize_liquidity_shadow_meta,
+    write_liquidity_shadow_review,
 )
 
 # 시장 분석 모듈 (screener_core에서 통합)
@@ -2831,6 +2835,417 @@ def diversify_by_sector(df_sorted: pd.DataFrame, top_n: int, sector_cap: float) 
     final_df = df_sorted.loc[selected_idx]
     return final_df.head(top_n)
 
+
+def _score_status_from_fail_reason(reason: Optional[str]) -> str:
+    r = str(reason or "").upper()
+    if r in ("NO_PRICE_DATA", "INSUFFICIENT_HISTORY", "SKIPPED_SHORT_HISTORY", "NEWLY_LISTED"):
+        return "DATA_UNAVAILABLE"
+    if r in ("TIMEOUT_ERROR", "TIMEOUT"):
+        return "API_FAILED"
+    if r in ("INVALID_CODE", "INDICATOR_CALC_ERROR", "INSUFFICIENT_DATA"):
+        return "INVALID_FEATURES"
+    if r:
+        return "API_FAILED"
+    return "API_FAILED"
+
+
+def run_liquidity_shadow_post_diagnostics(
+    *,
+    writer: ScreenerRunWriter,
+    liq_policy: Dict[str, Any],
+    amount_map: Dict[str, float],
+    production_amount5d_threshold: float,
+    scores_records: List[Dict[str, Any]],
+    production_tickers: Set[str],
+    eligible_shadow_tickers: Set[str],
+    production_candidate_count: int,
+    trade_date: str,
+    market: str,
+    screener_params: Dict[str, Any],
+    risk_params: Dict[str, Any],
+    market_score: float,
+    sector_trends: Dict[str, float],
+    listing_df: Optional[pd.DataFrame],
+    held_tickers: Optional[Set[str]],
+    issuer_map: Optional[Dict[str, str]],
+    workers: int,
+    score_fn: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Score Liquidity Shadow universe and publish under post_run_diagnostics/.
+
+    Never mutates the finalized DECISION run directory.
+    """
+    if writer is None or not writer.published:
+        raise ArtifactError("Liquidity Shadow requires a published DECISION/REPLAY run")
+
+    liq_t0 = time.perf_counter()
+    started_at = datetime.now(KST).isoformat()
+    log_lines: List[str] = []
+    warnings: List[str] = []
+    errors: List[str] = []
+
+    def _log(msg: str) -> None:
+        log_lines.append(msg)
+        logger.info("[LIQUIDITY_SHADOW] %s", msg)
+
+    source_manifest_sha = None
+    man_path = writer.final_dir / "manifest.json"
+    if man_path.exists():
+        source_manifest_sha = sha256_file(man_path)
+
+    universe, liq_meta = compute_liquidity_shadow_universe(
+        amount_map,
+        policy=liq_policy,
+        production_threshold=production_amount5d_threshold,
+    )
+    scored_lookup = {str(r.get("ticker") or "").upper(): r for r in (scores_records or [])}
+    budget = float(liq_policy.get("time_budget_sec", 90) or 90)
+    kis_conc = 2
+    try:
+        from utils import get_cfg as _get_cfg
+
+        settings = _get_cfg() or {}
+        kis_conc = int((settings.get("kis_limits") or {}).get("max_concurrency", 2) or 2)
+    except Exception:
+        pass
+    actual_workers = max(1, min(int(workers or 1), kis_conc, MAX_WORKERS_HARD_CAP))
+
+    shadow_only = [t for t in universe if t not in scored_lookup]
+    production_reused = [t for t in universe if t in scored_lookup]
+    _log(
+        f"universe={len(universe)} reused={len(production_reused)} "
+        f"shadow_only={len(shadow_only)} budget_sec={budget} workers={actual_workers}"
+    )
+
+    # Build enrichment rows for shadow-only from listing when available
+    listing = listing_df if listing_df is not None else pd.DataFrame()
+    score_callable = score_fn or _calculate_scores_for_ticker
+
+    # Prefetch fundamentals for shadow-only within budget
+    fin_by_ticker: Dict[str, pd.Series] = {}
+    if shadow_only and not listing.empty:
+        try:
+            # Prefer existing columns on listing
+            for t in shadow_only:
+                if t in listing.index:
+                    fin_by_ticker[t] = listing.loc[t]
+            missing_for_fund = [t for t in shadow_only if t not in fin_by_ticker]
+            if missing_for_fund and time.perf_counter() - liq_t0 < budget * 0.3:
+                fund = get_fundamentals(
+                    trade_date, market, tickers=missing_for_fund[: len(shadow_only)], kis=_KIS_INSTANCE
+                )
+                if fund is not None and not fund.empty:
+                    for t in missing_for_fund:
+                        if t in fund.index:
+                            base = fin_by_ticker.get(t)
+                            if base is None and t in listing.index:
+                                base = listing.loc[t]
+                            if base is not None:
+                                merged = base.copy()
+                                for col in ("PER", "PBR"):
+                                    if col in fund.columns:
+                                        merged[col] = fund.loc[t, col]
+                                fin_by_ticker[t] = merged
+                            else:
+                                fin_by_ticker[t] = fund.loc[t]
+        except Exception as e:
+            warnings.append(f"FUNDAMENTALS_PARTIAL:{type(e).__name__}")
+            _log(f"fundamentals prefetch warning: {e}")
+
+    raw_rows: List[Dict[str, Any]] = []
+    time_budget_exceeded = False
+
+    # Reuse production scores first
+    for t in production_reused:
+        rec = dict(scored_lookup[t])
+        rec["ticker"] = t
+        rec["score_status"] = "SUCCESS"
+        rec["failure_reason"] = None
+        rec["score_reused"] = True
+        raw_rows.append(rec)
+
+    # Score shadow-only with deadline-aware executor
+    pending = list(shadow_only)
+    if pending:
+        remaining_budget = budget - (time.perf_counter() - liq_t0)
+        if remaining_budget <= 0:
+            time_budget_exceeded = True
+            for t in pending:
+                raw_rows.append(
+                    {
+                        "ticker": t,
+                        "score": None,
+                        "Score": None,
+                        "amount5d": amount_map.get(t),
+                        "score_status": "TIME_BUDGET_EXCEEDED",
+                        "failure_reason": "TIME_BUDGET_EXCEEDED",
+                        "used_by_trader": False,
+                        "diagnostic_only": True,
+                    }
+                )
+            pending = []
+
+    if pending:
+        with ThreadPoolExecutor(max_workers=actual_workers) as ex:
+            futs = {}
+            for t in pending:
+                if time.perf_counter() - liq_t0 > budget:
+                    time_budget_exceeded = True
+                    break
+                fin = fin_by_ticker.get(t)
+                if fin is None:
+                    # Minimal series so scorer can still attempt OHLCV-based score
+                    fin = pd.Series(
+                        {
+                            "Name": t,
+                            "Sector": "N/A",
+                            "Marcap": 0,
+                            "PER": np.nan,
+                            "PBR": np.nan,
+                            "Amount5D": amount_map.get(t),
+                        }
+                    )
+                elif "Amount5D" not in fin.index:
+                    fin = fin.copy()
+                    fin["Amount5D"] = amount_map.get(t)
+                futs[
+                    ex.submit(
+                        score_callable,
+                        t,
+                        trade_date,
+                        fin,
+                        screener_params,
+                        market_score,
+                        sector_trends,
+                        risk_params,
+                        market,
+                    )
+                ] = t
+
+            completed: Set[str] = set()
+            for fut in as_completed(futs):
+                t = futs[fut]
+                if time.perf_counter() - liq_t0 > budget:
+                    time_budget_exceeded = True
+                try:
+                    res = fut.result(timeout=1)
+                except Exception as e:
+                    raw_rows.append(
+                        {
+                            "ticker": t,
+                            "score": None,
+                            "Score": None,
+                            "amount5d": amount_map.get(t),
+                            "score_status": "API_FAILED",
+                            "failure_reason": f"{type(e).__name__}:{str(e)[:120]}",
+                            "used_by_trader": False,
+                            "diagnostic_only": True,
+                        }
+                    )
+                    completed.add(t)
+                    continue
+                completed.add(t)
+                if not res:
+                    raw_rows.append(
+                        {
+                            "ticker": t,
+                            "score": None,
+                            "Score": None,
+                            "amount5d": amount_map.get(t),
+                            "score_status": "DATA_UNAVAILABLE",
+                            "failure_reason": "SCORER_RETURNED_NONE",
+                            "used_by_trader": False,
+                            "diagnostic_only": True,
+                        }
+                    )
+                    continue
+                score = res.get("Score")
+                raw_rows.append(
+                    {
+                        "ticker": t,
+                        "Ticker": t,
+                        "name": res.get("Name"),
+                        "Name": res.get("Name"),
+                        "sector": res.get("Sector"),
+                        "Sector": res.get("Sector"),
+                        "score": score,
+                        "Score": score,
+                        "fin_score": res.get("FinScore"),
+                        "tech_score": res.get("TechScore"),
+                        "market_score": res.get("MktScore"),
+                        "sector_score": res.get("SectorScore"),
+                        "vol_kki": res.get("VolKki"),
+                        "pos_52w": res.get("Pos52w"),
+                        "pattern_score": res.get("PatternScore"),
+                        "rsi": res.get("RSI"),
+                        "atr": res.get("ATR"),
+                        "ma50": res.get("MA50"),
+                        "ma200": res.get("MA200"),
+                        "per": res.get("PER"),
+                        "pbr": res.get("PBR"),
+                        "price": res.get("Price"),
+                        "exclude_reasons": list(res.get("exclude_reasons") or []),
+                        "exclusion_reasons": list(res.get("exclude_reasons") or []),
+                        "amount5d": amount_map.get(t),
+                        "score_status": "SUCCESS",
+                        "failure_reason": None,
+                        "score_reused": False,
+                        "used_by_trader": False,
+                        "diagnostic_only": True,
+                    }
+                )
+
+            # Mark unsubmitted / incomplete as TIME_BUDGET or NOT_RUN
+            for t in pending:
+                if t in completed:
+                    continue
+                status = "TIME_BUDGET_EXCEEDED" if time_budget_exceeded else "NOT_RUN"
+                raw_rows.append(
+                    {
+                        "ticker": t,
+                        "score": None,
+                        "Score": None,
+                        "amount5d": amount_map.get(t),
+                        "score_status": status,
+                        "failure_reason": status,
+                        "used_by_trader": False,
+                        "diagnostic_only": True,
+                    }
+                )
+
+    shadow_thr = float(liq_meta.get("shadow_liquidity_threshold") or 0)
+    annotated = build_liquidity_shadow_rows(
+        scored_rows=raw_rows,
+        amount_by_ticker=amount_map,
+        production_threshold=production_amount5d_threshold,
+        shadow_threshold=shadow_thr,
+        production_tickers=production_tickers,
+        eligible_shadow_tickers=eligible_shadow_tickers,
+        liquidity_shadow_candidate_tickers=set(),
+    )
+
+    candidates, cand_meta = compute_liquidity_shadow_candidates(
+        annotated,
+        policy=liq_policy,
+        production_threshold=float(
+            screener_params.get("min_score_threshold")
+            or (screener_params.get("score_threshold_policy") or {}).get("static_threshold")
+            or 0.48
+        ),
+        production_tickers=production_tickers,
+        diversify_fn=diversify_by_sector,
+        sector_cap=float(screener_params.get("sector_cap", 0.35) or 0.35),
+        issuer_map=issuer_map or {},
+        held_tickers=held_tickers or set(),
+        rsi_overheated_threshold=float(
+            screener_params.get("rsi_overheated_threshold", 70.0) or 70.0
+        ),
+    )
+    cand_tickers = {
+        str(c.get("ticker") or c.get("Ticker") or "").upper() for c in candidates if c
+    }
+    # Re-stamp candidate flags on score rows
+    annotated = build_liquidity_shadow_rows(
+        scored_rows=annotated,
+        amount_by_ticker=amount_map,
+        production_threshold=production_amount5d_threshold,
+        shadow_threshold=shadow_thr,
+        production_tickers=production_tickers,
+        eligible_shadow_tickers=eligible_shadow_tickers,
+        liquidity_shadow_candidate_tickers=cand_tickers,
+    )
+
+    meta = summarize_liquidity_shadow_meta(
+        base_meta=liq_meta,
+        universe=universe,
+        score_rows=annotated,
+        candidates=candidates,
+        candidate_meta=cand_meta,
+        production_reused=len(production_reused),
+        shadow_only_requested=len(shadow_only),
+        duration_sec=time.perf_counter() - liq_t0,
+        time_budget_exceeded=time_budget_exceeded,
+        warnings=warnings,
+        errors=errors,
+    )
+    meta["score_threshold"] = cand_meta.get("score_threshold")
+    meta["score_threshold_mode"] = cand_meta.get("score_threshold_mode")
+    meta["enabled"] = bool(liq_policy.get("enabled", True))
+
+    # Invariant checks
+    u = int(meta.get("universe_count") or 0)
+    if u != int(meta.get("scored_count") or 0) + int(meta.get("failed_count") or 0) + int(
+        meta.get("unscored_count") or 0
+    ):
+        warnings.append("UNIVERSE_COUNT_INVARIANT_MISMATCH")
+        meta["warnings"] = list(dict.fromkeys([*(meta.get("warnings") or []), *warnings]))
+    if int(meta.get("candidate_count") or 0) != len(candidates):
+        meta["candidate_count"] = len(candidates)
+    if any(not c.get("liquidity_shadow_candidate") for c in candidates):
+        for c in candidates:
+            c["liquidity_shadow_candidate"] = True
+
+    diag_writer = None
+    try:
+        diag_writer = PostRunDiagnosticsWriter(
+            output_dir=writer.output_dir,
+            market=writer.market,
+            trade_date=writer.trade_date,
+            session=writer.session,
+            source_run_id=writer.run_id,
+            source_decision_manifest_sha256=source_manifest_sha,
+            started_at_kst=started_at,
+        )
+        diag_writer.write_json("screener_liquidity_shadow_scores.json", annotated)
+        diag_writer.write_json("screener_liquidity_shadow_candidates.json", candidates)
+        diag_writer.write_json("liquidity_shadow_meta.json", meta)
+        diag_writer.write_text("logs/liquidity_shadow.log", "\n".join(log_lines) + "\n")
+        completed_at = datetime.now(KST).isoformat()
+        # Review first (without diagnostics_run_id), then manifest
+        review_path = diag_writer.path("liquidity_shadow_review.md")
+        # Build manifest after artifacts are written
+        man = diag_writer.build_manifest(
+            status=str(meta.get("status") or "FAILED"),
+            completed_at_kst=completed_at,
+            diagnostic_types=["LIQUIDITY_SHADOW"],
+        )
+        write_liquidity_shadow_review(
+            review_path,
+            source_run_id=writer.run_id,
+            trade_date=trade_date,
+            production_candidate_count=production_candidate_count,
+            production_amount5d_threshold=production_amount5d_threshold,
+            source_manifest_sha256=source_manifest_sha,
+            meta=meta,
+            candidates=candidates,
+            diagnostics_manifest=man,
+        )
+        diag_writer._files["liquidity_shadow_review.md"] = review_path
+        # Rebuild manifest to include review digest
+        man = diag_writer.build_manifest(
+            status=str(meta.get("status") or "FAILED"),
+            completed_at_kst=completed_at,
+            diagnostic_types=["LIQUIDITY_SHADOW"],
+            diagnostics_run_id=man.get("diagnostics_run_id"),
+        )
+        published = diag_writer.publish(man)
+        _log(f"published diagnostics={published} status={meta.get('status')} candidates={len(candidates)}")
+        meta["diagnostics_directory"] = str(published)
+        meta["diagnostics_manifest_sha256"] = sha256_file(published / "diagnostics_manifest.json")
+        return meta
+    except Exception as e:
+        logger.warning("Liquidity Shadow diagnostics publish failed (Production unchanged): %s", e)
+        if diag_writer is not None:
+            try:
+                diag_writer.abandon_staging()
+            except Exception:
+                pass
+        meta["status"] = "FAILED"
+        meta["errors"] = [*(meta.get("errors") or []), str(e)]
+        meta["used_by_trader"] = False
+        return meta
+
+
 # ─────────── 메인 실행 ───────────
 def run_screener(
     date_str: str,
@@ -3319,8 +3734,6 @@ def run_screener(
             for name in ("screener_candidates_full.json", "screener_candidates.json", "screener_scores.json"):
                 writer.write_json(name, [])
             writer.write_json("screener_eligible_shadow_candidates.json", [])
-            writer.write_json("screener_liquidity_shadow_scores.json", [])
-            writer.write_json("screener_liquidity_shadow_candidates.json", [])
             _persist_run_meta(
                 status="SUCCESS",
                 result_status="EMPTY_DATA_QUALITY",
@@ -4093,9 +4506,7 @@ def run_screener(
         writer.write_json("screener_scores.json", scores_records)
         writer.write_json("screener_shadow_candidates.json", shadow_payload_rows)
         writer.write_json("screener_eligible_shadow_candidates.json", eligible_shadow_rows)
-        # Placeholder liquidity artifacts (filled after Production finalize when possible)
-        writer.write_json("screener_liquidity_shadow_scores.json", [])
-        writer.write_json("screener_liquidity_shadow_candidates.json", [])
+        # Liquidity Shadow artifacts are written under post_run_diagnostics/ after finalize
 
         if holdings_scores:
             holdings_list = list(holdings_scores.values())
@@ -4154,11 +4565,19 @@ def run_screener(
                 len(scores_records),
             )
 
-        # Snapshot Production candidate SHA before liquidity shadow (must remain unchanged)
+        # Snapshot Production candidate SHA from staging before finalize
         prod_cands_path = writer.path("screener_candidates.json")
         prod_sha_before_liq = sha256_file(prod_cands_path) if prod_cands_path.exists() else None
 
         top_score_rows = scores_records[:10]
+        # DECISION meta records expected post-run diagnostics as PENDING (not live results)
+        liquidity_shadow_meta = {
+            "enabled": bool((screener_params.get("liquidity_shadow_policy") or {}).get("enabled", True)),
+            "used_by_trader": False,
+            "status": "PENDING",
+            "note": "Liquidity Shadow results are stored under post_run_diagnostics/",
+        }
+        liquidity_shadow_candidate_rows = []
         _persist_run_meta(
             status=status,
             result_status=result_status,
@@ -4178,6 +4597,7 @@ def run_screener(
             scores_records=scores_records,
             eligible_shadow=eligible_shadow_meta,
             eligible_shadow_candidates=eligible_shadow_rows,
+            liquidity_shadow=liquidity_shadow_meta,
             diagnostics=diagnostics_payload,
             market_regime_shadow=market_regime_shadow_payload,
             exclusion_summary=exclusion_summary_payload,
@@ -4186,16 +4606,14 @@ def run_screener(
             empty_reason_detail=empty_reason_detail_payload,
         )
 
-        # Liquidity Shadow AFTER Production artifacts saved/promoted (failure isolated)
+        # Snapshot immutable DECISION bytes after publish, before diagnostics
+        decision_sha_before = directory_sha_snapshot(writer.final_dir)
+        if prod_sha_before_liq is None and (writer.final_dir / "screener_candidates.json").exists():
+            prod_sha_before_liq = sha256_file(writer.final_dir / "screener_candidates.json")
+
+        # Liquidity Shadow AFTER Production artifacts saved/promoted — separate diagnostics dir
         liq_policy = screener_params.get("liquidity_shadow_policy") or {}
-        liquidity_shadow_meta = {
-            "enabled": bool(liq_policy.get("enabled", True)),
-            "used_by_trader": False,
-            "status": "SKIPPED",
-        }
-        liquidity_shadow_candidate_rows = []
         if bool(liq_policy.get("enabled", True)):
-            liq_t0 = time.perf_counter()
             try:
                 amount_map = stage1_meta.get("amount5d_by_ticker") or {}
                 prod_amt_thr = float(
@@ -4204,128 +4622,76 @@ def run_screener(
                         screener_params.get("min_trading_value_5d_avg_us", 5_000_000_000),
                     )
                 )
-                universe, liq_meta = compute_liquidity_shadow_universe(
-                    amount_map,
-                    policy=liq_policy,
-                    production_threshold=prod_amt_thr,
-                )
-                liquidity_shadow_meta = dict(liq_meta)
-                scored_lookup = {
-                    str(r.get("ticker") or "").upper(): r for r in scores_records
-                }
-                liq_score_rows: List[Dict[str, Any]] = []
-                budget = float(liq_policy.get("time_budget_sec", 90) or 90)
-                partial = False
-                unscored = 0
-                for t in universe:
-                    if time.perf_counter() - liq_t0 > budget:
-                        partial = True
-                        break
-                    if t in scored_lookup:
-                        liq_score_rows.append(dict(scored_lookup[t]))
-                    else:
-                        # Observation-only: do not block Production to score extras;
-                        # leave row stub for universe membership tracking.
-                        unscored += 1
-                        liq_score_rows.append(
-                            {
-                                "ticker": t,
-                                "score": None,
-                                "amount5d": amount_map.get(t),
-                                "scored": False,
-                                "used_by_trader": False,
-                                "diagnostic_only": True,
-                            }
-                        )
-                liquidity_shadow_meta["scored_count"] = sum(
-                    1 for r in liq_score_rows if r.get("score") is not None
-                )
-                liquidity_shadow_meta["unscored_count"] = unscored
-                liquidity_shadow_meta["duration_sec"] = round(time.perf_counter() - liq_t0, 3)
-                liquidity_shadow_meta["status"] = "PARTIAL_SHADOW" if partial else "OK"
-                if partial:
-                    liquidity_shadow_meta["warnings"] = ["TIME_BUDGET_EXCEEDED"]
-                elif unscored:
-                    liquidity_shadow_meta["warnings"] = ["UNIVERSE_OUTSIDE_PRODUCTION_SCORES"]
-                    liquidity_shadow_meta["status"] = "PARTIAL_SHADOW"
-                liq_score_rows = build_liquidity_shadow_rows(
-                    scored_rows=liq_score_rows,
-                    amount_by_ticker=amount_map,
-                    production_threshold=prod_amt_thr,
-                    shadow_threshold=float(
-                        liquidity_shadow_meta.get("shadow_liquidity_threshold") or 0
-                    ),
+                listing_for_liq = None
+                try:
+                    listing_for_liq = get_stock_listing(market)
+                except Exception:
+                    listing_for_liq = None
+                held_set: Set[str] = set()
+                try:
+                    held_set = {
+                        str(h.get("Ticker") or h.get("ticker") or "").upper()
+                        for h in (holdings or [])
+                        if h
+                    }
+                except Exception:
+                    held_set = set()
+                liquidity_shadow_meta = run_liquidity_shadow_post_diagnostics(
+                    writer=writer,
+                    liq_policy=liq_policy,
+                    amount_map=amount_map,
+                    production_amount5d_threshold=prod_amt_thr,
+                    scores_records=scores_records,
                     production_tickers=set(final_candidates["Ticker"].astype(str).str.upper())
                     if not final_candidates.empty
                     else set(),
                     eligible_shadow_tickers=elig_shadow_tickers,
+                    production_candidate_count=len(final_candidates),
+                    trade_date=fixed_date,
+                    market=market,
+                    screener_params=screener_params,
+                    risk_params=risk_params,
+                    market_score=float(market_score or 0.5),
+                    sector_trends=sector_trends or {},
+                    listing_df=listing_for_liq,
+                    held_tickers=held_set,
+                    issuer_map=issuer_map,
+                    workers=workers,
                 )
-                liquidity_shadow_candidate_rows = select_liquidity_shadow_candidates(
-                    liq_score_rows,
-                    max_candidates=int(liq_policy.get("max_candidates", 10) or 10),
-                    min_score=None,
-                )
-                liquidity_shadow_meta["candidate_count"] = len(liquidity_shadow_candidate_rows)
-                # Write into published run directory (observation only)
-                try:
-                    atomic_write_json(
-                        writer.final_dir / "screener_liquidity_shadow_scores.json",
-                        liq_score_rows,
-                    )
-                    atomic_write_json(
-                        writer.final_dir / "screener_liquidity_shadow_candidates.json",
-                        liquidity_shadow_candidate_rows,
-                    )
-                    # Patch run meta liquidity section without rewriting Production candidates
-                    meta_path = writer.final_dir / "screener_run_meta.json"
-                    if meta_path.exists():
-                        with open(meta_path, "r", encoding="utf-8") as f:
-                            meta_obj = json.load(f)
-                        meta_obj["liquidity_shadow"] = liquidity_shadow_meta
-                        if liquidity_shadow_meta.get("status") == "PARTIAL_SHADOW" and str(
-                            meta_obj.get("status")
-                        ).startswith("SUCCESS"):
-                            meta_obj["status"] = "SUCCESS_WITH_WARNINGS"
-                        atomic_write_json(meta_path, meta_obj)
-                except Exception as e:
-                    logger.warning("Liquidity Shadow artifact write failed: %s", e)
+                liquidity_shadow_candidate_rows = []
                 logger.info(
-                    "Liquidity Shadow: universe=%s scored=%s candidates=%s status=%s",
+                    "Liquidity Shadow diagnostics: universe=%s scored=%s candidates=%s status=%s dir=%s",
                     liquidity_shadow_meta.get("universe_count"),
                     liquidity_shadow_meta.get("scored_count"),
                     liquidity_shadow_meta.get("candidate_count"),
                     liquidity_shadow_meta.get("status"),
+                    liquidity_shadow_meta.get("diagnostics_directory"),
                 )
             except Exception as e:
                 logger.warning("Liquidity Shadow failed (Production unchanged): %s", e)
                 liquidity_shadow_meta = {
                     "enabled": True,
-                    "status": "LIQUIDITY_SHADOW_FAILED",
+                    "status": "FAILED",
                     "errors": [str(e)],
                     "used_by_trader": False,
                     "failure_policy": liq_policy.get("failure_policy", "WARN_AND_CONTINUE"),
                 }
-                try:
-                    meta_path = writer.final_dir / "screener_run_meta.json"
-                    if meta_path.exists():
-                        with open(meta_path, "r", encoding="utf-8") as f:
-                            meta_obj = json.load(f)
-                        meta_obj["liquidity_shadow"] = liquidity_shadow_meta
-                        if str(meta_obj.get("status")).startswith("SUCCESS"):
-                            meta_obj["status"] = "SUCCESS_WITH_WARNINGS"
-                        findings = list(meta_obj.get("data_quality_findings") or [])
-                        findings.append({"code": "LIQUIDITY_SHADOW_FAILED", "severity": "WARNING"})
-                        meta_obj["data_quality_findings"] = findings
-                        atomic_write_json(meta_path, meta_obj)
-                except Exception:
-                    pass
 
+        # DECISION immutability invariants
         if prod_sha_before_liq:
             prod_sha_after = sha256_file(writer.final_dir / "screener_candidates.json")
             if prod_sha_after != prod_sha_before_liq:
                 logger.error(
                     "INVARIANT VIOLATION: Production candidates SHA changed after Liquidity Shadow"
                 )
+        decision_sha_after = directory_sha_snapshot(writer.final_dir)
+        if decision_sha_before != decision_sha_after:
+            logger.error(
+                "INVARIANT VIOLATION: DECISION run directory mutated after finalize "
+                "(before=%d files after=%d)",
+                len(decision_sha_before),
+                len(decision_sha_after),
+            )
 
         logger.info(
             "최종 후보 저장(run=%s): full=%d slim=%d scores=%d shadow=%d eligible_shadow=%d mode=%s",

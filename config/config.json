@@ -93,13 +93,21 @@
       "exclude_production_candidates": true,
       "used_by_trader": false
     },
-    // Liquidity Shadow (Production Amount5D 5B 불변, 관찰용)
+    // Liquidity Shadow (Production Amount5D 5B 불변, 관찰용, post_run_diagnostics/)
     "liquidity_shadow_policy": {
       "enabled": true,
       "threshold_mode": "percentile",
       "percentile": 0.90,
+      "liquidity_percentile": 0.90,
       "max_universe": 60,
+      "score_threshold_mode": "production_threshold",
+      "score_floor": 0.42,
+      "score_percentile": 0.90,
       "max_candidates": 10,
+      "exclude_production_candidates": true,
+      "require_eligibility": true,
+      "apply_issuer_dedup": true,
+      "apply_sector_diversification": true,
       "used_by_trader": false,
       "failure_policy": "WARN_AND_CONTINUE",
       "run_after_production_artifacts_saved": true,

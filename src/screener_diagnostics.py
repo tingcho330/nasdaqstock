@@ -541,6 +541,9 @@ def compute_liquidity_shadow_universe(
     production_threshold: float,
 ) -> Tuple[List[str], Dict[str, Any]]:
     """Build Amount5D P90 (or configured) universe for liquidity shadow."""
+    percentile = float(
+        policy.get("liquidity_percentile", policy.get("percentile", 0.90)) or 0.90
+    )
     meta: Dict[str, Any] = {
         "enabled": bool(policy.get("enabled", True)),
         "type": "LIQUIDITY",
@@ -549,6 +552,7 @@ def compute_liquidity_shadow_universe(
         "universe_count": 0,
         "production_liquidity_pass_count": 0,
         "max_universe": int(policy.get("max_universe", 60) or 60),
+        "liquidity_percentile": percentile,
         "used_by_trader": False,
         **DIAGNOSTIC_META,
     }
@@ -560,11 +564,10 @@ def compute_liquidity_shadow_universe(
         return [], meta
 
     mode = str(policy.get("threshold_mode", "percentile")).lower()
-    pct = float(policy.get("percentile", 0.90) or 0.90)
     if mode == "static":
-        thr = float(policy.get("static_threshold", s.quantile(pct)))
+        thr = float(policy.get("static_threshold", s.quantile(percentile)))
     else:
-        thr = float(s.quantile(pct))
+        thr = float(s.quantile(percentile))
     meta["shadow_liquidity_threshold"] = thr
     meta["production_liquidity_pass_count"] = int((s >= float(production_threshold)).sum())
 
@@ -577,6 +580,30 @@ def compute_liquidity_shadow_universe(
     return tickers, meta
 
 
+def resolve_liquidity_score_threshold(
+    policy: Dict[str, Any],
+    *,
+    production_threshold: float,
+    scored_values: Optional[Sequence[float]] = None,
+) -> Tuple[float, str]:
+    """Resolve Liquidity Shadow score gate without changing Production threshold."""
+    mode = str(policy.get("score_threshold_mode", "production_threshold") or "production_threshold").lower()
+    floor = float(policy.get("score_floor", 0.42) or 0.42)
+    pct = float(policy.get("score_percentile", 0.90) or 0.90)
+    if mode in ("production_threshold", "production", "static_production"):
+        return float(production_threshold), "production_threshold"
+    scores = [float(x) for x in (scored_values or []) if x is not None]
+    if mode == "floor":
+        return floor, "floor"
+    if not scores:
+        return floor, "floor_fallback_empty"
+    p90 = float(pd.Series(scores).quantile(pct))
+    if mode == "percentile":
+        return float(p90), "percentile"
+    # hybrid
+    return float(max(floor, p90)), "hybrid_percentile"
+
+
 def build_liquidity_shadow_rows(
     *,
     scored_rows: List[Dict[str, Any]],
@@ -585,25 +612,46 @@ def build_liquidity_shadow_rows(
     shadow_threshold: float,
     production_tickers: Optional[Set[str]] = None,
     eligible_shadow_tickers: Optional[Set[str]] = None,
+    liquidity_shadow_candidate_tickers: Optional[Set[str]] = None,
 ) -> List[Dict[str, Any]]:
-    """Attach liquidity pass flags to scored shadow rows."""
+    """Attach liquidity pass flags / source_universe to shadow score rows."""
     prod = {str(t).upper() for t in (production_tickers or set())}
     elig = {str(t).upper() for t in (eligible_shadow_tickers or set())}
+    ls_cands = {str(t).upper() for t in (liquidity_shadow_candidate_tickers or set())}
     out: List[Dict[str, Any]] = []
     for row in scored_rows:
         t = str(row.get("ticker") or row.get("Ticker") or "").upper()
         amt = _safe_float(amount_by_ticker.get(t, row.get("amount5d") or row.get("Amount5D")))
+        prod_pass = bool(amt is not None and amt >= float(production_threshold))
+        shadow_pass = bool(amt is not None and amt >= float(shadow_threshold))
         rec = dict(row)
         rec["ticker"] = t
+        if "Ticker" in rec:
+            rec["Ticker"] = t
         rec["amount5d"] = amt
         rec["production_liquidity_threshold"] = float(production_threshold)
         rec["shadow_liquidity_threshold"] = float(shadow_threshold)
-        rec["production_liquidity_pass"] = bool(amt is not None and amt >= float(production_threshold))
-        rec["shadow_liquidity_pass"] = bool(amt is not None and amt >= float(shadow_threshold))
+        rec["production_liquidity_pass"] = prod_pass
+        rec["shadow_liquidity_pass"] = shadow_pass
+        rec["source_universe"] = (
+            "PRODUCTION_AND_LIQUIDITY_SHADOW" if prod_pass else "LIQUIDITY_SHADOW_ONLY"
+        )
         rec["production_candidate"] = t in prod
         rec["eligible_shadow_candidate"] = t in elig
+        rec["liquidity_shadow_candidate"] = t in ls_cands
         rec["used_by_trader"] = False
         rec["diagnostic_only"] = True
+        # Ensure null scores have status/reason
+        score = _safe_float(rec.get("score") if "score" in rec else rec.get("Score"))
+        if score is None:
+            rec.setdefault("score_status", rec.get("score_status") or "NOT_RUN")
+            rec.setdefault(
+                "failure_reason",
+                rec.get("failure_reason") or rec.get("score_status") or "UNSCORED",
+            )
+        else:
+            rec.setdefault("score_status", "SUCCESS")
+            rec.setdefault("failure_reason", None)
         out.append(rec)
     return out
 
@@ -614,11 +662,378 @@ def select_liquidity_shadow_candidates(
     max_candidates: int = 10,
     min_score: Optional[float] = None,
 ) -> List[Dict[str, Any]]:
+    """Legacy helper: top scored rows. Prefer compute_liquidity_shadow_candidates."""
     scored = [r for r in rows if _safe_float(r.get("score") or r.get("Score")) is not None]
     if min_score is not None:
-        scored = [r for r in scored if float(r.get("score") or r.get("Score") or 0) >= float(min_score)]
+        scored = [
+            r
+            for r in scored
+            if float(r.get("score") or r.get("Score") or 0) >= float(min_score)
+        ]
     scored.sort(key=lambda r: float(r.get("score") or r.get("Score") or 0), reverse=True)
     return scored[: int(max_candidates)]
+
+
+def compute_liquidity_shadow_candidates(
+    score_rows: List[Dict[str, Any]],
+    *,
+    policy: Dict[str, Any],
+    production_threshold: float,
+    production_tickers: Optional[Set[str]] = None,
+    diversify_fn: Optional[Callable] = None,
+    sector_cap: float = 0.35,
+    issuer_map: Optional[Dict[str, str]] = None,
+    held_tickers: Optional[Set[str]] = None,
+    rsi_overheated_threshold: float = 70.0,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Select real Liquidity Shadow candidates with eligibility/issuer/sector.
+
+    Candidate file contains only rows with liquidity_shadow_candidate=true.
+    """
+    from screener_ops import enrich_scored_dataframe, select_candidates_pipeline
+
+    prod = {str(t).upper() for t in (production_tickers or set())}
+    held = {str(t).upper() for t in (held_tickers or set())}
+    meta: Dict[str, Any] = {
+        "candidate_count": 0,
+        "shadow_only_candidate_count": 0,
+        "production_reference_candidate_count": 0,
+        "production_near_miss_candidate_count": 0,
+        "score_threshold": None,
+        "score_threshold_mode": None,
+        "used_by_trader": False,
+        **DIAGNOSTIC_META,
+    }
+
+    # Build DataFrame of successfully scored rows only
+    records: List[Dict[str, Any]] = []
+    scored_values: List[float] = []
+    for r in score_rows:
+        score = _safe_float(r.get("score") if "score" in r else r.get("Score"))
+        if score is None:
+            continue
+        scored_values.append(float(score))
+        ticker = str(r.get("ticker") or r.get("Ticker") or "").upper()
+        if not ticker:
+            continue
+        rec = {
+            "Ticker": ticker,
+            "Name": r.get("name") or r.get("Name") or "",
+            "Sector": r.get("sector") or r.get("Sector") or "N/A",
+            "Score": float(score),
+            "RSI": _safe_float(r.get("rsi") if "rsi" in r else r.get("RSI")),
+            "Price": _safe_float(r.get("price") if "price" in r else r.get("Price")),
+            "exclude_reasons": list(
+                r.get("exclusion_reasons") or r.get("exclude_reasons") or []
+            ),
+            "Amount5D": _safe_float(r.get("amount5d") or r.get("Amount5D")),
+            "production_liquidity_pass": bool(r.get("production_liquidity_pass")),
+            "source_universe": r.get("source_universe"),
+            "FinScore": _safe_float(r.get("fin_score") or r.get("FinScore")),
+            "TechScore": _safe_float(r.get("tech_score") or r.get("TechScore")),
+            "MktScore": _safe_float(r.get("market_score") or r.get("MktScore")),
+            "SectorScore": _safe_float(r.get("sector_score") or r.get("SectorScore")),
+            "VolKki": _safe_float(r.get("vol_kki") or r.get("VolKki")),
+            "Pos52w": _safe_float(r.get("pos_52w") or r.get("Pos52w")),
+            "PatternScore": _safe_float(r.get("pattern_score") or r.get("PatternScore")),
+            "PER": _safe_float(r.get("per") or r.get("PER")),
+            "PBR": _safe_float(r.get("pbr") or r.get("PBR")),
+            "ATR": _safe_float(r.get("atr") or r.get("ATR")),
+            "MA50": _safe_float(r.get("ma50") or r.get("MA50")),
+            "MA200": _safe_float(r.get("ma200") or r.get("MA200")),
+        }
+        records.append(rec)
+
+    if not records:
+        meta["score_threshold"], meta["score_threshold_mode"] = resolve_liquidity_score_threshold(
+            policy, production_threshold=production_threshold, scored_values=[]
+        )
+        return [], meta
+
+    df = pd.DataFrame(records)
+    thr, thr_mode = resolve_liquidity_score_threshold(
+        policy, production_threshold=production_threshold, scored_values=scored_values
+    )
+    meta["score_threshold"] = thr
+    meta["score_threshold_mode"] = thr_mode
+
+    df = enrich_scored_dataframe(
+        df,
+        held_tickers=held,
+        issuer_map=issuer_map or {},
+        production_threshold=float(thr),
+        rsi_overheated_threshold=float(rsi_overheated_threshold),
+        exclude_held_from_candidates=True,
+    )
+
+    def _passthrough(indexed: pd.DataFrame, top_n: int, _cap: float) -> pd.DataFrame:
+        if indexed is None or indexed.empty:
+            return indexed
+        return indexed.head(int(top_n))
+
+    diversify = diversify_fn or _passthrough
+    require_elig = bool(policy.get("require_eligibility", True))
+    apply_issuer = bool(policy.get("apply_issuer_dedup", True))
+    apply_sector = bool(policy.get("apply_sector_diversification", True))
+    max_c = int(policy.get("max_candidates", 10) or 10)
+
+    cands_df, _stages = select_candidates_pipeline(
+        df,
+        threshold=float(thr),
+        require_positive_momentum=False,
+        exclude_high_volatility=False,
+        top_n=max_c,
+        sector_cap=float(sector_cap),
+        diversify_fn=diversify if apply_sector else _passthrough,
+        apply_issuer_dedupe=apply_issuer,
+        require_eligible=require_elig,
+        max_candidates=max_c,
+    )
+
+    exclude_prod = bool(policy.get("exclude_production_candidates", True))
+    if exclude_prod and prod and cands_df is not None and not cands_df.empty:
+        cands_df = cands_df[~cands_df["Ticker"].astype(str).str.upper().isin(prod)].copy()
+
+    out_rows: List[Dict[str, Any]] = []
+    shadow_only = 0
+    near_miss = 0
+    reference = 0
+    if cands_df is not None and not cands_df.empty:
+        for _, row in cands_df.iterrows():
+            t = str(row.get("Ticker") or "").upper()
+            prod_liq_pass = bool(row.get("production_liquidity_pass", False))
+            is_prod = t in prod
+            if is_prod:
+                origin = "PRODUCTION_CANDIDATE_REFERENCE"
+                reference += 1
+            elif prod_liq_pass:
+                origin = "PRODUCTION_LIQUIDITY_PASS_NEAR_MISS"
+                near_miss += 1
+            else:
+                origin = "SHADOW_ONLY"
+                shadow_only += 1
+            # Look up full score row extras
+            src = next(
+                (
+                    r
+                    for r in score_rows
+                    if str(r.get("ticker") or r.get("Ticker") or "").upper() == t
+                ),
+                {},
+            )
+            out_rows.append(
+                {
+                    **{k: v for k, v in dict(src).items() if k not in ("liquidity_shadow_candidate",)},
+                    "ticker": t,
+                    "Ticker": t,
+                    "score": _safe_float(row.get("Score")),
+                    "Score": _safe_float(row.get("Score")),
+                    "name": row.get("Name") or src.get("name") or "",
+                    "sector": row.get("Sector") or src.get("sector") or "",
+                    "amount5d": _safe_float(row.get("Amount5D") or src.get("amount5d")),
+                    "eligibility_status": row.get("eligibility_status"),
+                    "exclusion_reasons": list(
+                        row.get("exclusion_reasons") or row.get("exclude_reasons") or []
+                    ),
+                    "liquidity_shadow_candidate": True,
+                    "candidate_origin": origin,
+                    "used_by_trader": False,
+                    "diagnostic_only": True,
+                    "production_candidate": is_prod,
+                    "production_liquidity_pass": prod_liq_pass,
+                    "source_universe": src.get("source_universe")
+                    or (
+                        "PRODUCTION_AND_LIQUIDITY_SHADOW"
+                        if prod_liq_pass
+                        else "LIQUIDITY_SHADOW_ONLY"
+                    ),
+                }
+            )
+
+    # If exclude_production_candidates, references should already be filtered out
+    if exclude_prod:
+        out_rows = [r for r in out_rows if r.get("candidate_origin") != "PRODUCTION_CANDIDATE_REFERENCE"]
+        reference = 0
+
+    meta["candidate_count"] = len(out_rows)
+    meta["shadow_only_candidate_count"] = sum(
+        1 for r in out_rows if r.get("candidate_origin") == "SHADOW_ONLY"
+    )
+    meta["production_near_miss_candidate_count"] = sum(
+        1 for r in out_rows if r.get("candidate_origin") == "PRODUCTION_LIQUIDITY_PASS_NEAR_MISS"
+    )
+    meta["production_reference_candidate_count"] = reference
+    return out_rows, meta
+
+
+def write_liquidity_shadow_review(
+    path: Any,
+    *,
+    source_run_id: str,
+    trade_date: str,
+    production_candidate_count: int,
+    production_amount5d_threshold: float,
+    source_manifest_sha256: Optional[str],
+    meta: Dict[str, Any],
+    candidates: List[Dict[str, Any]],
+    diagnostics_manifest: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Write standalone liquidity_shadow_review.md (does not touch DECISION review)."""
+    from pathlib import Path as _Path
+
+    path = _Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [
+        "# Liquidity Shadow Review",
+        "",
+        "## Source Decision",
+        f"- source run id: `{source_run_id}`",
+        f"- trade date: `{trade_date}`",
+        f"- Production candidate count: {production_candidate_count}",
+        f"- Production Amount5D threshold: {production_amount5d_threshold}",
+        f"- source manifest SHA: `{source_manifest_sha256}`",
+        "",
+        "## Liquidity Shadow Universe",
+        f"- P90 threshold: {meta.get('shadow_liquidity_threshold')}",
+        f"- universe count: {meta.get('universe_count')}",
+        f"- Production score reused: {meta.get('production_score_reused_count')}",
+        f"- Shadow-only requested: {meta.get('shadow_only_requested_count')}",
+        f"- Shadow-only scored: {meta.get('shadow_only_scored_count')}",
+        f"- scored_count: {meta.get('scored_count')}",
+        f"- failed_count: {meta.get('failed_count')}",
+        f"- unscored_count: {meta.get('unscored_count')}",
+        f"- status: `{meta.get('status')}`",
+        f"- warnings: `{meta.get('warnings')}`",
+        "",
+        "## Liquidity Shadow Candidates",
+        f"- candidate_count: {meta.get('candidate_count')}",
+        f"- shadow_only_candidate_count: {meta.get('shadow_only_candidate_count')}",
+    ]
+    for c in candidates:
+        lines.append(
+            f"- {c.get('ticker')}: origin={c.get('candidate_origin')} "
+            f"amount5d={c.get('amount5d')} score={c.get('score')} "
+            f"eligibility={c.get('eligibility_status')} "
+            f"liquidity_shadow_candidate={c.get('liquidity_shadow_candidate')} "
+            f"used_by_trader={c.get('used_by_trader', False)}"
+        )
+    lines.extend(
+        [
+            "",
+            "## Integrity",
+            f"- diagnostics status: `{(diagnostics_manifest or {}).get('status')}`",
+            f"- diagnostics_run_id: `{(diagnostics_manifest or {}).get('diagnostics_run_id')}`",
+            f"- used_by_trader: false",
+            "",
+        ]
+    )
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def classify_liquidity_shadow_status(
+    *,
+    universe_count: int,
+    scored_count: int,
+    failed_count: int,
+    unscored_count: int,
+    time_budget_exceeded: bool,
+    hard_failure: bool = False,
+) -> str:
+    if hard_failure:
+        return "FAILED"
+    if universe_count <= 0:
+        return "SUCCESS"
+    if time_budget_exceeded or unscored_count > 0:
+        return "PARTIAL_SHADOW"
+    if failed_count > 0 and scored_count > 0:
+        return "SUCCESS_WITH_WARNINGS"
+    if scored_count == 0 and failed_count > 0:
+        return "FAILED"
+    return "SUCCESS"
+
+
+def summarize_liquidity_shadow_meta(
+    *,
+    base_meta: Dict[str, Any],
+    universe: Sequence[str],
+    score_rows: List[Dict[str, Any]],
+    candidates: List[Dict[str, Any]],
+    candidate_meta: Optional[Dict[str, Any]] = None,
+    production_reused: int,
+    shadow_only_requested: int,
+    duration_sec: float,
+    time_budget_exceeded: bool = False,
+    warnings: Optional[List[str]] = None,
+    errors: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    scored = sum(1 for r in score_rows if _safe_float(r.get("score") or r.get("Score")) is not None)
+    failed = sum(
+        1
+        for r in score_rows
+        if _safe_float(r.get("score") or r.get("Score")) is None
+        and str(r.get("score_status") or "")
+        in ("DATA_UNAVAILABLE", "API_FAILED", "INVALID_FEATURES")
+    )
+    unscored = sum(
+        1
+        for r in score_rows
+        if _safe_float(r.get("score") or r.get("Score")) is None
+        and str(r.get("score_status") or "") in ("NOT_RUN", "TIME_BUDGET_EXCEEDED", "")
+    )
+    # Prefer explicit counts when rows cover whole universe
+    if len(score_rows) == len(universe):
+        unscored = max(0, len(universe) - scored - failed)
+    shadow_only_scored = sum(
+        1
+        for r in score_rows
+        if r.get("source_universe") == "LIQUIDITY_SHADOW_ONLY"
+        and _safe_float(r.get("score") or r.get("Score")) is not None
+    )
+    status = classify_liquidity_shadow_status(
+        universe_count=len(universe),
+        scored_count=scored,
+        failed_count=failed,
+        unscored_count=unscored,
+        time_budget_exceeded=time_budget_exceeded,
+        hard_failure=bool(errors) and scored == 0 and len(universe) > 0,
+    )
+    out = dict(base_meta or {})
+    out.update(
+        {
+            "status": status,
+            "universe_count": len(universe),
+            "production_score_reused_count": int(production_reused),
+            "shadow_only_requested_count": int(shadow_only_requested),
+            "shadow_only_scored_count": int(shadow_only_scored),
+            "scored_count": int(scored),
+            "failed_count": int(failed),
+            "unscored_count": int(unscored),
+            "candidate_count": int(len(candidates)),
+            "shadow_only_candidate_count": int(
+                (candidate_meta or {}).get("shadow_only_candidate_count")
+                or sum(1 for c in candidates if c.get("candidate_origin") == "SHADOW_ONLY")
+            ),
+            "production_reference_candidate_count": int(
+                (candidate_meta or {}).get("production_reference_candidate_count") or 0
+            ),
+            "production_near_miss_candidate_count": int(
+                (candidate_meta or {}).get("production_near_miss_candidate_count")
+                or sum(
+                    1
+                    for c in candidates
+                    if c.get("candidate_origin") == "PRODUCTION_LIQUIDITY_PASS_NEAR_MISS"
+                )
+            ),
+            "duration_sec": round(float(duration_sec), 3),
+            "warnings": list(warnings or []),
+            "errors": list(errors or []),
+            "used_by_trader": False,
+            **DIAGNOSTIC_META,
+        }
+    )
+    if time_budget_exceeded and "TIME_BUDGET_EXCEEDED" not in out["warnings"]:
+        out["warnings"].append("TIME_BUDGET_EXCEEDED")
+    return out
 
 
 def summarize_diagnostics(score_records: List[Dict[str, Any]]) -> Dict[str, Any]:

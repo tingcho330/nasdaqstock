@@ -1414,22 +1414,14 @@ def write_review_markdown(
     lines.append("")
     ls = meta.get("liquidity_shadow") or {}
     lines.append("## Liquidity Shadow")
-    lines.append(f"- Production Amount5D threshold: {ls.get('production_liquidity_threshold')}")
-    lines.append(f"- Production liquidity universe count: {ls.get('production_liquidity_pass_count')}")
-    lines.append(f"- Shadow liquidity threshold: {ls.get('shadow_liquidity_threshold')}")
-    lines.append(f"- Shadow universe count: {ls.get('universe_count')}")
-    lines.append(f"- scored count: {ls.get('scored_count')}")
-    lines.append(f"- candidate count: {ls.get('candidate_count')}")
-    lines.append(f"- duration_sec: {ls.get('duration_sec')}")
-    lines.append(f"- status: {ls.get('status')}")
-    if ls.get("warnings"):
-        lines.append(f"- warnings: {ls.get('warnings')}")
-    if ls.get("errors"):
-        lines.append(f"- errors: {ls.get('errors')}")
+    lines.append(
+        "- note: live Liquidity Shadow artifacts are stored under `post_run_diagnostics/` "
+        "(not inside this immutable DECISION run)"
+    )
+    lines.append(f"- status in DECISION meta: `{ls.get('status', 'PENDING')}`")
     lines.append(f"- used_by_trader: {ls.get('used_by_trader', False)}")
-    liq_rows = liquidity_shadow_candidates or []
-    for c in liq_rows[:10]:
-        lines.append(f"- candidate: {c.get('ticker') or c.get('Ticker')}: score={c.get('score') or c.get('Score')}")
+    if ls.get("note"):
+        lines.append(f"- {ls.get('note')}")
     lines.append("")
     diag = meta.get("diagnostics") or {}
     lines.append("## Diagnostics")
