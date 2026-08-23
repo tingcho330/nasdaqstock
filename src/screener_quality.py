@@ -569,6 +569,94 @@ def detect_legacy_meta_self_hash_only(
     return meta_contains_self_hash(meta)
 
 
+def assess_decision_run_trust(run_dir: Path) -> Dict[str, Any]:
+    """Generic DECISION-run trust classification shared by Quality and Replay.
+
+    Historical ``screener_run_meta.json`` self-hash mismatches are
+    ``TRUSTED_WITH_WARNING`` / ``LEGACY_META_SELF_HASH_MISMATCH`` — the same
+    semantics Quality already uses. Post-finalize liquidity mutation and any
+    other unknown SHA mismatch remain untrusted.
+
+    Does not mutate artifacts. Liquidity Shadow diagnostics trust is assessed
+    separately by ``evaluate_liquidity_shadow_trust``.
+    """
+    from screener_artifacts import verify_manifest_integrity
+
+    run_dir = Path(run_dir)
+    meta = _load_json(run_dir / "screener_run_meta.json")
+    meta = meta if isinstance(meta, dict) else {}
+    man = _load_json(run_dir / "manifest.json")
+    man = man if isinstance(man, dict) else {}
+
+    result: Dict[str, Any] = {
+        "trust_status": LEGACY_UNTRUSTED,
+        "trust_reason": "INIT",
+        "manifest_ok": False,
+        "issues": [],
+        "reasons": [],
+        "status": LEGACY_UNTRUSTED,  # alias used by Full-Universe Replay
+    }
+
+    run_mode = str(meta.get("run_mode") or man.get("run_mode") or "").upper()
+    if run_mode and run_mode != "DECISION":
+        result["trust_reason"] = "NON_DECISION_RUN"
+        result["reasons"].append("NON_DECISION_RUN")
+        result["issues"] = ["NON_DECISION_RUN"]
+        return result
+
+    man_path = run_dir / "manifest.json"
+    if not man_path.exists():
+        result["trust_reason"] = "MANIFEST_MISSING"
+        result["reasons"].append("MANIFEST_MISSING")
+        result["issues"] = ["MANIFEST_MISSING"]
+        return result
+
+    _ok, issues = verify_manifest_integrity(run_dir)
+    issues = list(issues or [])
+    result["issues"] = issues
+    result["manifest_ok"] = len(issues) == 0
+
+    legacy_mut = [i for i in issues if i.startswith("LEGACY_POST_FINALIZE_MUTATION")]
+    if legacy_mut:
+        result["trust_status"] = LEGACY_UNTRUSTED
+        result["status"] = LEGACY_UNTRUSTED
+        result["trust_reason"] = "LEGACY_POST_FINALIZE_MUTATION"
+        result["reasons"].append("LEGACY_POST_FINALIZE_MUTATION")
+        result["reasons"].extend(legacy_mut)
+        return result
+
+    if detect_legacy_meta_self_hash_only(run_dir, issues=issues, meta=meta):
+        result["trust_status"] = TRUSTED_WITH_WARNING
+        result["status"] = TRUSTED_WITH_WARNING
+        result["trust_reason"] = "LEGACY_META_SELF_HASH_MISMATCH"
+        result["reasons"].append("LEGACY_META_SELF_HASH_MISMATCH")
+        return result
+
+    sha_mismatches = [i for i in issues if i.startswith("SHA_MISMATCH:")]
+    if sha_mismatches:
+        result["trust_status"] = LEGACY_UNTRUSTED
+        result["status"] = LEGACY_UNTRUSTED
+        result["trust_reason"] = "DECISION_SHA_MISMATCH"
+        result["reasons"].append("DECISION_SHA_MISMATCH")
+        result["reasons"].extend(sha_mismatches)
+        return result
+
+    other_issues = [i for i in issues if not i.startswith("SHA_MISMATCH:")]
+    if other_issues:
+        result["trust_status"] = LEGACY_UNTRUSTED
+        result["status"] = LEGACY_UNTRUSTED
+        result["trust_reason"] = str(other_issues[0])
+        result["reasons"].extend(other_issues)
+        return result
+
+    result["trust_status"] = TRUSTED
+    result["status"] = TRUSTED
+    result["trust_reason"] = "ALL_INTEGRITY_CHECKS_PASSED"
+    result["reasons"].append("ALL_INTEGRITY_CHECKS_PASSED")
+    result["manifest_ok"] = True
+    return result
+
+
 def evaluate_liquidity_shadow_trust(
     run_dir: Path,
     *,

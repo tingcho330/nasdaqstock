@@ -20,6 +20,8 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from screener_full_universe_replay import (  # noqa: E402
+    LEGACY_META_SELF_HASH_MISMATCH,
+    LEGACY_UNTRUSTED,
     MIGRATION_DROP,
     MIGRATION_KEEP,
     MIGRATION_NEW,
@@ -27,8 +29,10 @@ from screener_full_universe_replay import (  # noqa: E402
     PRODUCTION_THRESHOLD,
     SCENARIOS,
     SCOPE_NOTE,
+    STATUS_NO_DATA,
     STATUS_OK,
     TRUSTED,
+    TRUSTED_WITH_WARNING,
     WARNING_BASELINE_REPLAY_MISMATCH,
     analyze_full_universe_replay,
     assess_run_trust,
@@ -42,13 +46,20 @@ from screener_full_universe_replay import (  # noqa: E402
     normalize_score_record,
     pipeline_params_from_config,
     replay_day_scenario,
+    replay_inclusion_decision,
     resolve_full_scored_universe,
     run_candidate_pipeline,
     run_full_universe_replay,
+    verify_screener_scores_integrity,
     write_replay_outputs,
 )
 from screener_ops import enrich_scored_dataframe, select_candidates_pipeline  # noqa: E402
+from screener_quality import (  # noqa: E402
+    assess_decision_run_trust,
+    detect_legacy_meta_self_hash_only,
+)
 from screener_weight_simulation import FACTOR_NAMES  # noqa: E402,F401
+from screener_artifacts import sha256_file, verify_manifest_integrity  # noqa: E402
 
 BASE_W = dict(SCENARIOS["A_BASELINE"])
 
@@ -109,6 +120,7 @@ def _score_row(
         "momentum_pass": True,
         "volatility_pass": True,
         "threshold_pass": (score or 0) >= PRODUCTION_THRESHOLD,
+        "production_candidate": False,
         "schema_version": "1.4",
     }
     if ret5 is not None:
@@ -688,3 +700,319 @@ def test_compare_baseline_replay_helper():
     cmp = compare_baseline_replay_to_production(["A", "B"], ["A", "B"])
     assert cmp["exact_set_match"] is True
     assert cmp["exact_order_match"] is True
+
+
+# ── Trust alignment with Quality (legacy meta self-hash) ─────────────
+
+
+def _inject_legacy_meta_self_hash(run_dir: Path) -> None:
+    """Reproduce historical LEGACY_META_SELF_HASH_MISMATCH (meta-only SHA drift)."""
+    meta_path = run_dir / "screener_run_meta.json"
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    meta["artifact_integrity"] = dict(meta.get("artifact_integrity") or {})
+    meta["artifact_integrity"]["screener_run_meta.json"] = {
+        "sha256": sha256_file(meta_path)
+    }
+    meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    meta["legacy_marker"] = True
+    meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    # Manifest still points at pre-mutation meta sha → SHA_MISMATCH:screener_run_meta.json only
+
+
+def _rewrite_manifest_scores_entry(run_dir: Path, **updates: Any) -> None:
+    man_path = run_dir / "manifest.json"
+    man = json.loads(man_path.read_text(encoding="utf-8"))
+    arts = man.setdefault("artifacts", {})
+    entry = dict(arts.get("screener_scores.json") or {})
+    entry.update(updates)
+    arts["screener_scores.json"] = entry
+    man_path.write_text(json.dumps(man), encoding="utf-8")
+
+
+def test_legacy_meta_self_hash_is_trusted_with_warning(tmp_path: Path):
+    out = tmp_path / "output"
+    run_dir = _write_replay_run(
+        out, trade_date="20260810", run_id="legacy-meta", universe=_build_test_universe()
+    )
+    _inject_legacy_meta_self_hash(run_dir)
+    ok, issues = verify_manifest_integrity(run_dir)
+    assert not ok
+    assert any(i.endswith("screener_run_meta.json") for i in issues if i.startswith("SHA_MISMATCH:"))
+    meta = json.loads((run_dir / "screener_run_meta.json").read_text(encoding="utf-8"))
+    assert detect_legacy_meta_self_hash_only(run_dir, issues=issues, meta=meta)
+
+    trust = assess_decision_run_trust(run_dir)
+    assert trust["trust_status"] == TRUSTED_WITH_WARNING
+    assert trust["trust_reason"] == LEGACY_META_SELF_HASH_MISMATCH
+
+    replay_trust = assess_run_trust(run_dir)
+    assert replay_trust["status"] == TRUSTED_WITH_WARNING
+    assert replay_trust["trust_reason"] == LEGACY_META_SELF_HASH_MISMATCH
+
+
+def test_legacy_meta_self_hash_with_scores_pass_is_included(tmp_path: Path):
+    out = tmp_path / "output"
+    run_dir = _write_replay_run(
+        out, trade_date="20260810", run_id="inc-warn", universe=_build_test_universe()
+    )
+    _inject_legacy_meta_self_hash(run_dir)
+    days, meta = load_replay_days(
+        output_dir=out,
+        market=MARKET,
+        session=SESSION,
+        start_trade_date=START,
+        end_trade_date=END,
+    )
+    assert meta["included_days"] == 1
+    assert days[0]["trust_status"] == TRUSTED_WITH_WARNING
+    assert days[0]["trust_reason"] == LEGACY_META_SELF_HASH_MISMATCH
+    assert days[0]["artifact_integrity_status"] == "PASS"
+    assert meta["accepted_trust_counts"].get(TRUSTED_WITH_WARNING) == 1
+    assert meta["trust_counts_raw"].get(TRUSTED_WITH_WARNING) == 1
+
+
+def test_legacy_meta_self_hash_scores_sha_mismatch_excluded(tmp_path: Path):
+    out = tmp_path / "output"
+    run_dir = _write_replay_run(
+        out, trade_date="20260810", run_id="bad-sha", universe=_build_test_universe()
+    )
+    _inject_legacy_meta_self_hash(run_dir)
+    _rewrite_manifest_scores_entry(run_dir, sha256="0" * 64)
+    days, meta = load_replay_days(
+        output_dir=out,
+        market=MARKET,
+        session=SESSION,
+        start_trade_date=START,
+        end_trade_date=END,
+    )
+    assert meta["included_days"] == 0
+    # Scores SHA mismatch is not legacy-meta-only → untrusted (or scores FAIL)
+    assert meta["excluded_trust_counts"].get(LEGACY_UNTRUSTED) == 1
+    assert meta["artifact_integrity_counts"].get("FAIL") == 1
+    assert any(not d.get("included") for d in meta["run_decisions"])
+
+
+def test_legacy_meta_self_hash_row_count_mismatch_excluded(tmp_path: Path):
+    out = tmp_path / "output"
+    run_dir = _write_replay_run(
+        out, trade_date="20260810", run_id="bad-rc", universe=_build_test_universe()
+    )
+    _inject_legacy_meta_self_hash(run_dir)
+    _rewrite_manifest_scores_entry(run_dir, row_count=999)
+    days, meta = load_replay_days(
+        output_dir=out,
+        market=MARKET,
+        session=SESSION,
+        start_trade_date=START,
+        end_trade_date=END,
+    )
+    assert meta["included_days"] == 0
+    assert any(not d.get("included") for d in meta["run_decisions"])
+    # Independent scores check must flag row-count failure
+    integ = verify_screener_scores_integrity(run_dir, expected_run_id="bad-rc")
+    assert integ["status"] == "FAIL"
+    assert not integ["row_count_ok"]
+
+
+def test_scores_integrity_fail_blocks_trusted_warning(tmp_path: Path):
+    """Artifact gate: TRUSTED_WITH_WARNING + schema fail → exclude even if trust ok."""
+    out = tmp_path / "output"
+    universe = _build_test_universe()
+    run_dir = _write_replay_run(
+        out, trade_date="20260810", run_id="warn-schema", universe=universe
+    )
+    _inject_legacy_meta_self_hash(run_dir)
+    # Corrupt schema without changing bytes hash: rewrite scores then restore manifest sha
+    # by rewriting empty factors while updating manifest to match new content → trust still
+    # meta-only warning if scores sha matches new file.
+    bad = [
+        {
+            "ticker": "AAA",
+            "score": 0.5,
+            "fin_score": 0.5,
+            "tech_score": 0.5,
+            "market_score": 0.5,
+            "sector_score": 0.5,
+            "vol_kki": 0.5,
+            "pos_52w": 0.5,
+            # missing momentum/volatility/sector/production_candidate
+        }
+    ]
+    scores_path = run_dir / "screener_scores.json"
+    scores_path.write_text(json.dumps(bad), encoding="utf-8")
+    _rewrite_manifest_scores_entry(
+        run_dir,
+        sha256=hashlib.sha256(scores_path.read_bytes()).hexdigest(),
+        row_count=1,
+    )
+    trust = assess_run_trust(run_dir)
+    assert trust["trust_status"] == TRUSTED_WITH_WARNING
+    integ = verify_screener_scores_integrity(run_dir, expected_run_id="warn-schema")
+    assert integ["status"] == "FAIL"
+    days, meta = load_replay_days(
+        output_dir=out,
+        market=MARKET,
+        session=SESSION,
+        start_trade_date=START,
+        end_trade_date=END,
+    )
+    assert meta["included_days"] == 0
+    assert any(
+        (d.get("exclusion_reason") or "").startswith("SCORES_INTEGRITY_FAIL")
+        for d in meta["run_decisions"]
+    )
+
+
+def test_unknown_run_meta_mismatch_excluded(tmp_path: Path):
+    out = tmp_path / "output"
+    run_dir = _write_replay_run(
+        out, trade_date="20260810", run_id="unknown-meta", universe=_build_test_universe()
+    )
+    # Corrupt meta WITHOUT embedding self-hash → not detect_legacy_meta_self_hash_only
+    meta_path = run_dir / "screener_run_meta.json"
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    meta["tampered"] = True
+    meta_path.write_text(json.dumps(meta), encoding="utf-8")
+    trust = assess_decision_run_trust(run_dir)
+    assert trust["trust_status"] == LEGACY_UNTRUSTED
+    assert trust["trust_reason"] == "DECISION_SHA_MISMATCH"
+    days, meta_out = load_replay_days(
+        output_dir=out,
+        market=MARKET,
+        session=SESSION,
+        start_trade_date=START,
+        end_trade_date=END,
+    )
+    assert days == []
+    assert meta_out["excluded_trust_counts"].get(LEGACY_UNTRUSTED) == 1
+
+
+def test_post_finalize_liquidity_mutation_untrusted(tmp_path: Path):
+    out = tmp_path / "output"
+    run_dir = _write_replay_run(
+        out, trade_date="20260728", run_id="liq-mut", universe=_build_test_universe()
+    )
+    # File appears after finalize / not in manifest → LEGACY_POST_FINALIZE_MUTATION
+    (run_dir / "screener_liquidity_shadow_candidates.json").write_text(
+        json.dumps([{"ticker": "X"}]), encoding="utf-8"
+    )
+    trust = assess_decision_run_trust(run_dir)
+    assert trust["trust_status"] == LEGACY_UNTRUSTED
+    assert trust["trust_reason"] == "LEGACY_POST_FINALIZE_MUTATION"
+    days, meta = load_replay_days(
+        output_dir=out,
+        market=MARKET,
+        session=SESSION,
+        start_trade_date=START,
+        end_trade_date=END,
+    )
+    assert meta["included_days"] == 0
+    assert meta["trust_counts_raw"].get(LEGACY_UNTRUSTED) == 1
+
+
+def test_trusted_normal_run_included(tmp_path: Path):
+    out = _seed_output(tmp_path)
+    days, meta = load_replay_days(
+        output_dir=out,
+        market=MARKET,
+        session=SESSION,
+        start_trade_date=START,
+        end_trade_date=END,
+    )
+    assert meta["included_days"] == 4
+    assert meta["accepted_trust_counts"].get(TRUSTED) == 4
+    assert all(d["artifact_integrity_status"] == "PASS" for d in days)
+
+
+def test_required_schema_missing_excluded(tmp_path: Path):
+    out = tmp_path / "output"
+    bad = [{"ticker": "AAA", "score": 0.5}]  # missing factors / pipeline fields
+    run_dir = _write_replay_run(out, trade_date="20260810", run_id="bad-schema", universe=bad)
+    # Fix candidates empty ok; re-hash scores in manifest after write already correct for bad list
+    integ = verify_screener_scores_integrity(run_dir, expected_run_id="bad-schema")
+    assert integ["status"] == "FAIL"
+    assert not integ["schema_ok"]
+    days, meta = load_replay_days(
+        output_dir=out,
+        market=MARKET,
+        session=SESSION,
+        start_trade_date=START,
+        end_trade_date=END,
+    )
+    assert meta["included_days"] == 0
+
+
+def test_source_run_id_mismatch_excluded(tmp_path: Path):
+    out = tmp_path / "output"
+    universe = _build_test_universe()
+    for r in universe:
+        r["source_run_id"] = "OTHER-RUN"
+    run_dir = _write_replay_run(
+        out, trade_date="20260810", run_id="rid-mismatch", universe=universe
+    )
+    integ = verify_screener_scores_integrity(run_dir, expected_run_id="rid-mismatch")
+    assert integ["status"] == "FAIL"
+    assert not integ["source_run_id_ok"]
+    days, _meta = load_replay_days(
+        output_dir=out,
+        market=MARKET,
+        session=SESSION,
+        start_trade_date=START,
+        end_trade_date=END,
+    )
+    assert days == []
+
+
+def test_no_data_status_when_all_excluded(tmp_path: Path):
+    out = tmp_path / "output"
+    run_dir = _write_replay_run(
+        out, trade_date="20260810", run_id="all-excl", universe=_build_test_universe()
+    )
+    _rewrite_manifest_scores_entry(run_dir, sha256="0" * 64)
+    report, _ = run_full_universe_replay(
+        market=MARKET,
+        session=SESSION,
+        start_trade_date=START,
+        end_trade_date=END,
+        output_dir=out,
+    )
+    assert report["status"] == STATUS_NO_DATA
+    assert (report.get("universe_meta") or {}).get("included_days") == 0
+
+
+def test_baseline_replay_gate_still_blocks_shadow(tmp_path: Path):
+    out = tmp_path / "output"
+    universe = _build_test_universe()
+    # Force Production candidates that cannot match replay pipeline output
+    fake_cands = [{"Ticker": "ZZZZ", "Score": 0.99}]
+    _write_replay_run(
+        out,
+        trade_date="20260810",
+        run_id="mismatch-base",
+        universe=universe,
+        candidates=fake_cands,
+    )
+    report, _ = run_full_universe_replay(
+        market=MARKET,
+        session=SESSION,
+        start_trade_date=START,
+        end_trade_date=END,
+        output_dir=out,
+    )
+    assert report.get("baseline_replay", {}).get("ok") is False
+    for name, v in (report.get("shadow_verdicts") or {}).items():
+        assert v.get("status") == "SHADOW_REJECTED"
+
+
+def test_assess_decision_run_trust_matches_quality_helper(tmp_path: Path):
+    """Shared helper agrees with Quality detector; does not change Quality contract."""
+    out = tmp_path / "output"
+    run_dir = _write_replay_run(
+        out, trade_date="20260811", run_id="shared", universe=_build_test_universe()
+    )
+    clean = assess_decision_run_trust(run_dir)
+    assert clean["trust_status"] == TRUSTED
+    _inject_legacy_meta_self_hash(run_dir)
+    warned = assess_decision_run_trust(run_dir)
+    assert warned["trust_status"] == TRUSTED_WITH_WARNING
+    assert warned["trust_reason"] == LEGACY_META_SELF_HASH_MISMATCH

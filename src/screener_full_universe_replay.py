@@ -54,10 +54,33 @@ from screener_weight_simulation import (  # noqa: E402
 )
 
 SCOPE_NOTE = "FULL_UNIVERSE_REPLAY"
+STATUS_NO_DATA = "NO_DATA"
 
 TRUSTED = "TRUSTED"
 TRUSTED_WITH_WARNING = "TRUSTED_WITH_WARNING"
 LEGACY_UNTRUSTED = "LEGACY_UNTRUSTED"
+LEGACY_META_SELF_HASH_MISMATCH = "LEGACY_META_SELF_HASH_MISMATCH"
+
+PRIMARY_SCORES_ARTIFACT = "screener_scores.json"
+
+# Core Production factors (aliases resolved via extract_factor_value)
+REQUIRED_SCORE_FACTORS = FACTOR_NAMES
+# Fields the replay pipeline reads (presence OR documented default)
+REQUIRED_SCORE_IDENTITY = ("ticker", "score")
+REQUIRED_PIPELINE_FIELDS = (
+    "momentum_pass",
+    "volatility_pass",
+    "issuer_group",
+    "sector",
+    "production_candidate",
+)
+# Eligibility: at least one of these must be present
+ELIGIBILITY_FIELD_ALTS = (
+    "eligibility_status",
+    "eligibility_pass",
+    "exclusion_reasons",
+    "exclude_reasons",
+)
 
 WARNING_BASELINE_REPLAY_MISMATCH = "BASELINE_REPLAY_MISMATCH"
 WARNING_LOW_SAMPLE = "LOW_SAMPLE"
@@ -89,54 +112,253 @@ def _load_json(path: Path) -> Any:
 
 
 def assess_run_trust(run_dir: Path) -> Dict[str, Any]:
-    """Manifest/hash verification; never mutates artifacts."""
-    from screener_artifacts import verify_manifest_integrity
+    """Delegate to canonical Quality decision-run trust semantics.
+
+    Never invents a stricter Replay-only policy for historical meta self-hash.
+    """
+    from screener_quality import assess_decision_run_trust
+
+    trust = assess_decision_run_trust(Path(run_dir))
+    return {
+        "status": trust.get("trust_status") or trust.get("status") or LEGACY_UNTRUSTED,
+        "trust_status": trust.get("trust_status") or LEGACY_UNTRUSTED,
+        "trust_reason": trust.get("trust_reason") or "UNKNOWN",
+        "manifest_ok": bool(trust.get("manifest_ok")),
+        "issues": list(trust.get("issues") or []),
+        "reasons": list(trust.get("reasons") or []),
+        "source_artifact": PRIMARY_SCORES_ARTIFACT,
+    }
+
+
+def _row_has_any_key(row: Dict[str, Any], keys: Sequence[str]) -> bool:
+    return any(k in row and row.get(k) is not None for k in keys)
+
+
+def _resolve_ticker_field(row: Dict[str, Any]) -> Optional[str]:
+    t = _ticker_of(row)
+    return t or None
+
+
+def _resolve_score_field(row: Dict[str, Any]) -> Optional[float]:
+    return _safe_float(row.get("score") if row.get("score") is not None else row.get("Score"))
+
+
+def verify_screener_scores_integrity(
+    run_dir: Path,
+    *,
+    expected_run_id: Optional[str] = None,
+    expected_market: Optional[str] = None,
+    expected_session: Optional[str] = None,
+    expected_trade_date: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Independent integrity check for primary Replay artifact screener_scores.json."""
+    from screener_artifacts import sha256_file
+    from screener_factor_analysis import extract_factor_value
 
     run_dir = Path(run_dir)
-    meta = _load_json(run_dir / "screener_run_meta.json") or {}
-    run_mode = str(meta.get("run_mode") or "").upper()
-    if run_mode and run_mode != "DECISION":
-        return {
-            "status": LEGACY_UNTRUSTED,
-            "manifest_ok": False,
-            "issues": ["NON_DECISION_RUN"],
-            "source_artifact": None,
-        }
-    man_path = run_dir / "manifest.json"
-    if not man_path.exists():
-        if (run_dir / "screener_scores.json").exists():
-            return {
-                "status": TRUSTED_WITH_WARNING,
-                "manifest_ok": False,
-                "issues": ["MANIFEST_MISSING"],
-                "source_artifact": "screener_scores.json",
-            }
-        return {
-            "status": LEGACY_UNTRUSTED,
-            "manifest_ok": False,
-            "issues": ["MANIFEST_MISSING"],
-            "source_artifact": None,
-        }
-    man_ok, issues = verify_manifest_integrity(run_dir)
-    if not man_ok:
-        return {
-            "status": LEGACY_UNTRUSTED,
-            "manifest_ok": False,
-            "issues": issues,
-            "source_artifact": None,
-        }
-    if issues:
-        return {
-            "status": TRUSTED_WITH_WARNING,
-            "manifest_ok": True,
-            "issues": issues,
-            "source_artifact": "screener_scores.json",
-        }
+    result: Dict[str, Any] = {
+        "status": "FAIL",
+        "artifact": PRIMARY_SCORES_ARTIFACT,
+        "file_exists": False,
+        "sha_ok": False,
+        "row_count_ok": False,
+        "json_ok": False,
+        "schema_ok": False,
+        "source_run_id_ok": True,
+        "path_consistency_ok": True,
+        "row_count": 0,
+        "reasons": [],
+        "rows": [],
+    }
+    scores_path = run_dir / PRIMARY_SCORES_ARTIFACT
+    if not scores_path.exists():
+        result["reasons"].append("SCORES_MISSING")
+        return result
+    result["file_exists"] = True
+
+    man = _load_json(run_dir / "manifest.json") or {}
+    arts = man.get("artifacts") if isinstance(man, dict) else {}
+    art_info = (arts or {}).get(PRIMARY_SCORES_ARTIFACT) if isinstance(arts, dict) else {}
+    if not isinstance(art_info, dict):
+        art_info = {}
+
+    expected_sha = art_info.get("sha256")
+    try:
+        actual_sha = sha256_file(scores_path)
+    except Exception:
+        result["reasons"].append("SCORES_SHA_UNREADABLE")
+        return result
+    if expected_sha:
+        result["sha_ok"] = actual_sha == expected_sha
+        if not result["sha_ok"]:
+            result["reasons"].append("SCORES_SHA_MISMATCH")
+    else:
+        # Manifest entry without sha — cannot claim PASS
+        result["sha_ok"] = False
+        result["reasons"].append("SCORES_SHA_MISSING_IN_MANIFEST")
+
+    data = _load_json(scores_path)
+    if not isinstance(data, list):
+        result["reasons"].append("SCORES_NOT_LIST")
+        return result
+    result["json_ok"] = True
+    result["row_count"] = len(data)
+    result["rows"] = [r for r in data if isinstance(r, dict)]
+
+    exp_rc = art_info.get("row_count")
+    if exp_rc is not None:
+        result["row_count_ok"] = int(exp_rc) == int(len(data))
+        if not result["row_count_ok"]:
+            result["reasons"].append("SCORES_ROW_COUNT_MISMATCH")
+    else:
+        result["row_count_ok"] = True  # no declared count to contradict
+
+    if not result["rows"]:
+        result["reasons"].append("SCORES_EMPTY")
+        return result
+
+    # Schema: required factors + identity + pipeline fields used by replay
+    schema_ok = True
+    for row in result["rows"][: min(20, len(result["rows"]))]:
+        if not _resolve_ticker_field(row):
+            schema_ok = False
+            result["reasons"].append("SCHEMA_MISSING_TICKER")
+            break
+        if _resolve_score_field(row) is None:
+            schema_ok = False
+            result["reasons"].append("SCHEMA_MISSING_SCORE")
+            break
+        for fac in REQUIRED_SCORE_FACTORS:
+            if extract_factor_value(row, fac) is None:
+                schema_ok = False
+                result["reasons"].append(f"SCHEMA_MISSING_FACTOR:{fac}")
+                break
+        if not schema_ok:
+            break
+        if not any(_row_has_any_key(row, [a]) for a in ELIGIBILITY_FIELD_ALTS):
+            # eligibility_status may be derived later; require at least exclusion list or status
+            if "held" not in row and "exclusion_reasons" not in row and "exclude_reasons" not in row:
+                schema_ok = False
+                result["reasons"].append("SCHEMA_MISSING_ELIGIBILITY")
+                break
+        for fld in ("momentum_pass", "volatility_pass"):
+            if fld not in row:
+                schema_ok = False
+                result["reasons"].append(f"SCHEMA_MISSING:{fld}")
+                break
+        if not schema_ok:
+            break
+        if not _row_has_any_key(row, ("issuer_group", "IssuerGroup")):
+            # issuer defaults to ticker in normalize — warn but allow if ticker present
+            pass
+        if not _row_has_any_key(row, ("sector", "Sector")):
+            schema_ok = False
+            result["reasons"].append("SCHEMA_MISSING_SECTOR")
+            break
+        if "production_candidate" not in row:
+            schema_ok = False
+            result["reasons"].append("SCHEMA_MISSING_PRODUCTION_CANDIDATE")
+            break
+    result["schema_ok"] = schema_ok
+
+    # source_run_id consistency when present on rows
+    if expected_run_id:
+        mismatched = [
+            r
+            for r in result["rows"]
+            if r.get("source_run_id") is not None
+            and str(r.get("source_run_id")) != str(expected_run_id)
+        ]
+        if mismatched:
+            result["source_run_id_ok"] = False
+            result["reasons"].append("SOURCE_RUN_ID_MISMATCH")
+
+    # Path vs declared identity
+    parts = {p.name for p in run_dir.parents}
+    parts.add(run_dir.name)
+    if expected_market and expected_market.upper() not in {p.upper() for p in parts}:
+        # path layout: .../decision/{MARKET}/{date}/{session}/{run_id}
+        try:
+            sess_dir = run_dir.parent
+            date_dir = sess_dir.parent
+            mkt_dir = date_dir.parent
+            if str(mkt_dir.name).upper() != str(expected_market).upper():
+                result["path_consistency_ok"] = False
+                result["reasons"].append("PATH_MARKET_MISMATCH")
+            if expected_trade_date and str(date_dir.name) != str(expected_trade_date):
+                result["path_consistency_ok"] = False
+                result["reasons"].append("PATH_TRADE_DATE_MISMATCH")
+            if expected_session and str(sess_dir.name).lower() != str(expected_session).lower():
+                result["path_consistency_ok"] = False
+                result["reasons"].append("PATH_SESSION_MISMATCH")
+        except Exception:
+            pass
+
+    if (
+        result["sha_ok"]
+        and result["row_count_ok"]
+        and result["json_ok"]
+        and result["schema_ok"]
+        and result["source_run_id_ok"]
+        and result["path_consistency_ok"]
+        and not result["reasons"]
+    ):
+        result["status"] = "PASS"
+    elif (
+        result["sha_ok"]
+        and result["row_count_ok"]
+        and result["json_ok"]
+        and result["schema_ok"]
+        and result["source_run_id_ok"]
+        and result["path_consistency_ok"]
+    ):
+        # reasons may still list soft notes — treat as PASS only when empty
+        result["status"] = "PASS" if not result["reasons"] else "FAIL"
+    else:
+        result["status"] = "FAIL"
+
+    # Drop bulky rows from return for callers that only need status
+    rows = result.pop("rows")
+    result["rows"] = rows  # keep for load_replay_days
+    return result
+
+
+def replay_inclusion_decision(
+    trust: Dict[str, Any],
+    scores_integrity: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Include TRUSTED or LEGACY_META_SELF_HASH warning runs with PASS scores integrity."""
+    status = trust.get("trust_status") or trust.get("status")
+    reason = trust.get("trust_reason") or ""
+    scores_pass = scores_integrity.get("status") == "PASS"
+
+    included = False
+    exclusion_reason: Optional[str] = None
+    if status == TRUSTED and scores_pass:
+        included = True
+    elif (
+        status == TRUSTED_WITH_WARNING
+        and reason == LEGACY_META_SELF_HASH_MISMATCH
+        and scores_pass
+    ):
+        included = True
+    elif status == LEGACY_UNTRUSTED:
+        exclusion_reason = reason or LEGACY_UNTRUSTED
+    elif status == TRUSTED_WITH_WARNING and reason != LEGACY_META_SELF_HASH_MISMATCH:
+        exclusion_reason = f"UNACCEPTED_WARNING:{reason}"
+    elif not scores_pass:
+        exclusion_reason = "SCORES_INTEGRITY_FAIL:" + ",".join(
+            scores_integrity.get("reasons") or ["UNKNOWN"]
+        )
+    else:
+        exclusion_reason = f"UNACCEPTED_TRUST:{status}:{reason}"
+
     return {
-        "status": TRUSTED,
-        "manifest_ok": True,
-        "issues": [],
-        "source_artifact": "screener_scores.json",
+        "included": included,
+        "exclusion_reason": exclusion_reason,
+        "trust_status": status,
+        "trust_reason": reason,
+        "artifact_integrity_status": scores_integrity.get("status"),
     }
 
 
@@ -572,7 +794,7 @@ def load_replay_days(
     start_trade_date: str,
     end_trade_date: str,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    """Load trusted DECISION runs with full scored universe in window."""
+    """Load includable DECISION runs with verified full scored universe."""
     from screener_factor_analysis import discover_runs_in_window, inspect_artifact_factor_schema
 
     discovered = discover_runs_in_window(
@@ -584,32 +806,80 @@ def load_replay_days(
     )
     days: List[Dict[str, Any]] = []
     source_counts: Counter = Counter()
-    trust_counts: Counter = Counter()
+    trust_counts_raw: Counter = Counter()
+    accepted_trust_counts: Counter = Counter()
+    excluded_trust_counts: Counter = Counter()
+    artifact_integrity_counts: Counter = Counter()
+    run_decisions: List[Dict[str, Any]] = []
     universe_sizes: List[int] = []
     sample_rows: List[Dict[str, Any]] = []
 
     for run_dir in discovered.run_dirs:
         run_dir = Path(run_dir)
         merged = discovered.merged_by_run.get(str(run_dir)) or {}
+        trade_date = str(merged.get("trade_date") or "")
+        market_v = str(merged.get("market") or market).upper()
+        session_v = str(merged.get("session") or session).lower()
+        run_id = str(merged.get("run_id") or run_dir.name)
+
         trust = assess_run_trust(run_dir)
-        if trust["status"] == LEGACY_UNTRUSTED:
-            trust_counts[LEGACY_UNTRUSTED] += 1
+        trust_counts_raw[trust["trust_status"]] += 1
+
+        scores_integrity = verify_screener_scores_integrity(
+            run_dir,
+            expected_run_id=run_id,
+            expected_market=market_v,
+            expected_session=session_v,
+            expected_trade_date=trade_date,
+        )
+        # Avoid carrying full row payloads in decisions
+        integrity_summary = {
+            k: v for k, v in scores_integrity.items() if k != "rows"
+        }
+        artifact_integrity_counts[scores_integrity.get("status") or "FAIL"] += 1
+
+        decision = replay_inclusion_decision(trust, scores_integrity)
+        decision_rec = {
+            "trade_date": trade_date,
+            "run_id": run_id,
+            "trust_status": decision["trust_status"],
+            "trust_reason": decision["trust_reason"],
+            "artifact": PRIMARY_SCORES_ARTIFACT,
+            "artifact_sha_ok": bool(scores_integrity.get("sha_ok")),
+            "artifact_row_count_ok": bool(scores_integrity.get("row_count_ok")),
+            "schema_ok": bool(scores_integrity.get("schema_ok")),
+            "artifact_integrity_status": decision["artifact_integrity_status"],
+            "included": decision["included"],
+            "exclusion_reason": decision["exclusion_reason"],
+            "screener_scores_integrity": scores_integrity.get("status"),
+        }
+        run_decisions.append(decision_rec)
+
+        if not decision["included"]:
+            excluded_trust_counts[trust["trust_status"]] += 1
             continue
-        trust_counts[trust["status"]] += 1
-        universe, source_name, src_meta = resolve_full_scored_universe(run_dir)
+
+        accepted_trust_counts[trust["trust_status"]] += 1
+        universe = list(scores_integrity.get("rows") or [])
         if not universe:
+            # Fallback resolve (should not happen after PASS)
+            universe, source_name, src_meta = resolve_full_scored_universe(run_dir)
+        else:
+            source_name = PRIMARY_SCORES_ARTIFACT
+            src_meta = {"source": source_name, "row_count": len(universe)}
+
+        if not universe:
+            excluded_trust_counts[trust["trust_status"]] += 1
+            decision_rec["included"] = False
+            decision_rec["exclusion_reason"] = "SCORES_EMPTY_AFTER_PASS"
             continue
+
         source_counts[source_name] += 1
         universe_sizes.append(len(universe))
         if len(sample_rows) < 50:
             sample_rows.extend(universe[: max(0, 50 - len(sample_rows))])
 
-        trade_date = str(merged.get("trade_date") or "")
-        market_v = str(merged.get("market") or market).upper()
-        session_v = str(merged.get("session") or session).lower()
-        run_id = str(merged.get("run_id") or run_dir.name)
         regime = load_market_regime(run_dir, merged)
-
         hydrated = [
             normalize_score_record(
                 r,
@@ -623,7 +893,9 @@ def load_replay_days(
         actual_cands = load_actual_production_candidates(run_dir)
         actual_tickers = [_ticker_of(c) for c in actual_cands if _ticker_of(c)]
         actual_scores = {
-            _ticker_of(c): _safe_float(c.get("Score") if c.get("Score") is not None else c.get("score"))
+            _ticker_of(c): _safe_float(
+                c.get("Score") if c.get("Score") is not None else c.get("score")
+            )
             for c in actual_cands
             if _ticker_of(c)
         }
@@ -636,8 +908,12 @@ def load_replay_days(
                 "source_run_id": run_id,
                 "run_dir": str(run_dir),
                 "regime": regime,
-                "trust_status": trust["status"],
+                "trust_status": trust["trust_status"],
+                "trust_reason": trust["trust_reason"],
                 "trust_issues": trust.get("issues") or [],
+                "artifact_integrity_status": scores_integrity.get("status"),
+                "screener_scores_integrity": integrity_summary,
+                "included_for_replay": True,
                 "universe_source": source_name,
                 "universe_source_meta": src_meta,
                 "universe_rows": hydrated,
@@ -650,12 +926,21 @@ def load_replay_days(
     schema = inspect_artifact_factor_schema(sample_rows) if sample_rows else {}
     meta = {
         "included_days": len(days),
-        "trust_counts": dict(trust_counts),
+        "trust_counts": dict(accepted_trust_counts),  # backward-compatible = accepted
+        "trust_counts_raw": dict(trust_counts_raw),
+        "accepted_trust_counts": dict(accepted_trust_counts),
+        "excluded_trust_counts": dict(excluded_trust_counts),
+        "artifact_integrity_counts": dict(artifact_integrity_counts),
+        "run_decisions": run_decisions,
         "universe_source_counts": dict(source_counts),
-        "avg_universe_size": round(sum(universe_sizes) / len(universe_sizes), 2) if universe_sizes else 0,
-        "universe_size_by_date": {d["trade_date"]: len(d["universe_rows"]) for d in days},
+        "avg_universe_size": (
+            round(sum(universe_sizes) / len(universe_sizes), 2) if universe_sizes else 0
+        ),
+        "universe_size_by_date": {
+            d["trade_date"]: len(d["universe_rows"]) for d in days
+        },
         "factor_schema": schema,
-        "primary_universe_artifact": "screener_scores.json",
+        "primary_universe_artifact": PRIMARY_SCORES_ARTIFACT,
         "scope": SCOPE_NOTE,
     }
     return days, meta
@@ -909,7 +1194,7 @@ def analyze_full_universe_replay(
     if not days or not all_universe_rows:
         warnings.append({"type": "NO_TRUSTED_RUNS", "detail": "no trusted DECISION runs with scored universe in window"})
         return {
-            "status": STATUS_OK,
+            "status": STATUS_NO_DATA,
             "scope": SCOPE_NOTE,
             "market": market,
             "session": session,
@@ -1353,6 +1638,10 @@ def render_markdown(report: Dict[str, Any]) -> str:
     lines.append(f"- Status: `{report.get('status')}` · scope=`{report.get('scope')}`")
     lines.append(f"- Primary universe artifact: `{um.get('primary_universe_artifact')}`")
     lines.append(f"- Included days: {um.get('included_days')} · avg universe size: {um.get('avg_universe_size')}")
+    lines.append(f"- trust_counts_raw: `{um.get('trust_counts_raw')}`")
+    lines.append(f"- accepted_trust_counts: `{um.get('accepted_trust_counts')}`")
+    lines.append(f"- excluded_trust_counts: `{um.get('excluded_trust_counts')}`")
+    lines.append(f"- artifact_integrity_counts: `{um.get('artifact_integrity_counts')}`")
     br = report.get("baseline_replay") or {}
     lines.append(f"- Baseline replay match avg: {br.get('avg_match_pct')}% · ok={br.get('ok')}")
     lines.append("- Production policy: **unchanged**")
@@ -1512,6 +1801,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "json": str(paths["json"]),
         "md": str(paths["md"]),
         "included_days": (report.get("universe_meta") or {}).get("included_days"),
+        "trust_counts_raw": (report.get("universe_meta") or {}).get("trust_counts_raw"),
+        "accepted_trust_counts": (report.get("universe_meta") or {}).get("accepted_trust_counts"),
+        "excluded_trust_counts": (report.get("universe_meta") or {}).get("excluded_trust_counts"),
+        "artifact_integrity_counts": (report.get("universe_meta") or {}).get(
+            "artifact_integrity_counts"
+        ),
         "baseline_replay_ok": (report.get("baseline_replay") or {}).get("ok"),
         "baseline_avg_match_pct": (report.get("baseline_replay") or {}).get("avg_match_pct"),
         "production_inputs_unchanged": report.get("production_inputs_unchanged"),
@@ -1525,9 +1820,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "recommendation": report.get("recommendation"),
     }
     print(json.dumps(summary, indent=2, ensure_ascii=False))
-    if report.get("status") == STATUS_BASELINE_FAILED:
+    status = report.get("status")
+    if status == STATUS_BASELINE_FAILED:
         return 3
-    if not (report.get("universe_meta") or {}).get("included_days"):
+    if status == STATUS_NO_DATA or not (report.get("universe_meta") or {}).get("included_days"):
         return 2
     return 0
 
