@@ -423,5 +423,14 @@
     "critical_on_failed_marked_as_executed": true,
     "warn_on_missing_kis_endpoint_evidence": true,
     "warn_on_partial_exchange_coverage": true
+  },
+
+  // 품질 분석 전용 (trader/screener Production 미사용)
+  "quality_policy": {
+    "structural_min_days": 20,
+    "outcome_min_1d": 30,
+    "outcome_min_5d": 30,
+    "outcome_min_10d": 20,
+    "policy_review_min_5d": 40
   }
 }

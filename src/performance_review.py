@@ -1260,6 +1260,65 @@ def _collect_scoped_stale_artifact_paths(
     return dated_paths, latest_by_kind
 
 
+def _load_companion_screener_result_status(path: Path) -> Optional[str]:
+    """Resolve result_status from sibling screener_run_meta for candidates files."""
+    name = path.name
+    # screener_candidates_YYYYMMDD_sess_MKT.json (not full)
+    if not name.startswith("screener_candidates_") or "full" in name.lower():
+        # Also support run-dir relative name
+        if name != "screener_candidates.json":
+            return None
+    meta_path: Optional[Path] = None
+    if name == "screener_candidates.json":
+        meta_path = path.parent / "screener_run_meta.json"
+    else:
+        meta_name = name.replace("screener_candidates_", "screener_run_meta_", 1)
+        meta_path = path.parent / meta_name
+        if not meta_path.exists():
+            # Fixed artifacts may sit beside dated meta with same suffix
+            suffix = name[len("screener_candidates_") :]
+            alt = path.parent / f"screener_run_meta_{suffix}"
+            meta_path = alt if alt.exists() else meta_path
+    if meta_path is None or not meta_path.exists():
+        return None
+    try:
+        with open(meta_path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        if isinstance(payload, dict):
+            return str(payload.get("result_status") or "") or None
+    except Exception:
+        return None
+    return None
+
+
+def _screener_candidates_empty_list_semantics(path: Path) -> Optional[str]:
+    """Return semantic label for screener_candidates empty/non-empty checks."""
+    name = path.name
+    is_cands = name == "screener_candidates.json" or (
+        name.startswith("screener_candidates_") and "full" not in name.lower()
+    )
+    if not is_cands:
+        return None
+    status = _load_companion_screener_result_status(path)
+    if not status:
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except Exception:
+        return None
+    n = len(payload) if isinstance(payload, list) else -1
+    if status == "EMPTY_VALID" and n == 0:
+        return "VALID_EMPTY_RESULT"
+    if status == "HAS_CANDIDATES" and n == 0:
+        return "HAS_CANDIDATES_EMPTY_LIST"
+    if status == "EMPTY_VALID" and n > 0:
+        return "EMPTY_VALID_NONEMPTY"
+    if status == "HAS_CANDIDATES" and n > 0:
+        return "HAS_CANDIDATES_NONEMPTY"
+    return None
+
+
 def _stale_artifact_findings_for_path(
     path: Path,
     *,
@@ -1309,6 +1368,31 @@ def _stale_artifact_findings_for_path(
         return findings
 
     if root_type == "list" and int(meta.get("item_count") or 0) == 0:
+        # Screener candidates: EMPTY_VALID + [] is a valid empty result, not an error.
+        empty_sem = _screener_candidates_empty_list_semantics(path)
+        if empty_sem == "VALID_EMPTY_RESULT":
+            findings.append(make_finding(
+                "VALID_EMPTY_RESULT", "INFO", "",
+                f"{path.name}: EMPTY_VALID with empty candidates list",
+                "정상 무후보 결과", "재실행 불필요",
+                category="DATA_QUALITY",
+                evidence_source_file=src,
+                evidence_trade_date=str(meta.get("artifact_date") or ""),
+            ))
+            return findings
+        if empty_sem == "HAS_CANDIDATES_EMPTY_LIST":
+            findings.append(make_finding(
+                "ARTIFACT_EMPTY_LIST", stale_sev, "",
+                f"{path.name}: HAS_CANDIDATES but empty candidates list",
+                "후보 상태와 artifact 불일치", "스크리너 DECISION 재실행",
+                category="DATA_QUALITY",
+                evidence_source_file=src,
+                evidence_trade_date=str(meta.get("artifact_date") or ""),
+            ))
+            return findings
+        if empty_sem == "EMPTY_VALID_NONEMPTY":
+            # Handled when non-empty; should not reach here
+            pass
         findings.append(make_finding(
             "ARTIFACT_EMPTY_LIST", stale_sev, "",
             f"{path.name}: empty list root",
@@ -1318,6 +1402,20 @@ def _stale_artifact_findings_for_path(
             evidence_trade_date=str(meta.get("artifact_date") or ""),
         ))
         return findings
+
+    # Non-empty candidates with EMPTY_VALID is an error
+    if root_type == "list" and int(meta.get("item_count") or 0) > 0:
+        empty_sem = _screener_candidates_empty_list_semantics(path)
+        if empty_sem == "EMPTY_VALID_NONEMPTY":
+            findings.append(make_finding(
+                "EMPTY_VALID_NONEMPTY_CANDIDATES", stale_sev, "",
+                f"{path.name}: EMPTY_VALID but non-empty candidates",
+                "후보 상태와 artifact 불일치", "스크리너 DECISION 재실행",
+                category="DATA_QUALITY",
+                evidence_source_file=src,
+                evidence_trade_date=str(meta.get("artifact_date") or ""),
+            ))
+            return findings
 
     artifact_date = str(meta.get("artifact_date") or "").strip()
     generated_at = str(

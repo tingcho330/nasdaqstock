@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 import math
 import time
+from collections import Counter
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
@@ -952,6 +953,201 @@ def classify_liquidity_shadow_status(
     return "SUCCESS"
 
 
+SCORING_PIPELINE_VERSION = "production_v1"
+
+# Favorable constant defaults historically applied when PER/PBR missing (US Marcap=0).
+_DEFAULT_FIN_SCORE = 0.65
+_DEFAULT_PER = 20.0
+_DEFAULT_PBR = 1.5
+
+
+def _is_missing_valuation(val: Any) -> bool:
+    f = _safe_float(val)
+    if f is None:
+        return True
+    return f == 0.0
+
+
+def annotate_fundamental_parity_fields(
+    row: Dict[str, Any],
+    *,
+    fin_info: Optional[Any] = None,
+    score_reused: bool = False,
+    fundamental_source: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Attach observability-only fundamental parity fields (never used by trader)."""
+    rec = dict(row)
+    per_raw = None
+    pbr_raw = None
+    if fin_info is not None:
+        try:
+            per_raw = fin_info.get("PER") if hasattr(fin_info, "get") else None
+            pbr_raw = fin_info.get("PBR") if hasattr(fin_info, "get") else None
+        except Exception:
+            per_raw = None
+            pbr_raw = None
+    if per_raw is None:
+        per_raw = rec.get("per") if "per" in rec else rec.get("PER")
+    if pbr_raw is None:
+        pbr_raw = rec.get("pbr") if "pbr" in rec else rec.get("PBR")
+
+    per_missing = _is_missing_valuation(per_raw)
+    pbr_missing = _is_missing_valuation(pbr_raw)
+    if not per_missing and not pbr_missing:
+        fund_q = "AVAILABLE"
+    elif per_missing and pbr_missing:
+        fund_q = "UNAVAILABLE"
+    else:
+        fund_q = "PARTIAL"
+
+    default_used = bool(per_missing or pbr_missing)
+    # Detect the known favorable constant pattern on the scored output
+    fin = _safe_float(rec.get("fin_score") if "fin_score" in rec else rec.get("FinScore"))
+    per_out = _safe_float(rec.get("per") if "per" in rec else rec.get("PER"))
+    pbr_out = _safe_float(rec.get("pbr") if "pbr" in rec else rec.get("PBR"))
+    looks_like_default = (
+        fin is not None
+        and abs(fin - _DEFAULT_FIN_SCORE) < 1e-9
+        and per_out is not None
+        and abs(per_out - _DEFAULT_PER) < 1e-9
+        and pbr_out is not None
+        and abs(pbr_out - _DEFAULT_PBR) < 1e-9
+    )
+    if looks_like_default:
+        default_used = True
+
+    if score_reused:
+        rec["score_feature_source"] = "PRODUCTION_REUSED"
+        rec["fundamental_source"] = fundamental_source or "PRODUCTION_SCORE_RECORD"
+    else:
+        rec["score_feature_source"] = "SHADOW_SCORED_VIA_PRODUCTION_PIPELINE"
+        rec["fundamental_source"] = fundamental_source or (
+            "GET_FUNDAMENTALS" if fund_q != "UNAVAILABLE" else "MISSING"
+        )
+
+    rec["fundamental_loaded"] = fund_q != "UNAVAILABLE"
+    rec["fundamental_default_used"] = bool(default_used)
+    rec["scoring_pipeline_version"] = SCORING_PIPELINE_VERSION
+    rec["feature_quality"] = {
+        "fundamentals": fund_q,
+        "technical": "AVAILABLE" if _safe_float(rec.get("tech_score") or rec.get("TechScore")) is not None else "UNKNOWN",
+        "market": "AVAILABLE",
+    }
+    if fund_q == "UNAVAILABLE" and not score_reused:
+        rec.setdefault("score_status", rec.get("score_status") or "SUCCESS_WITH_PARTIAL_FEATURES")
+    return rec
+
+
+def compute_fundamental_parity_diagnostics(
+    score_rows: Sequence[Dict[str, Any]],
+    *,
+    constant_dominance_ratio: float = 0.95,
+) -> Dict[str, Any]:
+    """Compare Production-reused vs Shadow-only fundamental feature distributions."""
+    prod = [
+        r
+        for r in score_rows
+        if r.get("score_reused")
+        or r.get("score_feature_source") == "PRODUCTION_REUSED"
+        or r.get("source_universe") == "PRODUCTION_AND_LIQUIDITY_SHADOW"
+    ]
+    shadow = [
+        r
+        for r in score_rows
+        if (not r.get("score_reused"))
+        and (
+            r.get("score_feature_source") == "SHADOW_SCORED_VIA_PRODUCTION_PIPELINE"
+            or r.get("source_universe") == "LIQUIDITY_SHADOW_ONLY"
+        )
+    ]
+
+    def _fin_vals(rows: Sequence[Dict[str, Any]]) -> List[float]:
+        out: List[float] = []
+        for r in rows:
+            v = _safe_float(r.get("fin_score") if "fin_score" in r else r.get("FinScore"))
+            if v is not None:
+                out.append(round(v, 4))
+        return out
+
+    def _default_rate(rows: Sequence[Dict[str, Any]]) -> Optional[float]:
+        if not rows:
+            return None
+        n = sum(1 for r in rows if r.get("fundamental_default_used"))
+        return round(n / len(rows), 6)
+
+    def _missing_rate(rows: Sequence[Dict[str, Any]]) -> Optional[float]:
+        if not rows:
+            return None
+        n = 0
+        for r in rows:
+            fq = (r.get("feature_quality") or {}).get("fundamentals")
+            if fq == "UNAVAILABLE" or (
+                r.get("fundamental_loaded") is False and not r.get("score_reused")
+            ):
+                n += 1
+        return round(n / len(rows), 6)
+
+    prod_fins = _fin_vals(prod)
+    shadow_fins = _fin_vals(shadow)
+    prod_unique = len(set(prod_fins))
+    shadow_unique = len(set(shadow_fins))
+
+    suspicious = False
+    suspicious_reasons: List[str] = []
+    if len(shadow_fins) >= 5:
+        cnt = Counter(shadow_fins)
+        top_fin, top_n = cnt.most_common(1)[0]
+        if top_n / len(shadow_fins) >= constant_dominance_ratio:
+            # Check PER/PBR lockstep
+            pers = [
+                _safe_float(r.get("per") if "per" in r else r.get("PER")) for r in shadow
+            ]
+            pbrs = [
+                _safe_float(r.get("pbr") if "pbr" in r else r.get("PBR")) for r in shadow
+            ]
+            pers_ok = [p for p in pers if p is not None]
+            pbrs_ok = [p for p in pbrs if p is not None]
+            per_dom = False
+            pbr_dom = False
+            if pers_ok:
+                pc = Counter(round(p, 2) for p in pers_ok)
+                per_dom = pc.most_common(1)[0][1] / len(pers_ok) >= constant_dominance_ratio
+            if pbrs_ok:
+                bc = Counter(round(p, 2) for p in pbrs_ok)
+                pbr_dom = bc.most_common(1)[0][1] / len(pbrs_ok) >= constant_dominance_ratio
+            if per_dom and pbr_dom:
+                suspicious = True
+                suspicious_reasons.append(
+                    f"SHADOW_CONSTANT_FEATURES:fin={top_fin},ratio={top_n/len(shadow_fins):.3f}"
+                )
+
+    prod_def = _default_rate(prod)
+    shadow_def = _default_rate(shadow)
+    if (
+        prod_def is not None
+        and shadow_def is not None
+        and shadow_def - prod_def >= 0.5
+        and len(shadow) >= 5
+    ):
+        suspicious = True
+        suspicious_reasons.append(
+            f"DEFAULT_RATE_GAP:prod={prod_def},shadow={shadow_def}"
+        )
+
+    return {
+        "production_unique_fin_scores": prod_unique,
+        "shadow_only_unique_fin_scores": shadow_unique,
+        "production_default_rate": prod_def,
+        "shadow_only_default_rate": shadow_def,
+        "missing_fundamental_rate": _missing_rate(shadow),
+        "suspicious_constant_feature_detected": suspicious,
+        "suspicious_reasons": suspicious_reasons,
+        "production_row_count": len(prod),
+        "shadow_only_row_count": len(shadow),
+        "scoring_pipeline_version": SCORING_PIPELINE_VERSION,
+    }
+
+
 def summarize_liquidity_shadow_meta(
     *,
     base_meta: Dict[str, Any],
@@ -1028,11 +1224,17 @@ def summarize_liquidity_shadow_meta(
             "warnings": list(warnings or []),
             "errors": list(errors or []),
             "used_by_trader": False,
+            "fundamental_parity": compute_fundamental_parity_diagnostics(score_rows),
             **DIAGNOSTIC_META,
         }
     )
     if time_budget_exceeded and "TIME_BUDGET_EXCEEDED" not in out["warnings"]:
         out["warnings"].append("TIME_BUDGET_EXCEEDED")
+    fp = out.get("fundamental_parity") or {}
+    if fp.get("suspicious_constant_feature_detected"):
+        for reason in fp.get("suspicious_reasons") or ["SUSPICIOUS_CONSTANT_FEATURES"]:
+            if reason not in out["warnings"]:
+                out["warnings"].append(str(reason))
     return out
 
 

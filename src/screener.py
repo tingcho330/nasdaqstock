@@ -7,7 +7,7 @@ import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Dict, Optional, List, Any, Tuple, Set
+from typing import Dict, Optional, List, Any, Tuple, Set, Sequence
 from pathlib import Path
 import threading
 from collections import defaultdict
@@ -92,6 +92,7 @@ from screener_artifacts import (
 )
 
 from screener_diagnostics import (
+    annotate_fundamental_parity_fields,
     annotate_stage_outcomes,
     build_liquidity_shadow_rows,
     classify_empty_result_v2,
@@ -106,6 +107,7 @@ from screener_diagnostics import (
     summarize_diagnostics,
     summarize_liquidity_shadow_meta,
     write_liquidity_shadow_review,
+    SCORING_PIPELINE_VERSION,
 )
 
 # 시장 분석 모듈 (screener_core에서 통합)
@@ -904,6 +906,58 @@ def get_fundamentals(
     except Exception as e:
         logger.debug("KIS 펀더멘털 조회 실패: %s", e)
         return pd.DataFrame()
+
+
+def load_scoring_fin_info(
+    tickers: Sequence[str],
+    *,
+    trade_date: str,
+    market: str,
+    listing_df: Optional[pd.DataFrame] = None,
+    amount_map: Optional[Dict[str, float]] = None,
+    kis: Optional[KIS] = None,
+) -> Dict[str, pd.Series]:
+    """Build per-ticker fin_info using the same fundamental loader as Production.
+
+    Production stage-1 joins get_fundamentals(PER/PBR) onto the filtered listing.
+    Liquidity Shadow must use this same path for shadow-only tickers — never score
+    from a bare listing row that lacks valuation columns.
+    """
+    listing = listing_df if listing_df is not None else pd.DataFrame()
+    amount_map = amount_map or {}
+    uniq = [str(t).upper() for t in tickers if t]
+    fin_by: Dict[str, pd.Series] = {}
+
+    for t in uniq:
+        if not listing.empty and t in listing.index:
+            fin_by[t] = listing.loc[t].copy()
+        else:
+            fin_by[t] = pd.Series(
+                {
+                    "Name": t,
+                    "Sector": "N/A",
+                    "SectorSource": "unknown",
+                    "Marcap": 0,
+                    "PER": np.nan,
+                    "PBR": np.nan,
+                }
+            )
+        if "Amount5D" not in fin_by[t].index:
+            fin_by[t] = fin_by[t].copy()
+            fin_by[t]["Amount5D"] = amount_map.get(t)
+
+    fund = get_fundamentals(trade_date, market, tickers=uniq, kis=kis or _KIS_INSTANCE)
+    if fund is not None and not fund.empty:
+        for t in uniq:
+            if t not in fund.index:
+                continue
+            merged = fin_by[t].copy()
+            for col in ("PER", "PBR"):
+                if col in fund.columns:
+                    merged[col] = fund.loc[t, col]
+            fin_by[t] = merged
+
+    return fin_by
 
 
 def _get_us_benchmark_close(date_str: str, min_bars: int = 60) -> Optional[pd.Series]:
@@ -2921,33 +2975,28 @@ def run_liquidity_shadow_post_diagnostics(
     listing = listing_df if listing_df is not None else pd.DataFrame()
     score_callable = score_fn or _calculate_scores_for_ticker
 
-    # Prefetch fundamentals for shadow-only within budget
+    # Prefetch fundamentals for shadow-only via the same Production loader
     fin_by_ticker: Dict[str, pd.Series] = {}
-    if shadow_only and not listing.empty:
+    fin_source_by_ticker: Dict[str, str] = {}
+    if shadow_only:
         try:
-            # Prefer existing columns on listing
-            for t in shadow_only:
-                if t in listing.index:
-                    fin_by_ticker[t] = listing.loc[t]
-            missing_for_fund = [t for t in shadow_only if t not in fin_by_ticker]
-            if missing_for_fund and time.perf_counter() - liq_t0 < budget * 0.3:
-                fund = get_fundamentals(
-                    trade_date, market, tickers=missing_for_fund[: len(shadow_only)], kis=_KIS_INSTANCE
-                )
-                if fund is not None and not fund.empty:
-                    for t in missing_for_fund:
-                        if t in fund.index:
-                            base = fin_by_ticker.get(t)
-                            if base is None and t in listing.index:
-                                base = listing.loc[t]
-                            if base is not None:
-                                merged = base.copy()
-                                for col in ("PER", "PBR"):
-                                    if col in fund.columns:
-                                        merged[col] = fund.loc[t, col]
-                                fin_by_ticker[t] = merged
-                            else:
-                                fin_by_ticker[t] = fund.loc[t]
+            fin_by_ticker = load_scoring_fin_info(
+                shadow_only,
+                trade_date=trade_date,
+                market=market,
+                listing_df=listing if not listing.empty else None,
+                amount_map=amount_map,
+                kis=_KIS_INSTANCE,
+            )
+            for t, fin in fin_by_ticker.items():
+                per_v = pd.to_numeric(fin.get("PER"), errors="coerce") if fin is not None else np.nan
+                pbr_v = pd.to_numeric(fin.get("PBR"), errors="coerce") if fin is not None else np.nan
+                if pd.notna(per_v) and per_v != 0 and pd.notna(pbr_v) and pbr_v != 0:
+                    fin_source_by_ticker[t] = "GET_FUNDAMENTALS"
+                elif (pd.notna(per_v) and per_v != 0) or (pd.notna(pbr_v) and pbr_v != 0):
+                    fin_source_by_ticker[t] = "GET_FUNDAMENTALS_PARTIAL"
+                else:
+                    fin_source_by_ticker[t] = "MISSING"
         except Exception as e:
             warnings.append(f"FUNDAMENTALS_PARTIAL:{type(e).__name__}")
             _log(f"fundamentals prefetch warning: {e}")
@@ -2962,6 +3011,11 @@ def run_liquidity_shadow_post_diagnostics(
         rec["score_status"] = "SUCCESS"
         rec["failure_reason"] = None
         rec["score_reused"] = True
+        rec = annotate_fundamental_parity_fields(
+            rec,
+            score_reused=True,
+            fundamental_source="PRODUCTION_SCORE_RECORD",
+        )
         raw_rows.append(rec)
 
     # Score shadow-only with deadline-aware executor
@@ -3005,6 +3059,7 @@ def run_liquidity_shadow_post_diagnostics(
                             "Amount5D": amount_map.get(t),
                         }
                     )
+                    fin_source_by_ticker.setdefault(t, "MISSING")
                 elif "Amount5D" not in fin.index:
                     fin = fin.copy()
                     fin["Amount5D"] = amount_map.get(t)
@@ -3020,11 +3075,11 @@ def run_liquidity_shadow_post_diagnostics(
                         risk_params,
                         market,
                     )
-                ] = t
+                ] = (t, fin)
 
             completed: Set[str] = set()
             for fut in as_completed(futs):
-                t = futs[fut]
+                t, fin_used = futs[fut]
                 if time.perf_counter() - liq_t0 > budget:
                     time_budget_exceeded = True
                 try:
@@ -3040,6 +3095,8 @@ def run_liquidity_shadow_post_diagnostics(
                             "failure_reason": f"{type(e).__name__}:{str(e)[:120]}",
                             "used_by_trader": False,
                             "diagnostic_only": True,
+                            "score_reused": False,
+                            "scoring_pipeline_version": SCORING_PIPELINE_VERSION,
                         }
                     )
                     completed.add(t)
@@ -3047,52 +3104,63 @@ def run_liquidity_shadow_post_diagnostics(
                 completed.add(t)
                 if not res:
                     raw_rows.append(
-                        {
-                            "ticker": t,
-                            "score": None,
-                            "Score": None,
-                            "amount5d": amount_map.get(t),
-                            "score_status": "DATA_UNAVAILABLE",
-                            "failure_reason": "SCORER_RETURNED_NONE",
-                            "used_by_trader": False,
-                            "diagnostic_only": True,
-                        }
+                        annotate_fundamental_parity_fields(
+                            {
+                                "ticker": t,
+                                "score": None,
+                                "Score": None,
+                                "amount5d": amount_map.get(t),
+                                "score_status": "DATA_UNAVAILABLE",
+                                "failure_reason": "SCORER_RETURNED_NONE",
+                                "used_by_trader": False,
+                                "diagnostic_only": True,
+                                "score_reused": False,
+                            },
+                            fin_info=fin_used,
+                            score_reused=False,
+                            fundamental_source=fin_source_by_ticker.get(t),
+                        )
                     )
                     continue
                 score = res.get("Score")
                 raw_rows.append(
-                    {
-                        "ticker": t,
-                        "Ticker": t,
-                        "name": res.get("Name"),
-                        "Name": res.get("Name"),
-                        "sector": res.get("Sector"),
-                        "Sector": res.get("Sector"),
-                        "score": score,
-                        "Score": score,
-                        "fin_score": res.get("FinScore"),
-                        "tech_score": res.get("TechScore"),
-                        "market_score": res.get("MktScore"),
-                        "sector_score": res.get("SectorScore"),
-                        "vol_kki": res.get("VolKki"),
-                        "pos_52w": res.get("Pos52w"),
-                        "pattern_score": res.get("PatternScore"),
-                        "rsi": res.get("RSI"),
-                        "atr": res.get("ATR"),
-                        "ma50": res.get("MA50"),
-                        "ma200": res.get("MA200"),
-                        "per": res.get("PER"),
-                        "pbr": res.get("PBR"),
-                        "price": res.get("Price"),
-                        "exclude_reasons": list(res.get("exclude_reasons") or []),
-                        "exclusion_reasons": list(res.get("exclude_reasons") or []),
-                        "amount5d": amount_map.get(t),
-                        "score_status": "SUCCESS",
-                        "failure_reason": None,
-                        "score_reused": False,
-                        "used_by_trader": False,
-                        "diagnostic_only": True,
-                    }
+                    annotate_fundamental_parity_fields(
+                        {
+                            "ticker": t,
+                            "Ticker": t,
+                            "name": res.get("Name"),
+                            "Name": res.get("Name"),
+                            "sector": res.get("Sector"),
+                            "Sector": res.get("Sector"),
+                            "score": score,
+                            "Score": score,
+                            "fin_score": res.get("FinScore"),
+                            "tech_score": res.get("TechScore"),
+                            "market_score": res.get("MktScore"),
+                            "sector_score": res.get("SectorScore"),
+                            "vol_kki": res.get("VolKki"),
+                            "pos_52w": res.get("Pos52w"),
+                            "pattern_score": res.get("PatternScore"),
+                            "rsi": res.get("RSI"),
+                            "atr": res.get("ATR"),
+                            "ma50": res.get("MA50"),
+                            "ma200": res.get("MA200"),
+                            "per": res.get("PER"),
+                            "pbr": res.get("PBR"),
+                            "price": res.get("Price"),
+                            "exclude_reasons": list(res.get("exclude_reasons") or []),
+                            "exclusion_reasons": list(res.get("exclude_reasons") or []),
+                            "amount5d": amount_map.get(t),
+                            "score_status": "SUCCESS",
+                            "failure_reason": None,
+                            "score_reused": False,
+                            "used_by_trader": False,
+                            "diagnostic_only": True,
+                        },
+                        fin_info=fin_used,
+                        score_reused=False,
+                        fundamental_source=fin_source_by_ticker.get(t),
+                    )
                 )
 
             # Mark unsubmitted / incomplete as TIME_BUDGET or NOT_RUN
@@ -3393,7 +3461,13 @@ def run_screener(
         decision_flag = bool(
             policy.decision_artifact and str(final_status).startswith("SUCCESS")
         )
-        integrity_preview = writer.artifact_digest_map() if writer else {}
+        # artifact_integrity inside meta must NOT include screener_run_meta.json or
+        # manifest.json — embedding a self-hash makes a stable SHA impossible.
+        integrity_preview = {
+            k: v
+            for k, v in (writer.artifact_digest_map() if writer else {}).items()
+            if k not in ("screener_run_meta.json", "manifest.json")
+        }
         meta = build_run_meta(
             market=market,
             trade_date=fixed_date,
@@ -3452,7 +3526,8 @@ def run_screener(
             market_regime_shadow=market_regime_shadow or market_regime_shadow_payload,
             build_identity=build_identity,
         )
-        writer.write_json("screener_run_meta.json", meta)
+        # Write review + optional snapshots BEFORE finalizing meta so their digests
+        # can be included in meta.artifact_integrity without rewriting meta later.
         try:
             review_path = writer.path("screener_review.md")
             write_review_markdown(
@@ -3483,6 +3558,16 @@ def run_screener(
             except Exception as e:
                 logger.warning("score_features snapshot 실패: %s", e)
 
+        # Refresh integrity once (still excluding self + manifest), then write meta once.
+        integrity_final = {
+            k: v
+            for k, v in writer.artifact_digest_map().items()
+            if k not in ("screener_run_meta.json", "manifest.json")
+        }
+        meta["artifact_integrity"] = integrity_final
+        meta["manifest_path"] = str(writer.final_dir / "manifest.json")
+        writer.write_json("screener_run_meta.json", meta)
+
         manifest = writer.build_manifest(
             status=final_status,
             result_status=result_status,
@@ -3506,11 +3591,7 @@ def run_screener(
                 "build_identity": build_identity,
             },
         )
-        # Refresh integrity on meta after all artifacts present
-        meta["artifact_integrity"] = manifest.get("artifacts") or {}
-        meta["manifest_path"] = str(writer.final_dir / "manifest.json")
-        writer.write_json("screener_run_meta.json", meta)
-
+        # Do NOT rewrite screener_run_meta after this point — manifest holds final meta SHA.
         published = writer.publish(manifest)
         logger.info(
             "immutable run 저장: %s status=%s result_status=%s mode=%s",
