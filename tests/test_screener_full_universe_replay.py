@@ -20,33 +20,43 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from screener_full_universe_replay import (  # noqa: E402
+    HISTORICAL_MARKET_STATE_CONFLICT,
     LEGACY_META_SELF_HASH_MISMATCH,
     LEGACY_UNTRUSTED,
+    MISSING_HISTORICAL_MARKET_STATE,
     MIGRATION_DROP,
     MIGRATION_KEEP,
     MIGRATION_NEW,
     MIGRATION_NEITHER,
     PRODUCTION_THRESHOLD,
+    REPLAY_SCORE_TOLERANCE,
     SCENARIOS,
     SCOPE_NOTE,
+    STATUS_BASELINE_FAILED,
     STATUS_NO_DATA,
     STATUS_OK,
     TRUSTED,
     TRUSTED_WITH_WARNING,
     WARNING_BASELINE_REPLAY_MISMATCH,
     analyze_full_universe_replay,
+    apply_replay_scenario_scores,
     assess_run_trust,
+    build_market_state_from_payload,
     build_migration_records,
     build_replay_dataframe,
     classify_migration,
+    combined_market_multiplier,
     compare_baseline_replay_to_production,
-    compute_scenario_score,
+    compute_weighted_base,
     eligible_universe_top_k,
+    load_historical_market_state,
     load_replay_days,
     normalize_score_record,
     pipeline_params_from_config,
     replay_day_scenario,
     replay_inclusion_decision,
+    replay_score,
+    reconstruct_baseline_scores_replay,
     resolve_full_scored_universe,
     run_candidate_pipeline,
     run_full_universe_replay,
@@ -58,7 +68,7 @@ from screener_quality import (  # noqa: E402
     assess_decision_run_trust,
     detect_legacy_meta_self_hash_only,
 )
-from screener_weight_simulation import FACTOR_NAMES  # noqa: E402,F401
+from screener_weight_simulation import FACTOR_NAMES, compute_scenario_score  # noqa: E402,F401
 from screener_artifacts import sha256_file, verify_manifest_integrity  # noqa: E402
 
 BASE_W = dict(SCENARIOS["A_BASELINE"])
@@ -87,6 +97,38 @@ def _factors(
     }
 
 
+def _market_state_payload(regime: str = "bull", volatility: str = "medium") -> Dict[str, Any]:
+    return {
+        "regime": regime,
+        "trend": regime,
+        "volatility": volatility,
+        "confidence": 0.5,
+        "as_of_kst": "2026-08-03T09:00:00+09:00",
+    }
+
+
+def _historical_market_state(regime: str = "bull", volatility: str = "medium"):
+    return build_market_state_from_payload(_market_state_payload(regime, volatility))
+
+
+def _rescore_universe(
+    universe: List[Dict[str, Any]],
+    *,
+    regime: str = "bull",
+    volatility: str = "medium",
+) -> List[Dict[str, Any]]:
+    ms = _historical_market_state(regime, volatility)
+    out: List[Dict[str, Any]] = []
+    for row in universe:
+        r = dict(row)
+        factors = {name: row.get(name) for name in FACTOR_NAMES}
+        score = replay_score(factors, BASE_W, ms)
+        r["score"] = score
+        r["threshold_pass"] = (score or 0) >= PRODUCTION_THRESHOLD
+        out.append(r)
+    return out
+
+
 def _score_row(
     ticker: str,
     *,
@@ -101,8 +143,12 @@ def _score_row(
     exclusion_reasons: Optional[List[str]] = None,
     issuer_group: Optional[str] = None,
     ret5: Optional[float] = 1.0,
+    regime: str = "bull",
+    volatility: str = "medium",
 ) -> Dict[str, Any]:
-    score = compute_scenario_score(_factors(fin, tech, mkt, sector, vol, pos), BASE_W)
+    factors = _factors(fin, tech, mkt, sector, vol, pos)
+    ms = _historical_market_state(regime, volatility)
+    score = replay_score(factors, BASE_W, ms)
     row: Dict[str, Any] = {
         "ticker": ticker,
         "score": score,
@@ -191,10 +237,13 @@ def _write_replay_run(
     run_id: str,
     universe: List[Dict[str, Any]],
     candidates: Optional[List[Dict[str, Any]]] = None,
-    regime: str = "BULL",
+    regime: str = "bull",
+    volatility: str = "medium",
 ) -> Path:
     run_dir = root / "runs" / "decision" / MARKET / trade_date / SESSION / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
+    ms_payload = _market_state_payload(regime, volatility)
+    universe = _rescore_universe(universe, regime=regime, volatility=volatility)
     cands = candidates if candidates is not None else _pipeline_candidates_from_universe(universe)
     scores_path = run_dir / "screener_scores.json"
     scores_path.write_text(json.dumps(universe), encoding="utf-8")
@@ -209,11 +258,12 @@ def _write_replay_run(
         "status": "SUCCESS",
         "decision_artifact": True,
         "schema_version": "3",
+        "market_state": ms_payload,
     }
     meta_path = run_dir / "screener_run_meta.json"
     meta_path.write_text(json.dumps(meta), encoding="utf-8")
     ms_path = run_dir / "market_state.json"
-    ms_path.write_text(json.dumps({"regime": regime, "trend": regime}), encoding="utf-8")
+    ms_path.write_text(json.dumps({"regime": regime, "trend": regime, "volatility": volatility}), encoding="utf-8")
     manifest = {
         "run_id": run_id,
         "run_mode": "DECISION",
@@ -384,14 +434,18 @@ def test_report_window_isolation(tmp_path: Path):
 
 def test_baseline_score_reproduction():
     u = _build_test_universe()
+    ms = _historical_market_state("bull", "medium")
     hydrated = [
         normalize_score_record(r, trade_date="20260728", market=MARKET, session=SESSION, source_run_id="r1")
         for r in u
     ]
-    from screener_weight_simulation import reconstruct_baseline_scores
-
-    recon = reconstruct_baseline_scores(hydrated, BASE_W)
+    recon = reconstruct_baseline_scores_replay(
+        hydrated,
+        BASE_W,
+        market_state_by_date={"20260728": ms},
+    )
     assert recon["ok"] is True
+    assert recon["uses_calculate_market_adjusted_score"] is True
 
 
 def test_baseline_threshold_048():
@@ -444,7 +498,14 @@ def test_downstream_eligibility_issuer_sector(tmp_path: Path):
         for r in universe
     ]
     params = pipeline_params_from_config({"screener_params": {"issuer_dedupe_enabled": True, "top_n": 8}})
-    df = build_replay_dataframe(hydrated, weights=BASE_W, threshold=PRODUCTION_THRESHOLD, pipeline_params=params)
+    ms = _historical_market_state()
+    df = build_replay_dataframe(
+        hydrated,
+        weights=BASE_W,
+        threshold=PRODUCTION_THRESHOLD,
+        pipeline_params=params,
+        historical_market_state=ms,
+    )
     out, stages = run_candidate_pipeline(df, threshold=PRODUCTION_THRESHOLD, pipeline_params=params)
     tickers = set(out["Ticker"].tolist()) if not out.empty else set()
     assert "GOOG" in tickers or "GOOGL" in tickers
@@ -520,7 +581,15 @@ def test_daily_top_k_matched(tmp_path: Path):
     ]
     params = pipeline_params_from_config({"screener_params": {}})
     k = 3
-    topk = eligible_universe_top_k(hydrated, weights=BASE_W, threshold=PRODUCTION_THRESHOLD, pipeline_params=params, k=k)
+    ms = _historical_market_state()
+    topk = eligible_universe_top_k(
+        hydrated,
+        weights=BASE_W,
+        threshold=PRODUCTION_THRESHOLD,
+        pipeline_params=params,
+        k=k,
+        historical_market_state=ms,
+    )
     assert len(topk) <= k
 
 
@@ -611,6 +680,7 @@ def test_missing_outcome_graceful(tmp_path: Path):
 
 def test_no_future_leakage_in_scores():
     f = _factors(0.3, 0.3, 0.3, 0.3, 0.3, 0.3)
+    ms = _historical_market_state()
     row = normalize_score_record(
         _score_row("X", fin=0.3, tech=0.3, mkt=0.3, sector=0.3, vol=0.3, pos=0.3, ret5=99.0),
         trade_date="20260728",
@@ -619,8 +689,8 @@ def test_no_future_leakage_in_scores():
         source_run_id="r",
     )
     row["return_5d_pct"] = 99.0
-    s = compute_scenario_score(f, BASE_W)
-    assert compute_scenario_score(row["factors"], BASE_W) == s
+    s = replay_score(f, BASE_W, ms)
+    assert replay_score(row["factors"], BASE_W, ms) == s
     assert row["return_5d_pct"] == 99.0
 
 
@@ -1016,3 +1086,273 @@ def test_assess_decision_run_trust_matches_quality_helper(tmp_path: Path):
     warned = assess_decision_run_trust(run_dir)
     assert warned["trust_status"] == TRUSTED_WITH_WARNING
     assert warned["trust_reason"] == LEGACY_META_SELF_HASH_MISMATCH
+
+
+# ── Historical MarketState score reconstruction ───────────────────────
+
+
+@pytest.mark.parametrize(
+    "regime,volatility,expected_multiplier",
+    [
+        ("sideways", "medium", 1.0),
+        ("bull", "medium", 1.1),
+        ("bull", "low", 1.155),
+        ("bear", "medium", 0.9),
+        ("volatile", "medium", 0.95),
+        ("bull", "high", 1.045),
+    ],
+)
+def test_market_adjusted_score_parity(regime, volatility, expected_multiplier):
+    ms = _historical_market_state(regime, volatility)
+    assert combined_market_multiplier(ms) == pytest.approx(expected_multiplier, rel=0, abs=1e-6)
+    factors = _factors(0.5, 0.5, 0.5, 0.5, 0.5, 0.5)
+    base = compute_weighted_base(factors, BASE_W)
+    assert base is not None
+    from screener_core import calculate_market_adjusted_score
+
+    adjusted = calculate_market_adjusted_score(float(base), ms)
+    assert replay_score(factors, BASE_W, ms) == round(float(adjusted), 4)
+
+
+def test_replay_score_uses_screener_core_calculate_market_adjusted_score(monkeypatch):
+    from screener_core import calculate_market_adjusted_score as real_calc
+
+    calls = []
+
+    def _spy(base, ms):
+        calls.append((base, ms.regime.value, ms.volatility_level))
+        return real_calc(base, ms)
+
+    monkeypatch.setattr("screener_core.calculate_market_adjusted_score", _spy)
+    ms = _historical_market_state("bull", "low")
+    replay_score(_factors(), BASE_W, ms)
+    assert len(calls) == 1
+
+
+def test_load_historical_market_state_from_run_meta(tmp_path: Path):
+    out = tmp_path / "output"
+    run_dir = _write_replay_run(
+        out,
+        trade_date="20260803",
+        run_id="ms-meta",
+        universe=_build_test_universe(),
+        regime="sideways",
+        volatility="medium",
+    )
+    hist = load_historical_market_state(run_dir)
+    assert hist["ok"] is True
+    assert hist["source"] == "screener_run_meta.market_state"
+    assert hist["regime"] == "sideways"
+    assert hist["volatility"] == "medium"
+    assert hist["expected_multiplier"] == pytest.approx(1.0)
+
+
+def test_load_historical_market_state_fallback_inputs(tmp_path: Path):
+    out = tmp_path / "output"
+    run_dir = _write_replay_run(
+        out,
+        trade_date="20260804",
+        run_id="ms-fallback",
+        universe=_build_test_universe(),
+        regime="bull",
+        volatility="medium",
+    )
+    meta_path = run_dir / "screener_run_meta.json"
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    del meta["market_state"]
+    meta_path.write_text(json.dumps(meta), encoding="utf-8")
+    inputs_dir = run_dir / "inputs"
+    inputs_dir.mkdir(parents=True, exist_ok=True)
+    (inputs_dir / "market_regime_inputs.json").write_text(
+        json.dumps(_market_state_payload("bull", "medium")), encoding="utf-8"
+    )
+    hist = load_historical_market_state(run_dir)
+    assert hist["ok"] is True
+    assert hist["source"] == "inputs/market_regime_inputs.json"
+
+
+def test_historical_market_state_conflict(tmp_path: Path):
+    out = tmp_path / "output"
+    run_dir = _write_replay_run(
+        out,
+        trade_date="20260821",
+        run_id="ms-conflict",
+        universe=_build_test_universe(),
+        regime="bull",
+        volatility="low",
+    )
+    inputs_dir = run_dir / "inputs"
+    inputs_dir.mkdir(parents=True, exist_ok=True)
+    (inputs_dir / "market_regime_inputs.json").write_text(
+        json.dumps(_market_state_payload("bear", "high")), encoding="utf-8"
+    )
+    hist = load_historical_market_state(run_dir)
+    assert hist["ok"] is False
+    assert hist["status"] == HISTORICAL_MARKET_STATE_CONFLICT
+
+
+def test_missing_historical_market_state_excludes_run(tmp_path: Path):
+    out = tmp_path / "output"
+    run_dir = _write_replay_run(
+        out,
+        trade_date="20260810",
+        run_id="no-ms",
+        universe=_build_test_universe(),
+    )
+    meta_path = run_dir / "screener_run_meta.json"
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    del meta["market_state"]
+    meta_path.write_text(json.dumps(meta), encoding="utf-8")
+    man_path = run_dir / "manifest.json"
+    man = json.loads(man_path.read_text(encoding="utf-8"))
+    man["artifacts"]["screener_run_meta.json"]["sha256"] = hashlib.sha256(
+        meta_path.read_bytes()
+    ).hexdigest()
+    man_path.write_text(json.dumps(man), encoding="utf-8")
+    hist = load_historical_market_state(run_dir)
+    assert hist["status"] == MISSING_HISTORICAL_MARKET_STATE
+    days, meta_out = load_replay_days(
+        output_dir=out,
+        market=MARKET,
+        session=SESSION,
+        start_trade_date=START,
+        end_trade_date=END,
+    )
+    assert days == []
+    assert meta_out["historical_market_state_exclusion_counts"].get(
+        MISSING_HISTORICAL_MARKET_STATE
+    ) == 1
+
+
+def test_factor_export_rounding_boundary_accepted():
+    ms = _historical_market_state("bull", "low")
+    factors = _factors(0.50005, 0.50005, 0.50005, 0.50005, 0.50005, 0.50005)
+    exported = {k: round(v, 4) for k, v in factors.items()}
+    prod_score = replay_score(exported, BASE_W, ms)
+    raw_score = replay_score(factors, BASE_W, ms)
+    assert prod_score is not None and raw_score is not None
+    err = abs(prod_score - raw_score)
+    assert err <= REPLAY_SCORE_TOLERANCE
+
+
+def test_acceptance_epsilon_0_0001_boundary():
+    err = 0.0001000000000000445
+    assert err <= REPLAY_SCORE_TOLERANCE
+
+
+def test_large_mismatch_fails_reconstruction():
+    ms = _historical_market_state("bull", "medium")
+    row = normalize_score_record(
+        _score_row("X", fin=0.9, tech=0.9, regime="bull", volatility="medium"),
+        trade_date="20260804",
+        market=MARKET,
+        session=SESSION,
+        source_run_id="r",
+    )
+    row["total_score"] = 0.05  # deliberate large mismatch
+    recon = reconstruct_baseline_scores_replay(
+        [row],
+        BASE_W,
+        market_state_by_date={"20260804": ms},
+    )
+    assert recon["ok"] is False
+    assert recon["failure_count"] >= 1
+    assert recon["max_abs_error"] > REPLAY_SCORE_TOLERANCE
+
+
+def test_c_d_e_share_same_historical_market_adjustment(tmp_path: Path):
+    out = tmp_path / "output"
+    universe = _build_test_universe()
+    _write_replay_run(
+        out,
+        trade_date="20260821",
+        run_id="shared-ms",
+        universe=universe,
+        regime="bull",
+        volatility="low",
+    )
+    days, load_meta = load_replay_days(
+        output_dir=out,
+        market=MARKET,
+        session=SESSION,
+        start_trade_date="20260821",
+        end_trade_date="20260821",
+    )
+    load_meta["output_dir"] = str(out)
+    day = days[0]
+    params = pipeline_params_from_config({"screener_params": {}})
+    base_w = BASE_W
+    ms = day["historical_market_state"]
+    universe_rows = day["universe_rows"]
+    a_scores = apply_replay_scenario_scores(
+        universe_rows, base_w, baseline_weights=base_w, historical_market_state=ms
+    )
+    c_scores = apply_replay_scenario_scores(
+        universe_rows,
+        SCENARIOS["C_POS52W_ZERO"],
+        baseline_weights=base_w,
+        historical_market_state=ms,
+    )
+    for a, c in zip(a_scores, c_scores):
+        assert combined_market_multiplier(ms) == pytest.approx(1.155)
+        assert a["weighted_base"] is not None
+        assert c["weighted_base"] is not None
+
+
+def test_baseline_reconstruction_failure_blocks_shadow_scenarios(tmp_path: Path):
+    out = tmp_path / "output"
+    universe = _build_test_universe()
+    run_dir = _write_replay_run(
+        out,
+        trade_date="20260810",
+        run_id="recon-fail",
+        universe=universe,
+        regime="sideways",
+        volatility="medium",
+    )
+    scores = json.loads((run_dir / "screener_scores.json").read_text(encoding="utf-8"))
+    for row in scores:
+        row["score"] = 0.01
+    scores_path = run_dir / "screener_scores.json"
+    scores_path.write_text(json.dumps(scores), encoding="utf-8")
+    _rewrite_manifest_scores_entry(
+        run_dir,
+        sha256=hashlib.sha256(scores_path.read_bytes()).hexdigest(),
+        row_count=len(scores),
+    )
+    report, _ = run_full_universe_replay(
+        market=MARKET,
+        session=SESSION,
+        start_trade_date="20260810",
+        end_trade_date="20260810",
+        output_dir=out,
+    )
+    assert report["status"] == STATUS_BASELINE_FAILED
+    assert report["baseline_reconstruction"]["ok"] is False
+    for name, v in (report.get("shadow_verdicts") or {}).items():
+        assert v.get("reason") == "baseline_failed"
+
+
+def test_no_production_ratio_inverse_in_replay_module():
+    import screener_full_universe_replay as mod
+
+    src = Path(mod.__file__).read_text(encoding="utf-8")
+    assert "production_score /" not in src.replace(" ", "")
+    assert "reconstructed_base_score" not in src
+
+
+def test_report_includes_market_state_summary(tmp_path: Path):
+    out = _seed_output(tmp_path)
+    report, _ = run_full_universe_replay(
+        market=MARKET,
+        session=SESSION,
+        start_trade_date=START,
+        end_trade_date=END,
+        output_dir=out,
+    )
+    ms = report.get("market_state_summary") or {}
+    assert ms.get("uses_calculate_market_adjusted_score") is True
+    assert ms.get("primary_source") == "screener_run_meta.market_state"
+    recon = report.get("baseline_reconstruction") or {}
+    assert recon.get("failure_count") == 0
+    assert recon.get("max_abs_error", 1.0) <= REPLAY_SCORE_TOLERANCE

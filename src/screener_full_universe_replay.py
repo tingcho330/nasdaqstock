@@ -28,7 +28,6 @@ logger = logging.getLogger("screener_full_universe_replay")
 
 # Reuse weight/score semantics from offline weight simulator
 from screener_weight_simulation import (  # noqa: E402
-    BASELINE_SCORE_TOLERANCE,
     DEFAULT_TRAIN_END,
     DEFAULT_VALIDATION_START,
     FACTOR_NAMES,
@@ -42,11 +41,8 @@ from screener_weight_simulation import (  # noqa: E402
     _clip01,
     _safe_float,
     _sha256_file,
-    apply_scenario_scores,
-    compute_scenario_score,
     outcome_metrics,
     production_baseline_weights,
-    reconstruct_baseline_scores,
     split_train_validation,
     threshold_pass_rows,
     top_n_rows,
@@ -100,6 +96,34 @@ MIGRATION_DROP = "DROP"
 MIGRATION_NEW = "NEW"
 MIGRATION_NEITHER = "NEITHER"
 
+# Production final Score tolerance after market adjustment (factor export is round(4))
+REPLAY_SCORE_TOLERANCE = 0.0001 + 1e-12
+
+MISSING_HISTORICAL_MARKET_STATE = "MISSING_HISTORICAL_MARKET_STATE"
+HISTORICAL_MARKET_STATE_CONFLICT = "HISTORICAL_MARKET_STATE_CONFLICT"
+
+REGIME_WEIGHTS: Dict[Any, float] = {}
+VOLATILITY_WEIGHTS: Dict[str, float] = {
+    "low": 1.05,
+    "medium": 1.0,
+    "high": 0.95,
+}
+
+
+def _init_regime_weights() -> None:
+    from reviewer import MarketRegime
+
+    global REGIME_WEIGHTS
+    if not REGIME_WEIGHTS:
+        REGIME_WEIGHTS.update(
+            {
+                MarketRegime.BULL: 1.1,
+                MarketRegime.BEAR: 0.9,
+                MarketRegime.SIDEWAYS: 1.0,
+                MarketRegime.VOLATILE: 0.95,
+            }
+        )
+
 
 def _load_json(path: Path) -> Any:
     if not path.exists():
@@ -127,6 +151,335 @@ def assess_run_trust(run_dir: Path) -> Dict[str, Any]:
         "issues": list(trust.get("issues") or []),
         "reasons": list(trust.get("reasons") or []),
         "source_artifact": PRIMARY_SCORES_ARTIFACT,
+    }
+
+
+def _regime_vol_from_payload(payload: Optional[Dict[str, Any]]) -> Tuple[Optional[str], Optional[str]]:
+    if not isinstance(payload, dict):
+        return None, None
+    regime = payload.get("regime") or payload.get("trend")
+    vol = payload.get("volatility") or payload.get("volatility_level")
+    regime_s = str(regime).strip().lower() if regime is not None else None
+    vol_s = str(vol).strip().lower() if vol is not None else None
+    return regime_s, vol_s
+
+
+def _parse_market_regime(regime_str: str) -> Any:
+    from reviewer import MarketRegime
+
+    mapping = {
+        "bull": MarketRegime.BULL,
+        "bear": MarketRegime.BEAR,
+        "sideways": MarketRegime.SIDEWAYS,
+        "volatile": MarketRegime.VOLATILE,
+    }
+    key = str(regime_str or "").strip().lower()
+    if key not in mapping:
+        raise ValueError(f"unknown market regime: {regime_str!r}")
+    return mapping[key]
+
+
+def build_market_state_from_payload(payload: Dict[str, Any]) -> Any:
+    """Restore MarketState for calculate_market_adjusted_score from run artifact."""
+    from datetime import datetime
+
+    from reviewer import MarketState
+    from utils import KST
+
+    regime_str, vol_str = _regime_vol_from_payload(payload)
+    if not regime_str or not vol_str:
+        raise ValueError("market_state payload missing regime or volatility")
+    trend = str(payload.get("trend") or regime_str).strip().lower()
+    conf = _safe_float(
+        payload.get("confidence")
+        if payload.get("confidence") is not None
+        else payload.get("advanced_market_confidence")
+    )
+    if conf is None:
+        conf = 0.5
+    ts_raw = payload.get("as_of_kst") or payload.get("timestamp")
+    ts = datetime.now(KST)
+    if ts_raw:
+        try:
+            ts = datetime.fromisoformat(str(ts_raw).replace("Z", "+00:00"))
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=KST)
+        except Exception:
+            ts = datetime.now(KST)
+    return MarketState(
+        regime=_parse_market_regime(regime_str),
+        volatility_level=vol_str,
+        trend_direction=trend,
+        confidence=float(conf),
+        timestamp=ts,
+    )
+
+
+def combined_market_multiplier(market_state: Any) -> float:
+    """Diagnostics-only combined regime * volatility weight (mirrors screener_core)."""
+    _init_regime_weights()
+    rw = REGIME_WEIGHTS.get(getattr(market_state, "regime", None), 1.0)
+    vw = VOLATILITY_WEIGHTS.get(str(getattr(market_state, "volatility_level", "") or ""), 1.0)
+    return round(float(rw) * float(vw), 6)
+
+
+def load_historical_market_state(
+    run_dir: Path,
+    merged_meta: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Load point-in-time MarketState from DECISION artifacts (never live market data).
+
+    Primary: screener_run_meta.json["market_state"]
+    Fallback: inputs/market_regime_inputs.json (only when primary absent)
+    """
+    run_dir = Path(run_dir)
+    merged_meta = merged_meta if isinstance(merged_meta, dict) else {}
+    run_meta = _load_json(run_dir / "screener_run_meta.json") or {}
+    if not isinstance(run_meta, dict):
+        run_meta = {}
+
+    primary_payload = merged_meta.get("market_state")
+    if not isinstance(primary_payload, dict):
+        primary_payload = run_meta.get("market_state")
+    if not isinstance(primary_payload, dict):
+        primary_payload = None
+
+    inputs_path = run_dir / "inputs" / "market_regime_inputs.json"
+    fallback_payload = _load_json(inputs_path) if inputs_path.exists() else None
+    if not isinstance(fallback_payload, dict):
+        fallback_payload = None
+
+    primary_regime, primary_vol = _regime_vol_from_payload(primary_payload)
+    fallback_regime, fallback_vol = _regime_vol_from_payload(fallback_payload)
+
+    if primary_regime and primary_vol and fallback_regime and fallback_vol:
+        if primary_regime != fallback_regime or primary_vol != fallback_vol:
+            return {
+                "ok": False,
+                "status": HISTORICAL_MARKET_STATE_CONFLICT,
+                "source": "screener_run_meta.market_state+inputs/market_regime_inputs.json",
+                "primary_regime": primary_regime,
+                "primary_volatility": primary_vol,
+                "fallback_regime": fallback_regime,
+                "fallback_volatility": fallback_vol,
+                "market_state": None,
+            }
+
+    payload: Optional[Dict[str, Any]] = None
+    source: Optional[str] = None
+    if primary_regime and primary_vol:
+        payload = primary_payload
+        source = "screener_run_meta.market_state"
+    elif fallback_regime and fallback_vol:
+        payload = fallback_payload
+        source = "inputs/market_regime_inputs.json"
+    else:
+        return {
+            "ok": False,
+            "status": MISSING_HISTORICAL_MARKET_STATE,
+            "source": None,
+            "market_state": None,
+        }
+
+    try:
+        ms = build_market_state_from_payload(payload or {})
+    except Exception as exc:
+        return {
+            "ok": False,
+            "status": MISSING_HISTORICAL_MARKET_STATE,
+            "source": source,
+            "error": str(exc),
+            "market_state": None,
+        }
+
+    regime_str, vol_str = _regime_vol_from_payload(payload)
+    return {
+        "ok": True,
+        "status": "OK",
+        "source": source,
+        "market_state": ms,
+        "regime": regime_str,
+        "volatility": vol_str,
+        "expected_multiplier": combined_market_multiplier(ms),
+        "payload": payload,
+    }
+
+
+def compute_weighted_base(
+    factors: Dict[str, Optional[float]],
+    weights: Dict[str, float],
+    *,
+    missing_as_zero: bool = True,
+) -> Optional[float]:
+    """Weighted factor sum + clip[0,1] before market adjustment (Production order)."""
+    present = 0
+    raw = 0.0
+    for name in FACTOR_NAMES:
+        v = _safe_float(factors.get(name))
+        w = float(weights.get(name, 0.0))
+        if v is None:
+            if not missing_as_zero:
+                return None
+            v = 0.0
+        else:
+            present += 1
+        raw += v * w
+    if present == 0:
+        return None
+    return _clip01(raw)
+
+
+def replay_score(
+    factors: Dict[str, Optional[float]],
+    weights: Dict[str, float],
+    historical_market_state: Optional[Any],
+    *,
+    missing_as_zero: bool = True,
+) -> Optional[float]:
+    """Mirror screener.py: clip weighted sum → market adjust → round(4)."""
+    from screener_core import calculate_market_adjusted_score
+
+    base = compute_weighted_base(factors, weights, missing_as_zero=missing_as_zero)
+    if base is None:
+        return None
+    adjusted = base
+    if historical_market_state is not None:
+        adjusted = calculate_market_adjusted_score(float(base), historical_market_state)
+    return round(float(adjusted), 4)
+
+
+def apply_replay_scenario_scores(
+    observations: Sequence[Dict[str, Any]],
+    weights: Dict[str, float],
+    *,
+    baseline_weights: Dict[str, float],
+    historical_market_state: Optional[Any],
+) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for obs in observations:
+        row = dict(obs)
+        factors = obs.get("factors") or {}
+        row["baseline_score"] = replay_score(
+            factors, baseline_weights, historical_market_state
+        )
+        row["scenario_score"] = replay_score(factors, weights, historical_market_state)
+        row["weighted_base"] = compute_weighted_base(factors, weights)
+        contribs: Dict[str, Optional[float]] = {}
+        for name in FACTOR_NAMES:
+            v = _safe_float(factors.get(name))
+            w = float(weights.get(name, 0.0))
+            contribs[name] = round(v * w, 8) if v is not None else None
+        row["scenario_contributions"] = contribs
+        out.append(row)
+    return out
+
+
+def reconstruct_baseline_scores_replay(
+    observations: Sequence[Dict[str, Any]],
+    baseline_weights: Dict[str, float],
+    *,
+    market_state_by_date: Dict[str, Any],
+    tolerance: float = REPLAY_SCORE_TOLERANCE,
+) -> Dict[str, Any]:
+    """Recompute Production final Score with historical market adjustment per trade_date."""
+    from screener_core import calculate_market_adjusted_score
+
+    _init_regime_weights()
+    errors: List[Dict[str, Any]] = []
+    diagnostics: List[Dict[str, Any]] = []
+    by_date: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    max_err = 0.0
+    n_checked = 0
+    n_skipped_missing = 0
+    n_skipped_no_market_state = 0
+
+    for obs in observations:
+        factors = obs.get("factors") or {}
+        if not isinstance(factors, dict):
+            factors = {}
+        td = str(obs.get("trade_date") or "")
+        ms = market_state_by_date.get(td)
+        if ms is None:
+            n_skipped_no_market_state += 1
+            continue
+
+        base = compute_weighted_base(factors, baseline_weights)
+        prod = _safe_float(
+            obs.get("total_score")
+            if obs.get("total_score") is not None
+            else obs.get("score")
+        )
+        if base is None or prod is None:
+            n_skipped_missing += 1
+            continue
+
+        adjusted = calculate_market_adjusted_score(float(base), ms)
+        recon = round(float(adjusted), 4)
+        err = abs(recon - prod)
+        n_checked += 1
+        if err > max_err:
+            max_err = err
+
+        rw = REGIME_WEIGHTS.get(getattr(ms, "regime", None), 1.0)
+        vw = VOLATILITY_WEIGHTS.get(str(getattr(ms, "volatility_level", "") or ""), 1.0)
+        diag = {
+            "trade_date": td,
+            "ticker": obs.get("ticker"),
+            "factor_weighted_sum": round(float(base), 6),
+            "market_regime": getattr(getattr(ms, "regime", None), "value", None),
+            "volatility_level": getattr(ms, "volatility_level", None),
+            "regime_weight": rw,
+            "volatility_weight": vw,
+            "combined_market_multiplier": round(float(rw) * float(vw), 6),
+            "reconstructed_adjusted_score": recon,
+            "production_score": prod,
+            "abs_error": err,
+        }
+        diagnostics.append(diag)
+        by_date[td].append(diag)
+
+        if err > tolerance:
+            errors.append(diag)
+
+    date_summary: List[Dict[str, Any]] = []
+    for td in sorted(by_date.keys()):
+        rows = by_date[td]
+        errs = [r["abs_error"] for r in rows]
+        ms = market_state_by_date.get(td)
+        date_summary.append(
+            {
+                "trade_date": td,
+                "regime": getattr(getattr(ms, "regime", None), "value", None),
+                "volatility": getattr(ms, "volatility_level", None),
+                "expected_multiplier": combined_market_multiplier(ms) if ms else None,
+                "n_checked": len(rows),
+                "max_abs_error": max(errs) if errs else None,
+                "median_abs_error": sorted(errs)[len(errs) // 2] if errs else None,
+                "failure_count": sum(1 for e in errs if e > tolerance),
+            }
+        )
+
+    ok = n_checked > 0 and len(errors) == 0
+    return {
+        "ok": ok,
+        "status": STATUS_OK if ok else STATUS_BASELINE_FAILED,
+        "n_checked": n_checked,
+        "n_skipped_missing_factors": n_skipped_missing,
+        "n_skipped_no_market_state": n_skipped_no_market_state,
+        "max_abs_error": max_err,
+        "tolerance": tolerance,
+        "failures": errors[:20],
+        "failure_count": len(errors),
+        "weight_sum": weight_sum(baseline_weights),
+        "uses_calculate_market_adjusted_score": True,
+        "historical_market_state_source": "screener_run_meta.market_state",
+        "diagnostics_sample": diagnostics[:50],
+        "date_summary": date_summary,
+        "note": (
+            "Reconstruction mirrors screener.py: sum(factor*weight), clip[0,1], "
+            "calculate_market_adjusted_score(historical MarketState from run_meta), "
+            "round(4). Tolerance allows factor export round(4) boundary effects."
+        ),
     }
 
 
@@ -517,6 +870,7 @@ def build_replay_dataframe(
     weights: Dict[str, float],
     threshold: float,
     pipeline_params: Dict[str, Any],
+    historical_market_state: Optional[Any] = None,
 ) -> pd.DataFrame:
     """Build scored DataFrame for select_candidates_pipeline."""
     records: List[Dict[str, Any]] = []
@@ -524,7 +878,7 @@ def build_replay_dataframe(
     exclude_held = bool(pipeline_params.get("exclude_held_from_candidates", True))
     for row in universe_rows:
         factors = row.get("factors") or {}
-        score = compute_scenario_score(factors, weights)
+        score = replay_score(factors, weights, historical_market_state)
         if score is None:
             continue
         elig_status, excl = annotate_eligibility_for_scenario(
@@ -608,7 +962,7 @@ def compare_baseline_replay_to_production(
         for t in both:
             rs = _safe_float(replay_scores.get(t))
             ac = _safe_float(actual_scores.get(t))
-            if rs is not None and ac is not None and abs(rs - ac) > BASELINE_SCORE_TOLERANCE:
+            if rs is not None and ac is not None and abs(rs - ac) > REPLAY_SCORE_TOLERANCE:
                 score_diffs.append({"ticker": t, "replay_score": rs, "actual_score": ac, "abs_diff": abs(rs - ac)})
     match_count = len(both)
     total = max(len(actual_set), 1)
@@ -633,10 +987,15 @@ def eligible_universe_top_k(
     threshold: float,
     pipeline_params: Dict[str, Any],
     k: int,
+    historical_market_state: Optional[Any] = None,
 ) -> List[str]:
     """Top-K by scenario score among ELIGIBILITY-passing universe rows."""
     scored_df = build_replay_dataframe(
-        universe_rows, weights=weights, threshold=threshold, pipeline_params=pipeline_params
+        universe_rows,
+        weights=weights,
+        threshold=threshold,
+        pipeline_params=pipeline_params,
+        historical_market_state=historical_market_state,
     )
     if scored_df.empty or k <= 0:
         return []
@@ -810,6 +1169,7 @@ def load_replay_days(
     accepted_trust_counts: Counter = Counter()
     excluded_trust_counts: Counter = Counter()
     artifact_integrity_counts: Counter = Counter()
+    market_state_exclusion_counts: Counter = Counter()
     run_decisions: List[Dict[str, Any]] = []
     universe_sizes: List[int] = []
     sample_rows: List[Dict[str, Any]] = []
@@ -857,6 +1217,16 @@ def load_replay_days(
 
         if not decision["included"]:
             excluded_trust_counts[trust["trust_status"]] += 1
+            continue
+
+        hist_ms = load_historical_market_state(run_dir, merged)
+        if not hist_ms.get("ok"):
+            decision_rec["included"] = False
+            decision_rec["exclusion_reason"] = hist_ms.get("status")
+            decision_rec["historical_market_state_status"] = hist_ms.get("status")
+            market_state_exclusion_counts[hist_ms.get("status") or "UNKNOWN"] += 1
+            excluded_trust_counts[trust["trust_status"]] += 1
+            run_decisions[-1] = decision_rec
             continue
 
         accepted_trust_counts[trust["trust_status"]] += 1
@@ -914,6 +1284,11 @@ def load_replay_days(
                 "artifact_integrity_status": scores_integrity.get("status"),
                 "screener_scores_integrity": integrity_summary,
                 "included_for_replay": True,
+                "historical_market_state": hist_ms.get("market_state"),
+                "historical_market_state_source": hist_ms.get("source"),
+                "historical_market_state_regime": hist_ms.get("regime"),
+                "historical_market_state_volatility": hist_ms.get("volatility"),
+                "expected_market_multiplier": hist_ms.get("expected_multiplier"),
                 "universe_source": source_name,
                 "universe_source_meta": src_meta,
                 "universe_rows": hydrated,
@@ -942,6 +1317,17 @@ def load_replay_days(
         "factor_schema": schema,
         "primary_universe_artifact": PRIMARY_SCORES_ARTIFACT,
         "scope": SCOPE_NOTE,
+        "missing_market_state_policy": "exclude_run_from_baseline_valid_universe",
+        "historical_market_state_exclusion_counts": dict(market_state_exclusion_counts),
+        "market_state_by_date": {
+            d["trade_date"]: {
+                "regime": d.get("historical_market_state_regime"),
+                "volatility": d.get("historical_market_state_volatility"),
+                "expected_multiplier": d.get("expected_market_multiplier"),
+                "source": d.get("historical_market_state_source"),
+            }
+            for d in days
+        },
     }
     return days, meta
 
@@ -956,9 +1342,19 @@ def replay_day_scenario(
     baseline_weights: Dict[str, float],
 ) -> Dict[str, Any]:
     universe = day.get("universe_rows") or []
-    scored_obs = apply_scenario_scores(universe, weights, baseline_weights=baseline_weights)
+    historical_market_state = day.get("historical_market_state")
+    scored_obs = apply_replay_scenario_scores(
+        universe,
+        weights,
+        baseline_weights=baseline_weights,
+        historical_market_state=historical_market_state,
+    )
     scored_df = build_replay_dataframe(
-        scored_obs, weights=weights, threshold=threshold, pipeline_params=pipeline_params
+        scored_obs,
+        weights=weights,
+        threshold=threshold,
+        pipeline_params=pipeline_params,
+        historical_market_state=historical_market_state,
     )
     candidates_df, stages = run_candidate_pipeline(
         scored_df, threshold=threshold, pipeline_params=pipeline_params
@@ -992,6 +1388,7 @@ def replay_day_scenario(
         threshold=threshold,
         pipeline_params=pipeline_params,
         k=k,
+        historical_market_state=historical_market_state,
     )
 
     return {
@@ -1220,7 +1617,15 @@ def analyze_full_universe_replay(
             "_export_scenario_summary": [],
         }
 
-    recon = reconstruct_baseline_scores(all_universe_rows, baseline_weights)
+    recon = reconstruct_baseline_scores_replay(
+        all_universe_rows,
+        baseline_weights,
+        market_state_by_date={
+            str(d.get("trade_date") or ""): d.get("historical_market_state")
+            for d in days
+            if d.get("historical_market_state") is not None
+        },
+    )
 
     baseline_replay_matches: List[Dict[str, Any]] = []
     baseline_replay_ok = True
@@ -1506,6 +1911,18 @@ def analyze_full_universe_replay(
     match_pcts = [m.get("match_pct") for m in baseline_replay_matches if m.get("match_pct") is not None]
     avg_match = round(sum(match_pcts) / len(match_pcts), 4) if match_pcts else 0.0
 
+    market_state_summary = {
+        "primary_source": "screener_run_meta.market_state",
+        "fallback_source": "inputs/market_regime_inputs.json",
+        "uses_calculate_market_adjusted_score": True,
+        "missing_market_state_policy": (load_meta or {}).get("missing_market_state_policy"),
+        "historical_market_state_exclusion_counts": (load_meta or {}).get(
+            "historical_market_state_exclusion_counts"
+        ),
+        "by_date": (load_meta or {}).get("market_state_by_date") or {},
+        "reconstruction_date_summary": recon.get("date_summary") or [],
+    }
+
     return {
         "status": STATUS_OK if baseline_replay_ok else STATUS_BASELINE_FAILED,
         "scope": SCOPE_NOTE,
@@ -1518,6 +1935,7 @@ def analyze_full_universe_replay(
         "baseline_weights": dict(baseline_weights),
         "baseline_weight_sum": weight_sum(baseline_weights),
         "baseline_reconstruction": recon,
+        "market_state_summary": market_state_summary,
         "baseline_replay": {
             "ok": baseline_replay_ok,
             "avg_match_pct": avg_match,
@@ -1644,6 +2062,18 @@ def render_markdown(report: Dict[str, Any]) -> str:
     lines.append(f"- artifact_integrity_counts: `{um.get('artifact_integrity_counts')}`")
     br = report.get("baseline_replay") or {}
     lines.append(f"- Baseline replay match avg: {br.get('avg_match_pct')}% · ok={br.get('ok')}")
+    recon = report.get("baseline_reconstruction") or {}
+    lines.append(
+        f"- Baseline reconstruction: ok={recon.get('ok')} "
+        f"n_checked={recon.get('n_checked')} failure_count={recon.get('failure_count')} "
+        f"max_abs_error={recon.get('max_abs_error')}"
+    )
+    ms = report.get("market_state_summary") or {}
+    lines.append(
+        f"- Historical MarketState: primary=`{ms.get('primary_source')}` "
+        f"fallback=`{ms.get('fallback_source')}` "
+        f"uses_calculate_market_adjusted_score={ms.get('uses_calculate_market_adjusted_score')}"
+    )
     lines.append("- Production policy: **unchanged**")
     lines.append("")
     if report.get("status") == STATUS_BASELINE_FAILED:
@@ -1807,6 +2237,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "artifact_integrity_counts": (report.get("universe_meta") or {}).get(
             "artifact_integrity_counts"
         ),
+        "historical_market_state": report.get("market_state_summary"),
+        "baseline_reconstruction": {
+            "ok": (report.get("baseline_reconstruction") or {}).get("ok"),
+            "n_checked": (report.get("baseline_reconstruction") or {}).get("n_checked"),
+            "failure_count": (report.get("baseline_reconstruction") or {}).get("failure_count"),
+            "max_abs_error": (report.get("baseline_reconstruction") or {}).get("max_abs_error"),
+            "date_summary": (report.get("baseline_reconstruction") or {}).get("date_summary"),
+        },
         "baseline_replay_ok": (report.get("baseline_replay") or {}).get("ok"),
         "baseline_avg_match_pct": (report.get("baseline_replay") or {}).get("avg_match_pct"),
         "production_inputs_unchanged": report.get("production_inputs_unchanged"),
