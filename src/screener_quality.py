@@ -1179,6 +1179,303 @@ def observation_key(decision_run_id: str, ticker: str, candidate_type: str) -> s
     return f"{decision_run_id}|{str(ticker).upper()}|{candidate_type}"
 
 
+def observation_in_report_scope(
+    row: Dict[str, Any],
+    *,
+    start_trade_date: Optional[str],
+    end_trade_date: Optional[str],
+    market: Optional[str],
+    session: Optional[str],
+) -> bool:
+    """True when observation belongs to the current Quality Report window."""
+    td = str(row.get("trade_date") or "").strip()
+    if not td:
+        return False
+    if start_trade_date and td < str(start_trade_date):
+        return False
+    if end_trade_date and td > str(end_trade_date):
+        return False
+    if market:
+        if str(row.get("market") or "").upper() != str(market).upper():
+            return False
+    if session:
+        if str(row.get("session") or "").lower() != str(session).lower():
+            return False
+    return True
+
+
+def filter_report_scoped_observations(
+    rows: Sequence[Dict[str, Any]],
+    *,
+    start_trade_date: Optional[str],
+    end_trade_date: Optional[str],
+    market: Optional[str],
+    session: Optional[str],
+) -> List[Dict[str, Any]]:
+    return [
+        r
+        for r in rows
+        if observation_in_report_scope(
+            r,
+            start_trade_date=start_trade_date,
+            end_trade_date=end_trade_date,
+            market=market,
+            session=session,
+        )
+    ]
+
+
+def is_trusted_for_analysis(row: Dict[str, Any]) -> bool:
+    return row.get("trusted_for_analysis") is not False
+
+
+def derive_fundamental_parity_status(
+    liq_trust_or_meta: Optional[Dict[str, Any]],
+) -> str:
+    """Map liquidity-shadow meta → fundamental_parity_status for observations."""
+    if not isinstance(liq_trust_or_meta, dict):
+        return "CHECK_REQUIRED"
+    meta = liq_trust_or_meta
+    if "fundamental_parity" not in meta and isinstance(meta.get("meta"), dict):
+        meta = meta["meta"]
+    explicit = meta.get("fundamental_parity_status")
+    if explicit:
+        return str(explicit)
+    fp = meta.get("fundamental_parity")
+    if not isinstance(fp, dict):
+        return "CHECK_REQUIRED"
+    if fp.get("status") == "VERIFIED" or fp.get("verified") is True:
+        return "VERIFIED"
+    if fp.get("suspicious_constant_feature_detected"):
+        return "LEGACY_UNCORRECTED"
+    return "CHECK_REQUIRED"
+
+
+def is_eligible_for_score_calibration(row: Dict[str, Any]) -> bool:
+    """LIQUIDITY_SHADOW requires VERIFIED fundamental parity for calibration/Spearman."""
+    if str(row.get("candidate_type") or "") == "LIQUIDITY_SHADOW":
+        return str(row.get("fundamental_parity_status") or "") == "VERIFIED"
+    return True
+
+
+def pick_debug_settle_observation(
+    rows: Sequence[Dict[str, Any]],
+    *,
+    start_trade_date: Optional[str],
+    end_trade_date: Optional[str],
+    market: Optional[str],
+    session: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    """Prefer scoped → trusted → PRODUCTION → oldest trade_date."""
+    scoped = filter_report_scoped_observations(
+        rows,
+        start_trade_date=start_trade_date,
+        end_trade_date=end_trade_date,
+        market=market,
+        session=session,
+    )
+    trusted = [r for r in scoped if is_trusted_for_analysis(r)]
+    production = [
+        r
+        for r in trusted
+        if str(r.get("candidate_type") or "") == "PRODUCTION"
+        and r.get("trade_date")
+        and r.get("ticker")
+    ]
+    pool = production or [
+        r for r in trusted if r.get("trade_date") and r.get("ticker")
+    ] or [r for r in scoped if r.get("trade_date") and r.get("ticker")]
+    if not pool:
+        return None
+    pool = sorted(pool, key=lambda r: str(r.get("trade_date")))
+    return pool[0]
+
+
+def _spearman_score_vs_return(
+    rows: Sequence[Dict[str, Any]],
+    *,
+    horizon: int = 5,
+) -> Optional[float]:
+    from screener_outcomes import spearman_corr
+
+    xs: List[float] = []
+    ys: List[float] = []
+    key = f"return_{horizon}d_pct"
+    for r in rows:
+        s = _safe_float(r.get("decision_score") or r.get("score"))
+        y = _safe_float(r.get(key))
+        if s is not None and y is not None:
+            xs.append(s)
+            ys.append(y)
+    return spearman_corr(xs, ys)
+
+
+def build_score_calibration_by_candidate_type(
+    trusted_rows: Sequence[Dict[str, Any]],
+    *,
+    horizon: int = 5,
+) -> Dict[str, Any]:
+    """Per-candidate-type score calibration; never mixes types into one Spearman."""
+    from screener_outcomes import score_calibration_buckets
+
+    by_type: Dict[str, List[Dict[str, Any]]] = {}
+    for r in trusted_rows:
+        by_type.setdefault(str(r.get("candidate_type") or "UNKNOWN"), []).append(r)
+
+    out: Dict[str, Any] = {}
+    for ctype in (
+        "PRODUCTION",
+        "ELIGIBLE_SHADOW",
+        "HIGH_CONVICTION_SHADOW",
+        "LIQUIDITY_SHADOW",
+    ):
+        group = by_type.get(ctype) or []
+        if not group:
+            continue
+        if ctype == "LIQUIDITY_SHADOW":
+            eligible = [r for r in group if is_eligible_for_score_calibration(r)]
+            excluded_n = len(group) - len(eligible)
+            if not eligible:
+                out[ctype] = {
+                    "status": "EXCLUDED_LEGACY_FUNDAMENTAL_PARITY",
+                    "observations": len(group),
+                    "excluded_from_calibration": excluded_n or len(group),
+                    f"spearman_{horizon}d": None,
+                    "buckets": [],
+                }
+                continue
+            out[ctype] = {
+                "status": "OK" if excluded_n == 0 else "PARTIAL_LEGACY_EXCLUDED",
+                "observations": len(group),
+                "calibration_rows": len(eligible),
+                "excluded_from_calibration": excluded_n,
+                f"spearman_{horizon}d": _spearman_score_vs_return(
+                    eligible, horizon=horizon
+                ),
+                "buckets": score_calibration_buckets(eligible, horizon=horizon),
+            }
+            continue
+
+        out[ctype] = {
+            "status": "OK",
+            "observations": len(group),
+            "calibration_rows": len(group),
+            "excluded_from_calibration": 0,
+            f"spearman_{horizon}d": _spearman_score_vs_return(group, horizon=horizon),
+            "buckets": score_calibration_buckets(group, horizon=horizon),
+        }
+
+    # Preserve any unexpected types (scoped + trusted) with same rules
+    for ctype, group in by_type.items():
+        if ctype in out:
+            continue
+        eligible = [r for r in group if is_eligible_for_score_calibration(r)]
+        out[ctype] = {
+            "status": "OK",
+            "observations": len(group),
+            "calibration_rows": len(eligible),
+            "excluded_from_calibration": len(group) - len(eligible),
+            f"spearman_{horizon}d": _spearman_score_vs_return(
+                eligible, horizon=horizon
+            ),
+            "buckets": score_calibration_buckets(eligible, horizon=horizon),
+        }
+    return out
+
+
+def apply_outcome_stats_to_report(
+    report: Dict[str, Any],
+    settled_rows: Sequence[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Attach outcome aggregates using report-scoped trusted rows only.
+
+    Settlement may cover the full ledger; Quality statistics must not.
+    """
+    from screener_outcomes import (
+        classify_sample_statuses,
+        summarize_outcome_group,
+    )
+
+    start = report.get("start_trade_date")
+    end = report.get("end_trade_date")
+    market = report.get("market")
+    session = report.get("session")
+
+    ledger_total = len(settled_rows)
+    scoped = filter_report_scoped_observations(
+        settled_rows,
+        start_trade_date=start,
+        end_trade_date=end,
+        market=market,
+        session=session,
+    )
+    trusted = [r for r in scoped if is_trusted_for_analysis(r)]
+
+    m1 = sum(1 for r in trusted if (r.get("maturity") or {}).get("1d"))
+    m3 = sum(1 for r in trusted if (r.get("maturity") or {}).get("3d"))
+    m5 = sum(1 for r in trusted if (r.get("maturity") or {}).get("5d"))
+    m10 = sum(1 for r in trusted if (r.get("maturity") or {}).get("10d"))
+    bits = classify_sample_statuses(
+        trading_days=int(report.get("trading_days") or 0),
+        matured_1d=m1,
+        matured_5d=m5,
+        matured_10d=m10,
+    )
+    report["structural_sample_status"] = bits["structural_sample_status"]
+    report["outcome_sample_status"] = bits["outcome_sample_status"]
+    report["policy_change_status"] = bits["policy_change_status"]
+    report["policy_change_recommendation"] = bits["policy_change_status"]
+    report["outcome_counts"] = {
+        "ledger_total_rows": ledger_total,
+        "report_scoped_rows": len(scoped),
+        "report_trusted_rows": len(trusted),
+        "trusted_rows": len(trusted),
+        "matured_1d": m1,
+        "matured_3d": m3,
+        "matured_5d": m5,
+        "matured_10d": m10,
+        "pending": sum(1 for r in trusted if r.get("outcome_status") == "PENDING"),
+        "partially_matured": sum(
+            1 for r in trusted if r.get("outcome_status") == "PARTIALLY_MATURED"
+        ),
+        "fully_matured": sum(
+            1 for r in trusted if r.get("outcome_status") == "FULLY_MATURED"
+        ),
+        "policy_review_sample_count": m5,
+    }
+
+    by_type: Dict[str, List[Dict[str, Any]]] = {}
+    for r in trusted:
+        by_type.setdefault(str(r.get("candidate_type") or "UNKNOWN"), []).append(r)
+
+    cand_perf: Dict[str, Any] = {
+        "note": (
+            "Returns use report-scoped trusted observations only; "
+            "Spearman/calibration are per candidate_type and never mixed."
+        ),
+        "horizons": ["1d", "3d", "5d", "10d"],
+    }
+    for ctype, group in by_type.items():
+        entry: Dict[str, Any] = {
+            h: summarize_outcome_group(group, horizon=h) for h in (1, 3, 5, 10)
+        }
+        calib_rows = [r for r in group if is_eligible_for_score_calibration(r)]
+        if ctype == "LIQUIDITY_SHADOW" and not calib_rows:
+            entry["spearman_score_5d"] = None
+            entry["spearman_calibration_status"] = "EXCLUDED_LEGACY_FUNDAMENTAL_PARITY"
+        else:
+            entry["spearman_score_5d"] = _spearman_score_vs_return(
+                calib_rows if ctype == "LIQUIDITY_SHADOW" else group, horizon=5
+            )
+        cand_perf[ctype] = entry
+
+    report["candidate_performance"] = cand_perf
+    report["score_calibration"] = build_score_calibration_by_candidate_type(
+        trusted, horizon=5
+    )
+    return report
+
+
 def upsert_observation_ledger(
     ledger_path: Path,
     rows: Sequence[Dict[str, Any]],
@@ -1247,6 +1544,11 @@ def upsert_observation_ledger(
             and prev.get("source_integrity_status") is not None
         ):
             merged["source_integrity_status"] = prev.get("source_integrity_status")
+        if (
+            merged.get("fundamental_parity_status") is None
+            and prev.get("fundamental_parity_status") is not None
+        ):
+            merged["fundamental_parity_status"] = prev.get("fundamental_parity_status")
         if merged.get("outcome_status") is None:
             merged["outcome_status"] = "PENDING"
         existing[key] = merged
@@ -1281,6 +1583,7 @@ def build_observation_rows_from_run(
         trusted_for_analysis: bool,
         exclusion_reason: Optional[str] = None,
         source_diagnostics_run_id: Optional[str] = None,
+        fundamental_parity_status: Optional[str] = None,
     ) -> None:
         for r in items:
             t = _ticker(r)
@@ -1288,38 +1591,39 @@ def build_observation_rows_from_run(
                 continue
             score = _safe_float(r.get("Score") if "Score" in r else r.get("score"))
             price = _safe_float(r.get("Price") if "Price" in r else r.get("price"))
-            rows.append(
-                {
-                    "decision_run_id": run_id,
-                    "source_run_id": run_id,
-                    "source_diagnostics_run_id": source_diagnostics_run_id,
-                    "trade_date": trade_date,
-                    "session": session,
-                    "market": market,
-                    "ticker": t,
-                    "candidate_type": ctype,
-                    "source_type": source_type,
-                    "source_integrity_status": source_integrity_status,
-                    "trusted_for_analysis": bool(trusted_for_analysis),
-                    "exclusion_reason": exclusion_reason,
-                    "decision_score": score,
-                    "decision_price": price,
-                    "reference_price": price,
-                    "reference_price_date": trade_date,
-                    "decision_price_source": "screener_artifact",
-                    "outcome_price_source": "close_to_close",
-                    "decision_as_of_kst": as_of,
-                    "return_1d_pct": None,
-                    "return_3d_pct": None,
-                    "return_5d_pct": None,
-                    "return_10d_pct": None,
-                    "max_drawdown_5d_pct": None,
-                    "max_drawdown_10d_pct": None,
-                    "outcome_status": "PENDING",
-                    "maturity": {"1d": False, "3d": False, "5d": False, "10d": False},
-                    "used_by_trader": False,
-                }
-            )
+            rec: Dict[str, Any] = {
+                "decision_run_id": run_id,
+                "source_run_id": run_id,
+                "source_diagnostics_run_id": source_diagnostics_run_id,
+                "trade_date": trade_date,
+                "session": session,
+                "market": market,
+                "ticker": t,
+                "candidate_type": ctype,
+                "source_type": source_type,
+                "source_integrity_status": source_integrity_status,
+                "trusted_for_analysis": bool(trusted_for_analysis),
+                "exclusion_reason": exclusion_reason,
+                "decision_score": score,
+                "decision_price": price,
+                "reference_price": price,
+                "reference_price_date": trade_date,
+                "decision_price_source": "screener_artifact",
+                "outcome_price_source": "close_to_close",
+                "decision_as_of_kst": as_of,
+                "return_1d_pct": None,
+                "return_3d_pct": None,
+                "return_5d_pct": None,
+                "return_10d_pct": None,
+                "max_drawdown_5d_pct": None,
+                "max_drawdown_10d_pct": None,
+                "outcome_status": "PENDING",
+                "maturity": {"1d": False, "3d": False, "5d": False, "10d": False},
+                "used_by_trader": False,
+            }
+            if fundamental_parity_status is not None:
+                rec["fundamental_parity_status"] = fundamental_parity_status
+            rows.append(rec)
 
     rd = Path(run_dir)
     _add(
@@ -1355,6 +1659,7 @@ def build_observation_rows_from_run(
     diag_id = None
     if liq_trust.get("diagnostics_dir"):
         diag_id = Path(str(liq_trust["diagnostics_dir"])).name
+    fp_status = derive_fundamental_parity_status(liq_trust)
     if trust_st in (TRUSTED, TRUSTED_WITH_WARNING):
         _add(
             list(liq_trust.get("candidates") or []),
@@ -1368,6 +1673,7 @@ def build_observation_rows_from_run(
                 else liq_trust.get("liquidity_shadow_trust_reason")
             ),
             source_diagnostics_run_id=diag_id,
+            fundamental_parity_status=fp_status,
         )
     elif trust_st in (LEGACY_UNTRUSTED, "LIQUIDITY_SHADOW_UNTRUSTED", UNTRUSTED):
         # Preserve rows but exclude from analysis aggregates
@@ -1382,6 +1688,9 @@ def build_observation_rows_from_run(
                 or "LEGACY_LIQUIDITY_ARTIFACT_UNTRUSTED"
             ),
             source_diagnostics_run_id=diag_id,
+            fundamental_parity_status=fp_status
+            if fp_status != "CHECK_REQUIRED"
+            else "LEGACY_UNCORRECTED",
         )
     return rows
 
@@ -1436,7 +1745,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "--debug-settle",
         action="store_true",
         default=False,
-        help="Pick one old trusted PRODUCTION observation and print settlement debug",
+        help="Pick oldest trusted PRODUCTION observation inside report scope and print settlement debug",
     )
     args = parser.parse_args(list(argv) if argv is not None else None)
 
@@ -1487,12 +1796,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         try:
             from screener_outcomes import (
                 backfill_candidate_outcomes,
-                classify_sample_statuses,
                 clear_ohlcv_cache,
                 debug_settle_one,
-                score_calibration_buckets,
-                spearman_corr,
-                summarize_outcome_group,
             )
 
             clear_ohlcv_cache()
@@ -1513,6 +1818,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 len(existing),
                 as_of,
             )
+            # Settle full ledger (including out-of-report-scope backfill).
             settled = backfill_candidate_outcomes(
                 existing, as_of_trade_date=as_of, only_trusted=False
             )
@@ -1525,17 +1831,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             )
 
             if args.debug_settle:
-                candidates = [
-                    r
-                    for r in settled
-                    if r.get("trusted_for_analysis") is not False
-                    and r.get("candidate_type") == "PRODUCTION"
-                    and r.get("trade_date")
-                    and r.get("ticker")
-                ]
-                candidates.sort(key=lambda r: str(r.get("trade_date")))
-                if candidates:
-                    pick = candidates[0]
+                pick = pick_debug_settle_observation(
+                    settled,
+                    start_trade_date=report.get("start_trade_date"),
+                    end_trade_date=report.get("end_trade_date"),
+                    market=report.get("market") or args.market,
+                    session=report.get("session") or args.session,
+                )
+                if pick:
                     dbg = debug_settle_one(pick, as_of_trade_date=as_of)
                     print(
                         json.dumps(
@@ -1557,53 +1860,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         )
                     )
 
-            trusted = [r for r in settled if r.get("trusted_for_analysis") is not False]
-            m1 = sum(1 for r in trusted if (r.get("maturity") or {}).get("1d"))
-            m3 = sum(1 for r in trusted if (r.get("maturity") or {}).get("3d"))
-            m5 = sum(1 for r in trusted if (r.get("maturity") or {}).get("5d"))
-            m10 = sum(1 for r in trusted if (r.get("maturity") or {}).get("10d"))
-            bits = classify_sample_statuses(
-                trading_days=int(report.get("trading_days") or 0),
-                matured_1d=m1,
-                matured_5d=m5,
-                matured_10d=m10,
-            )
-            report["structural_sample_status"] = bits["structural_sample_status"]
-            report["outcome_sample_status"] = bits["outcome_sample_status"]
-            report["policy_change_status"] = bits["policy_change_status"]
-            report["policy_change_recommendation"] = bits["policy_change_status"]
-            report["outcome_counts"] = {
-                "trusted_rows": len(trusted),
-                "matured_1d": m1,
-                "matured_3d": m3,
-                "matured_5d": m5,
-                "matured_10d": m10,
-                "pending": sum(1 for r in trusted if r.get("outcome_status") == "PENDING"),
-                "partially_matured": sum(
-                    1 for r in trusted if r.get("outcome_status") == "PARTIALLY_MATURED"
-                ),
-                "fully_matured": sum(
-                    1 for r in trusted if r.get("outcome_status") == "FULLY_MATURED"
-                ),
-            }
-            by_type: Dict[str, List[Dict[str, Any]]] = {}
-            for r in trusted:
-                by_type.setdefault(str(r.get("candidate_type") or "UNKNOWN"), []).append(r)
-            cand_perf: Dict[str, Any] = {}
-            for ctype, group in by_type.items():
-                cand_perf[ctype] = {
-                    h: summarize_outcome_group(group, horizon=h) for h in (1, 3, 5, 10)
-                }
-                xs, ys = [], []
-                for r in group:
-                    s = _safe_float(r.get("decision_score"))
-                    y = _safe_float(r.get("return_5d_pct"))
-                    if s is not None and y is not None:
-                        xs.append(s)
-                        ys.append(y)
-                cand_perf[ctype]["spearman_score_5d"] = spearman_corr(xs, ys)
-            report["candidate_performance"] = cand_perf
-            report["score_calibration"] = score_calibration_buckets(trusted, horizon=5)
+            # Quality aggregates: report scope only (never full ledger).
+            apply_outcome_stats_to_report(report, settled)
         except Exception as e:
             logger.exception("outcome backfill failed: %s", e)
 
@@ -1628,6 +1886,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "outcome_sample_status": report.get("outcome_sample_status"),
         "policy_change_status": report.get("policy_change_status"),
         "outcome_counts": report.get("outcome_counts"),
+        "score_calibration": {
+            k: {
+                "status": (v or {}).get("status") if isinstance(v, dict) else None,
+                "observations": (v or {}).get("observations") if isinstance(v, dict) else None,
+                "spearman_5d": (v or {}).get("spearman_5d") if isinstance(v, dict) else None,
+            }
+            for k, v in (report.get("score_calibration") or {}).items()
+            if k
+            in (
+                "PRODUCTION",
+                "ELIGIBLE_SHADOW",
+                "HIGH_CONVICTION_SHADOW",
+                "LIQUIDITY_SHADOW",
+            )
+        }
+        if isinstance(report.get("score_calibration"), dict)
+        else report.get("score_calibration"),
     }
     print(json.dumps(payload, indent=2))
 

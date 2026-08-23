@@ -687,6 +687,7 @@ def summarize_outcome_group(
 ) -> Dict[str, Any]:
     key = f"return_{horizon}d_pct"
     mdd_key = f"max_drawdown_{horizon}d_pct"
+    runup_key = f"max_runup_{horizon}d_pct"
     vals = [_safe_float(r.get(key)) for r in rows]
     matured = [v for v in vals if v is not None]
     tickers = {str(r.get("ticker") or "").upper() for r in rows if r.get("ticker")}
@@ -703,6 +704,8 @@ def summarize_outcome_group(
             "p25": None,
             "p75": None,
             "mean_max_drawdown": None,
+            "mean_max_runup": None,
+            "ticker_equal_weight_mean_return": None,
             "positive_tail": None,
             "negative_tail": None,
         }
@@ -714,6 +717,19 @@ def summarize_outcome_group(
         if _safe_float(r.get(key)) is not None
     ]
     mdds_ok = [v for v in mdds if v is not None]
+    runups = [
+        _safe_float(r.get(runup_key))
+        for r in rows
+        if _safe_float(r.get(key)) is not None
+    ]
+    runups_ok = [v for v in runups if v is not None]
+    by_ticker: Dict[str, List[float]] = {}
+    for r in rows:
+        t = str(r.get("ticker") or "").upper()
+        v = _safe_float(r.get(key))
+        if t and v is not None:
+            by_ticker.setdefault(t, []).append(v)
+    tmeans = [sum(vs) / len(vs) for vs in by_ticker.values()] if by_ticker else []
     return {
         "observations": n,
         "matured_observations": nm,
@@ -725,6 +741,12 @@ def summarize_outcome_group(
         "p75": matured_sorted[min(nm - 1, (3 * nm) // 4)],
         "mean_max_drawdown": (
             round(sum(mdds_ok) / len(mdds_ok), 6) if mdds_ok else None
+        ),
+        "mean_max_runup": (
+            round(sum(runups_ok) / len(runups_ok), 6) if runups_ok else None
+        ),
+        "ticker_equal_weight_mean_return": (
+            round(sum(tmeans) / len(tmeans), 6) if tmeans else None
         ),
         "positive_tail": matured_sorted[-1],
         "negative_tail": matured_sorted[0],
