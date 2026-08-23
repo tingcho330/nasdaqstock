@@ -113,6 +113,20 @@
       "run_after_production_artifacts_saved": true,
       "time_budget_sec": 90
     },
+    // WEIGHT_SHADOW (Production A_BASELINE 불변, D_TECH_POS_DOWN@0.40 관찰용, trader 미사용)
+    "weight_shadow_policy": {
+      "enabled": true,
+      "markets": ["SP500"],
+      "sessions": ["pm"],
+      "scenario": "D_TECH_POS_DOWN",
+      "research_threshold": 0.40,
+      "prospective_start_trade_date": "20260824",
+      "used_by_trader": false,
+      "diagnostic_only": true,
+      "failure_policy": "WARN_AND_CONTINUE",
+      "run_after_production_artifacts_saved": true,
+      "min_days_before_recommendation": 20
+    },
     // Diagnostic flags (Production 제외 사유로 사용 금지)
     "diagnostic_policy": {
       "enabled": true,

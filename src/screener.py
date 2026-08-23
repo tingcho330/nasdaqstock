@@ -2924,10 +2924,13 @@ def run_liquidity_shadow_post_diagnostics(
     issuer_map: Optional[Dict[str, str]],
     workers: int,
     score_fn: Optional[Any] = None,
+    weight_shadow_payload: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Score Liquidity Shadow universe and publish under post_run_diagnostics/.
 
     Never mutates the finalized DECISION run directory.
+    Optional weight_shadow_payload is written into the same diagnostics dir
+    (WEIGHT_SHADOW diagnostic only; unused by trader).
     """
     if writer is None or not writer.published:
         raise ArtifactError("Liquidity Shadow requires a published DECISION/REPLAY run")
@@ -3268,6 +3271,10 @@ def run_liquidity_shadow_post_diagnostics(
         diag_writer.write_json("screener_liquidity_shadow_candidates.json", candidates)
         diag_writer.write_json("liquidity_shadow_meta.json", meta)
         diag_writer.write_text("logs/liquidity_shadow.log", "\n".join(log_lines) + "\n")
+        diagnostic_types = ["LIQUIDITY_SHADOW"]
+        if weight_shadow_payload is not None:
+            diag_writer.write_json("weight_shadow.json", weight_shadow_payload)
+            diagnostic_types.append("WEIGHT_SHADOW")
         completed_at = datetime.now(KST).isoformat()
         # Review first (without diagnostics_run_id), then manifest
         review_path = diag_writer.path("liquidity_shadow_review.md")
@@ -3275,7 +3282,7 @@ def run_liquidity_shadow_post_diagnostics(
         man = diag_writer.build_manifest(
             status=str(meta.get("status") or "FAILED"),
             completed_at_kst=completed_at,
-            diagnostic_types=["LIQUIDITY_SHADOW"],
+            diagnostic_types=diagnostic_types,
         )
         write_liquidity_shadow_review(
             review_path,
@@ -3293,7 +3300,7 @@ def run_liquidity_shadow_post_diagnostics(
         man = diag_writer.build_manifest(
             status=str(meta.get("status") or "FAILED"),
             completed_at_kst=completed_at,
-            diagnostic_types=["LIQUIDITY_SHADOW"],
+            diagnostic_types=diagnostic_types,
             diagnostics_run_id=man.get("diagnostics_run_id"),
         )
         published = diag_writer.publish(man)
@@ -4692,6 +4699,70 @@ def run_screener(
         if prod_sha_before_liq is None and (writer.final_dir / "screener_candidates.json").exists():
             prod_sha_before_liq = sha256_file(writer.final_dir / "screener_candidates.json")
 
+        # WEIGHT_SHADOW payload (read-only; never feeds trader/GPT/orders)
+        weight_shadow_payload = None
+        weight_shadow_meta: Dict[str, Any] = {"enabled": False, "used_by_trader": False}
+        ws_policy = screener_params.get("weight_shadow_policy") or {}
+        try:
+            from screener_weight_shadow import (
+                build_weight_shadow_payload,
+                should_run_weight_shadow,
+            )
+            from screener_weight_simulation import (
+                SCENARIOS as _WS_SCENARIOS,
+                production_baseline_weights as _ws_baseline_weights,
+            )
+            from screener_full_universe_replay import pipeline_params_from_config as _ws_pipe
+
+            if should_run_weight_shadow(
+                ws_policy,
+                market=market,
+                session=sess,
+                trade_date=fixed_date,
+                run_mode=policy.run_mode,
+            ):
+                _ws_cfg = {"screener_params": screener_params}
+                weight_shadow_payload = build_weight_shadow_payload(
+                    scores_records=scores_records or [],
+                    production_tickers=set(final_candidates["Ticker"].astype(str).str.upper())
+                    if not final_candidates.empty
+                    else set(),
+                    trade_date=fixed_date,
+                    market=market,
+                    session=sess,
+                    source_run_id=writer.run_id,
+                    market_state=_CURRENT_MARKET_STATE,
+                    market_state_payload=market_state_payload,
+                    baseline_weights=_ws_baseline_weights(_ws_cfg),
+                    shadow_weights=dict(_WS_SCENARIOS["D_TECH_POS_DOWN"]),
+                    production_threshold=float(
+                        screener_params.get("min_score_threshold") or 0.48
+                    ),
+                    research_threshold=float(
+                        (ws_policy.get("research_threshold") if ws_policy else None) or 0.40
+                    ),
+                    pipeline_params=_ws_pipe(_ws_cfg),
+                    prospective_start_trade_date=str(
+                        (ws_policy or {}).get("prospective_start_trade_date") or "20260824"
+                    ),
+                )
+                weight_shadow_meta = {
+                    "enabled": True,
+                    "status": "BUILT",
+                    "used_by_trader": False,
+                    "diagnostic_only": True,
+                    "counts": (weight_shadow_payload or {}).get("counts"),
+                }
+        except Exception as e:
+            logger.warning("WEIGHT_SHADOW build failed (Production unchanged): %s", e)
+            weight_shadow_payload = None
+            weight_shadow_meta = {
+                "enabled": True,
+                "status": "FAILED",
+                "errors": [str(e)],
+                "used_by_trader": False,
+            }
+
         # Liquidity Shadow AFTER Production artifacts saved/promoted — separate diagnostics dir
         liq_policy = screener_params.get("liquidity_shadow_policy") or {}
         if bool(liq_policy.get("enabled", True)):
@@ -4738,8 +4809,14 @@ def run_screener(
                     held_tickers=held_set,
                     issuer_map=issuer_map,
                     workers=workers,
+                    weight_shadow_payload=weight_shadow_payload,
                 )
                 liquidity_shadow_candidate_rows = []
+                if weight_shadow_payload is not None:
+                    weight_shadow_meta["status"] = "OK"
+                    weight_shadow_meta["diagnostics_directory"] = liquidity_shadow_meta.get(
+                        "diagnostics_directory"
+                    )
                 logger.info(
                     "Liquidity Shadow diagnostics: universe=%s scored=%s candidates=%s status=%s dir=%s",
                     liquidity_shadow_meta.get("universe_count"),
@@ -4756,6 +4833,61 @@ def run_screener(
                     "errors": [str(e)],
                     "used_by_trader": False,
                     "failure_policy": liq_policy.get("failure_policy", "WARN_AND_CONTINUE"),
+                }
+                if weight_shadow_payload is not None:
+                    try:
+                        from screener_weight_shadow import run_weight_shadow_post_diagnostics
+
+                        weight_shadow_meta = run_weight_shadow_post_diagnostics(
+                            writer=writer,
+                            policy=ws_policy,
+                            scores_records=scores_records or [],
+                            production_tickers=set(final_candidates["Ticker"].astype(str).str.upper())
+                            if not final_candidates.empty
+                            else set(),
+                            trade_date=fixed_date,
+                            market=market,
+                            session=sess,
+                            screener_params=screener_params,
+                            market_state=_CURRENT_MARKET_STATE,
+                            market_state_payload=market_state_payload,
+                        )
+                    except Exception as ws_e:
+                        logger.warning(
+                            "WEIGHT_SHADOW fallback publish failed (Production unchanged): %s",
+                            ws_e,
+                        )
+        elif weight_shadow_payload is not None:
+            # Liquidity disabled — publish WEIGHT_SHADOW diagnostics alone
+            try:
+                from screener_weight_shadow import run_weight_shadow_post_diagnostics
+
+                weight_shadow_meta = run_weight_shadow_post_diagnostics(
+                    writer=writer,
+                    policy=ws_policy,
+                    scores_records=scores_records or [],
+                    production_tickers=set(final_candidates["Ticker"].astype(str).str.upper())
+                    if not final_candidates.empty
+                    else set(),
+                    trade_date=fixed_date,
+                    market=market,
+                    session=sess,
+                    screener_params=screener_params,
+                    market_state=_CURRENT_MARKET_STATE,
+                    market_state_payload=market_state_payload,
+                )
+                logger.info(
+                    "WEIGHT_SHADOW diagnostics: status=%s dir=%s",
+                    weight_shadow_meta.get("status"),
+                    weight_shadow_meta.get("diagnostics_directory"),
+                )
+            except Exception as e:
+                logger.warning("WEIGHT_SHADOW publish failed (Production unchanged): %s", e)
+                weight_shadow_meta = {
+                    "enabled": True,
+                    "status": "FAILED",
+                    "errors": [str(e)],
+                    "used_by_trader": False,
                 }
 
         # DECISION immutability invariants
@@ -4775,7 +4907,7 @@ def run_screener(
             )
 
         logger.info(
-            "최종 후보 저장(run=%s): full=%d slim=%d scores=%d shadow=%d eligible_shadow=%d mode=%s",
+            "최종 후보 저장(run=%s): full=%d slim=%d scores=%d shadow=%d eligible_shadow=%d mode=%s weight_shadow=%s",
             writer.run_id,
             len(final_candidates),
             len(final_candidates),
@@ -4783,6 +4915,7 @@ def run_screener(
             len(shadow_payload_rows),
             len(eligible_shadow_rows),
             policy.run_mode,
+            weight_shadow_meta.get("status"),
         )
 
         try:

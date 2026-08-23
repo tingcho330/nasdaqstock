@@ -996,6 +996,7 @@ class PostRunDiagnosticsWriter:
             "liquidity_shadow_meta.json",
             "liquidity_shadow_review.md",
             "logs/liquidity_shadow.log",
+            "weight_shadow.json",
         ):
             p = self.path(fname)
             if p.exists() and fname not in artifacts:

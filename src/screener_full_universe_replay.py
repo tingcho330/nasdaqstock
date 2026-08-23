@@ -88,13 +88,22 @@ WARNING_INSUFFICIENT_VALIDATION = "INSUFFICIENT_VALIDATION"
 SHADOW_CANDIDATE = "SHADOW_CANDIDATE"
 SHADOW_REJECTED = "SHADOW_REJECTED"
 
-THRESHOLD_GRID_DE = (0.35, 0.38, 0.40, 0.42, 0.44, 0.46, 0.48)
+# Final historical research only — no finer grid, no new weight scenarios.
+D_RESEARCH_THRESHOLDS = (0.38, 0.40, 0.42)
+D_RESEARCH_SCENARIO = "D_TECH_POS_DOWN"
+# Backward-compatible alias (tests may still reference name)
+THRESHOLD_GRID_DE = D_RESEARCH_THRESHOLDS
 TOP_N_LEVELS = (5, 10, 20)
 
 MIGRATION_KEEP = "KEEP"
 MIGRATION_DROP = "DROP"
 MIGRATION_NEW = "NEW"
 MIGRATION_NEITHER = "NEITHER"
+
+STATUS_RESEARCH_ONLY = "RESEARCH_ONLY"
+STATUS_HISTORICAL_WEIGHT_SEARCH_CLOSED = "HISTORICAL_WEIGHT_SEARCH_CLOSED"
+LOW_SAMPLE_REGIME_N = 5
+OUTLIER_ABS_EXCLUDE_N = 1
 
 # Production final Score tolerance after market adjustment (factor export is round(4))
 REPLAY_SCORE_TOLERANCE = 0.0001 + 1e-12
@@ -1044,6 +1053,227 @@ def detect_outlier_dependent(metrics: Dict[str, Any]) -> bool:
     return False
 
 
+def _avg_daily_candidate_count(rows: Sequence[Dict[str, Any]]) -> Optional[float]:
+    by_date: Counter = Counter()
+    for r in rows:
+        td = str(r.get("trade_date") or "")
+        if td:
+            by_date[td] += 1
+    if not by_date:
+        return None
+    return round(sum(by_date.values()) / len(by_date), 4)
+
+
+def window_outcome_block(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    """Outcome metrics plus avg daily candidate count for a candidate row set."""
+    m = outcome_metrics(rows, score_key="scenario_score")
+    m["avg_daily_candidate_count"] = _avg_daily_candidate_count(rows)
+    return m
+
+
+def collect_candidate_obs_from_day_results(
+    day_results: Sequence[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    obs_rows: List[Dict[str, Any]] = []
+    for dr in day_results:
+        for t in dr.get("replay_tickers") or []:
+            src = next(
+                (
+                    r
+                    for r in (dr.get("scored_observations") or [])
+                    if str(r.get("ticker") or "").upper() == t
+                ),
+                {"ticker": t},
+            )
+            obs_rows.append(
+                {
+                    **src,
+                    "scenario_candidate": True,
+                    "trade_date": dr.get("trade_date"),
+                    "ticker": str(src.get("ticker") or t).upper(),
+                }
+            )
+    return obs_rows
+
+
+def collect_topk_obs_from_day_results(
+    day_results: Sequence[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for dr in day_results:
+        for t in dr.get("daily_top_k_matched") or []:
+            src = next(
+                (
+                    r
+                    for r in (dr.get("scored_observations") or [])
+                    if str(r.get("ticker") or "").upper() == t
+                ),
+                {"ticker": t, "trade_date": dr.get("trade_date")},
+            )
+            rows.append({**src, "trade_date": dr.get("trade_date"), "ticker": t})
+    return rows
+
+
+def migration_group_metrics(records: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    """KEEP / DROP / NEW summary with robust stats (no production recommendation)."""
+    out: Dict[str, Any] = {}
+    for group in (MIGRATION_KEEP, MIGRATION_DROP, MIGRATION_NEW):
+        subset = [r for r in records if r.get("migration_group") == group]
+        m = outcome_metrics(subset, score_key="scenario_score")
+        out[group] = {
+            "n": len(subset),
+            "unique_tickers": m.get("unique_tickers"),
+            "mean_5d": m.get("mean_5d"),
+            "median_5d": m.get("median_5d"),
+            "win_rate": m.get("win_rate"),
+            "p25": m.get("p25"),
+            "p75": m.get("p75"),
+            "mature_5d_count": m.get("mature_5d_count"),
+        }
+    return out
+
+
+def metrics_excluding_largest_abs_return(
+    rows: Sequence[Dict[str, Any]],
+    *,
+    n_exclude: int = OUTLIER_ABS_EXCLUDE_N,
+) -> Dict[str, Any]:
+    """Diagnostic-only: drop the largest |return_5d| observation(s). Never cherry-picks sign."""
+    keyed = RETURN_KEYS[5]
+    with_ret = []
+    without_ret = []
+    for r in rows:
+        v = _safe_float(r.get(keyed))
+        if v is None:
+            without_ret.append(r)
+        else:
+            with_ret.append((abs(v), r))
+    if not with_ret or n_exclude <= 0:
+        return {
+            "excluded_n": 0,
+            "note": "insufficient matured returns for abs-exclude diagnostic",
+            "metrics": window_outcome_block(list(rows)),
+        }
+    with_ret_sorted = sorted(with_ret, key=lambda x: x[0], reverse=True)
+    excluded = [r for _, r in with_ret_sorted[:n_exclude]]
+    kept = [r for _, r in with_ret_sorted[n_exclude:]] + without_ret
+    excl_info = [
+        {
+            "ticker": e.get("ticker"),
+            "trade_date": e.get("trade_date"),
+            "return_5d_pct": _safe_float(e.get(keyed)),
+        }
+        for e in excluded
+    ]
+    return {
+        "excluded_n": len(excluded),
+        "excluded": excl_info,
+        "note": (
+            "diagnostic_only: exclude largest absolute 5d return(s); "
+            "not used for Production decisions"
+        ),
+        "metrics": window_outcome_block(kept),
+    }
+
+
+def summarize_d_threshold_windows(
+    day_results: Sequence[Dict[str, Any]],
+    *,
+    train_end: str,
+    validation_start: str,
+) -> Dict[str, Any]:
+    obs = collect_candidate_obs_from_day_results(day_results)
+    train, valid = split_train_validation(
+        obs, train_end=train_end, validation_start=validation_start
+    )
+    return {
+        "full": window_outcome_block(obs),
+        "train": window_outcome_block(train),
+        "validation": window_outcome_block(valid),
+    }
+
+
+def _metric_improved(
+    shadow: Optional[float],
+    baseline: Optional[float],
+    *,
+    higher_is_better: bool = True,
+    slack: float = 0.0,
+) -> bool:
+    if shadow is None or baseline is None:
+        return False
+    if higher_is_better:
+        return shadow > baseline + slack
+    return shadow < baseline - slack
+
+
+def evaluate_d_robust_improvement(
+    *,
+    baseline_validation: Dict[str, Any],
+    d_validation: Dict[str, Any],
+    baseline_topk: Dict[str, Any],
+    d_topk: Dict[str, Any],
+    migration_validation: Dict[str, Any],
+    outlier_flag: bool,
+) -> Dict[str, Any]:
+    """Research gate only — never recommends Production change."""
+    b_med = _safe_float(baseline_validation.get("median_5d"))
+    d_med = _safe_float(d_validation.get("median_5d"))
+    b_tew = _safe_float(baseline_validation.get("ticker_equal_weight_mean_5d"))
+    d_tew = _safe_float(d_validation.get("ticker_equal_weight_mean_5d"))
+    b_fs = _safe_float(baseline_validation.get("first_signal_median_5d"))
+    d_fs = _safe_float(d_validation.get("first_signal_median_5d"))
+    b_wr = _safe_float(baseline_validation.get("win_rate"))
+    d_wr = _safe_float(d_validation.get("win_rate"))
+    b_topk_med = _safe_float(baseline_topk.get("median_5d"))
+    d_topk_med = _safe_float(d_topk.get("median_5d"))
+    new_block = migration_validation.get(MIGRATION_NEW) or {}
+    new_med = _safe_float(new_block.get("median_5d"))
+
+    checks = {
+        "validation_median_improved": _metric_improved(d_med, b_med),
+        "validation_tew_improved": _metric_improved(d_tew, b_tew),
+        "validation_win_rate_ok": (
+            d_wr is not None and b_wr is not None and d_wr >= b_wr - 0.05
+        ),
+        "first_signal_ok": d_fs is None or b_fs is None or d_fs >= b_fs - 2.0,
+        "matched_topk_median_improved": _metric_improved(d_topk_med, b_topk_med),
+        "new_candidates_ok": new_med is None or new_med >= -1.0,
+        "not_outlier_dependent": not outlier_flag,
+    }
+    return {
+        "robust_improvement": all(checks.values()),
+        "checks": checks,
+    }
+
+
+def decide_historical_weight_search(
+    d_threshold_results: Sequence[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Max status is RESEARCH_ONLY. Close search when no robust D improvement."""
+    any_robust = any(bool(r.get("robust_improvement")) for r in d_threshold_results)
+    if any_robust:
+        return {
+            "status": STATUS_RESEARCH_ONLY,
+            "historical_weight_search": "OPEN_RESEARCH_ONLY",
+            "note": (
+                "At least one D research threshold shows research-grade signals; "
+                "Production remains A_BASELINE — no change recommended"
+            ),
+            "production_change_recommended": False,
+        }
+    return {
+        "status": STATUS_RESEARCH_ONLY,
+        "historical_weight_search": STATUS_HISTORICAL_WEIGHT_SEARCH_CLOSED,
+        "note": (
+            "D thresholds 0.38/0.40/0.42 show no robust improvement vs A_BASELINE; "
+            "HISTORICAL_WEIGHT_SEARCH_CLOSED — Production unchanged"
+        ),
+        "production_change_recommended": False,
+        "HISTORICAL_WEIGHT_SEARCH_CLOSED": True,
+    }
+
+
 def evaluate_shadow_candidate(
     scenario_name: str,
     *,
@@ -1634,6 +1864,12 @@ def analyze_full_universe_replay(
     threshold_grid: List[Dict[str, Any]] = []
     daily_candidate_rows: List[Dict[str, Any]] = []
     topn_rows: List[Dict[str, Any]] = []
+    d_threshold_day_results: Dict[float, List[Dict[str, Any]]] = {
+        float(t): [] for t in D_RESEARCH_THRESHOLDS
+    }
+    d_threshold_migrations: Dict[float, List[Dict[str, Any]]] = {
+        float(t): [] for t in D_RESEARCH_THRESHOLDS
+    }
 
     output_dir = Path((load_meta or {}).get("output_dir") or ".")
 
@@ -1692,42 +1928,30 @@ def analyze_full_universe_replay(
             )
             migration_all.extend(mig)
 
-        # Threshold grid for D/E (per day aggregate later)
-        for name in ("D_TECH_POS_DOWN", "E_CONSERVATIVE"):
-            for thr in THRESHOLD_GRID_DE:
-                dr = replay_day_scenario(
-                    day,
-                    scenario_name=name,
-                    weights=scenarios[name],
-                    threshold=float(thr),
-                    pipeline_params=pipeline_params,
-                    baseline_weights=baseline_weights,
-                )
-                cand_rows = [
-                    {
-                        "trade_date": day.get("trade_date"),
-                        "ticker": t,
-                        "scenario_candidate": True,
-                        "scenario_score": (dr.get("replay_scores") or {}).get(t),
-                        **{
-                            hk: _safe_float(
-                                next(
-                                    (
-                                        r.get(hk)
-                                        for r in (dr.get("scored_observations") or [])
-                                        if str(r.get("ticker")).upper() == t
-                                    ),
-                                    None,
-                                )
-                            )
-                            for hk in RETURN_KEYS.values()
-                        },
-                    }
-                    for t in dr.get("replay_tickers") or []
-                ]
-                gm = threshold_grid_metrics(cand_rows, scenario=name, threshold=float(thr))
-                gm["trade_date"] = day.get("trade_date")
-                threshold_grid.append(gm)
+        # D research thresholds only (0.38 / 0.40 / 0.42) — no E grid, no finer grid
+        for thr in D_RESEARCH_THRESHOLDS:
+            dr = replay_day_scenario(
+                day,
+                scenario_name=D_RESEARCH_SCENARIO,
+                weights=scenarios[D_RESEARCH_SCENARIO],
+                threshold=float(thr),
+                pipeline_params=pipeline_params,
+                baseline_weights=baseline_weights,
+            )
+            d_threshold_day_results[float(thr)].append(dr)
+            mig = build_migration_records(
+                baseline_day_result,
+                dr,
+                scenario_name=D_RESEARCH_SCENARIO,
+                threshold=float(thr),
+            )
+            d_threshold_migrations[float(thr)].extend(mig)
+            cand_rows = collect_candidate_obs_from_day_results([dr])
+            gm = threshold_grid_metrics(
+                cand_rows, scenario=D_RESEARCH_SCENARIO, threshold=float(thr)
+            )
+            gm["trade_date"] = day.get("trade_date")
+            threshold_grid.append(gm)
 
     if not baseline_replay_ok:
         warnings.append(
@@ -1771,13 +1995,16 @@ def analyze_full_universe_replay(
         all_candidate_obs.extend(obs_rows)
         train, valid = split_train_validation(obs_rows)
         thr = PRODUCTION_THRESHOLD
+        full_m = window_outcome_block(obs_rows)
+        train_m = window_outcome_block(train)
+        valid_m = window_outcome_block(valid)
         scenario_summaries[name] = {
             "weights": dict(scenarios[name]),
             "weight_sum": weight_sum(scenarios[name]),
             "threshold": thr,
-            "full": outcome_metrics(obs_rows),
-            "train": outcome_metrics(train),
-            "validation": outcome_metrics(valid),
+            "full": full_m,
+            "train": train_m,
+            "validation": valid_m,
             "sector_concentration": sector_concentration(obs_rows),
             "daily_candidate_counts": Counter(str(r.get("trade_date")) for r in obs_rows),
         }
@@ -1825,7 +2052,7 @@ def analyze_full_universe_replay(
                 rows.append(src)
         topk_matched[name] = outcome_metrics(rows)
 
-    # Aggregate threshold grid by scenario+threshold
+    # Aggregate threshold grid by scenario+threshold (compat export)
     grid_agg: Dict[Tuple[str, float], Dict[str, Any]] = {}
     for row in threshold_grid:
         key = (str(row.get("scenario")), float(row.get("threshold") or 0))
@@ -1864,12 +2091,120 @@ def analyze_full_universe_replay(
         grid_summary.append(rec)
 
     count_equiv: Dict[str, Optional[float]] = {}
-    for scen in ("D_TECH_POS_DOWN", "E_CONSERVATIVE"):
-        count_equiv[scen] = find_count_equivalent_threshold(
-            [{"scenario": r["scenario"], "threshold": r["threshold"], "pass_count": r["total_observations"]} for r in grid_summary],
-            baseline_count=baseline_pass,
-            scenario=scen,
+    count_equiv[D_RESEARCH_SCENARIO] = find_count_equivalent_threshold(
+        [
+            {
+                "scenario": r["scenario"],
+                "threshold": r["threshold"],
+                "pass_count": r["total_observations"],
+            }
+            for r in grid_summary
+        ],
+        baseline_count=baseline_pass,
+        scenario=D_RESEARCH_SCENARIO,
+    )
+
+    # --- D historical research diagnostics (0.38 / 0.40 / 0.42) ---
+    baseline_obs = collect_candidate_obs_from_day_results(baseline_daily)
+    baseline_train, baseline_valid = split_train_validation(
+        baseline_obs, train_end=train_end, validation_start=validation_start
+    )
+    baseline_windows = {
+        "full": window_outcome_block(baseline_obs),
+        "train": window_outcome_block(baseline_train),
+        "validation": window_outcome_block(baseline_valid),
+    }
+    baseline_topk_obs = collect_topk_obs_from_day_results(baseline_daily)
+    baseline_topk_metrics = window_outcome_block(baseline_topk_obs)
+
+    d_threshold_diagnostics: List[Dict[str, Any]] = []
+    for thr in D_RESEARCH_THRESHOLDS:
+        thr_f = float(thr)
+        drs = d_threshold_day_results.get(thr_f) or []
+        windows = summarize_d_threshold_windows(
+            drs, train_end=train_end, validation_start=validation_start
         )
+        mig = d_threshold_migrations.get(thr_f) or []
+        mig_full = migration_group_metrics(mig)
+        mig_valid_recs = [
+            m
+            for m in mig
+            if str(m.get("trade_date") or "") >= validation_start
+            and m.get("migration_group") in (MIGRATION_KEEP, MIGRATION_DROP, MIGRATION_NEW)
+        ]
+        mig_valid = migration_group_metrics(mig_valid_recs)
+        topk_obs = collect_topk_obs_from_day_results(drs)
+        topk_m = window_outcome_block(topk_obs)
+        cand_obs = collect_candidate_obs_from_day_results(drs)
+        _, cand_valid = split_train_validation(
+            cand_obs, train_end=train_end, validation_start=validation_start
+        )
+        outlier_full = metrics_excluding_largest_abs_return(cand_obs)
+        outlier_valid = metrics_excluding_largest_abs_return(cand_valid)
+        outlier_flag = detect_outlier_dependent(windows.get("validation") or {})
+        robust = evaluate_d_robust_improvement(
+            baseline_validation=baseline_windows["validation"],
+            d_validation=windows["validation"],
+            baseline_topk=baseline_topk_metrics,
+            d_topk=topk_m,
+            migration_validation=mig_valid,
+            outlier_flag=outlier_flag,
+        )
+        d_threshold_diagnostics.append(
+            {
+                "scenario": D_RESEARCH_SCENARIO,
+                "threshold": thr_f,
+                "windows": windows,
+                "migration": {"full": mig_full, "validation": mig_valid},
+                "daily_topk_matched": {
+                    "A_BASELINE": baseline_topk_metrics,
+                    D_RESEARCH_SCENARIO: topk_m,
+                    "note": (
+                        "K = Production A candidate count per day; "
+                        "separates threshold count effects from ranking quality"
+                    ),
+                },
+                "outlier_sensitivity": {
+                    "full": outlier_full,
+                    "validation": outlier_valid,
+                    "outlier_dependent_flag": outlier_flag,
+                },
+                "robust_improvement": robust.get("robust_improvement"),
+                "robust_checks": robust.get("checks"),
+            }
+        )
+
+    # Regime split A vs D (at research shadow threshold 0.40)
+    regime_avd: Dict[str, Any] = {}
+    d40_results = d_threshold_day_results.get(0.40) or []
+    a_by_regime: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    d_by_regime: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for dr in baseline_daily:
+        reg = str(dr.get("regime") or "UNKNOWN").lower()
+        a_by_regime[reg].extend(collect_candidate_obs_from_day_results([dr]))
+    for dr in d40_results:
+        reg = str(dr.get("regime") or "UNKNOWN").lower()
+        d_by_regime[reg].extend(collect_candidate_obs_from_day_results([dr]))
+    all_regimes = sorted(set(a_by_regime) | set(d_by_regime))
+    for reg in all_regimes:
+        a_rows = a_by_regime.get(reg) or []
+        d_rows = d_by_regime.get(reg) or []
+        a_m = window_outcome_block(a_rows)
+        d_m = window_outcome_block(d_rows)
+        low_sample = (
+            int(a_m.get("observations") or 0) < LOW_SAMPLE_REGIME_N
+            or int(d_m.get("observations") or 0) < LOW_SAMPLE_REGIME_N
+            or int(a_m.get("mature_5d_count") or 0) < LOW_SAMPLE_REGIME_N
+            or int(d_m.get("mature_5d_count") or 0) < LOW_SAMPLE_REGIME_N
+        )
+        regime_avd[reg] = {
+            "A_BASELINE": a_m,
+            D_RESEARCH_SCENARIO: d_m,
+            "LOW_SAMPLE": low_sample,
+            "sample_flag": WARNING_LOW_SAMPLE if low_sample else None,
+        }
+
+    historical_decision = decide_historical_weight_search(d_threshold_diagnostics)
 
     # Warnings
     val_n = int(scenario_summaries.get("A_BASELINE", {}).get("validation", {}).get("observations") or 0)
@@ -1889,7 +2224,7 @@ def analyze_full_universe_replay(
         if detect_outlier_dependent(summ.get("validation") or {}):
             warnings.append({"type": WARNING_OUTLIER_DEPENDENT, "scenario": name, "detail": "validation mean vs median gap"})
 
-    # Shadow evaluation (only if baseline replay ok)
+    # Shadow evaluation (only if baseline replay ok) — Production unchanged
     shadow_verdicts: Dict[str, Any] = {}
     if baseline_replay_ok:
         base_val = scenario_summaries["A_BASELINE"]["validation"]
@@ -1945,15 +2280,24 @@ def analyze_full_universe_replay(
         "scenarios": scenario_summaries,
         "a_vs_c": a_c,
         "regime_results": regime_results,
+        "regime_split_a_vs_d": regime_avd,
         "daily_top_k_matched": topk_matched,
         "threshold_grid": grid_summary,
         "count_equivalent_threshold": count_equiv,
+        "d_threshold_diagnostics": d_threshold_diagnostics,
+        "baseline_windows_for_d_compare": baseline_windows,
+        "historical_decision": historical_decision,
+        "research_status": STATUS_RESEARCH_ONLY,
         "shadow_verdicts": shadow_verdicts,
         "warnings": warnings,
         "production_policy_unchanged": True,
-        "recommendation": "NONE — read-only full-universe replay; no Production change",
+        "recommendation": (
+            f"{STATUS_RESEARCH_ONLY} — read-only full-universe replay; "
+            "no Production change"
+        ),
         "_export_daily_candidates": daily_candidate_rows,
-        "_export_migration": migration_all,
+        "_export_migration": migration_all
+        + [m for mig_list in d_threshold_migrations.values() for m in mig_list],
         "_export_topn": topn_rows,
         "_export_scenario_summary": _flatten_scenario_summary(scenario_summaries),
     }
@@ -2014,6 +2358,7 @@ def _flatten_scenario_summary(scenarios: Dict[str, Any]) -> List[Dict[str, Any]]
                     "first_signal_mean_5d": m.get("first_signal_mean_5d"),
                     "first_signal_median_5d": m.get("first_signal_median_5d"),
                     "first_signal_win_rate": m.get("first_signal_win_rate"),
+                    "avg_daily_candidate_count": m.get("avg_daily_candidate_count"),
                     "spearman_5d": m.get("spearman_5d"),
                 }
             )
@@ -2054,6 +2399,12 @@ def render_markdown(report: Dict[str, Any]) -> str:
         f"`{report.get('market')}` `{report.get('session')}`"
     )
     lines.append(f"- Status: `{report.get('status')}` · scope=`{report.get('scope')}`")
+    lines.append(f"- Research status: `{report.get('research_status') or STATUS_RESEARCH_ONLY}`")
+    hd = report.get("historical_decision") or {}
+    lines.append(
+        f"- Historical decision: `{hd.get('historical_weight_search')}` "
+        f"(production_change_recommended={hd.get('production_change_recommended', False)})"
+    )
     lines.append(f"- Primary universe artifact: `{um.get('primary_universe_artifact')}`")
     lines.append(f"- Included days: {um.get('included_days')} · avg universe size: {um.get('avg_universe_size')}")
     lines.append(f"- trust_counts_raw: `{um.get('trust_counts_raw')}`")
@@ -2087,6 +2438,40 @@ def render_markdown(report: Dict[str, Any]) -> str:
     lines.append(f"- A candidates: {ac.get('A_candidate_count')} · C candidates: {ac.get('C_candidate_count')}")
     lines.append(f"- C NEW n={((ac.get('C_NEW') or {}).get('n'))} · C DROP n={((ac.get('C_DROP') or {}).get('n'))}")
     lines.append("")
+
+    lines.append("## D research thresholds (0.38 / 0.40 / 0.42)")
+    for block in report.get("d_threshold_diagnostics") or []:
+        thr = block.get("threshold")
+        lines.append(f"### D_TECH_POS_DOWN @ {thr}")
+        for window in ("full", "train", "validation"):
+            m = (block.get("windows") or {}).get(window) or {}
+            lines.append(
+                f"- **{window}**: n={m.get('observations')} tickers={m.get('unique_tickers')} "
+                f"mean5d={m.get('mean_5d')} median5d={m.get('median_5d')} wr={m.get('win_rate')} "
+                f"tew={m.get('ticker_equal_weight_mean_5d')} "
+                f"fs_med={m.get('first_signal_median_5d')} "
+                f"avg_daily={m.get('avg_daily_candidate_count')}"
+            )
+        lines.append(f"- robust_improvement={block.get('robust_improvement')}")
+        mig_v = ((block.get("migration") or {}).get("validation") or {})
+        lines.append(
+            f"- validation migration KEEP n={((mig_v.get(MIGRATION_KEEP) or {}).get('n'))} "
+            f"DROP n={((mig_v.get(MIGRATION_DROP) or {}).get('n'))} "
+            f"NEW n={((mig_v.get(MIGRATION_NEW) or {}).get('n'))}"
+        )
+        lines.append("")
+
+    lines.append("## Regime split A vs D@0.40")
+    for reg, block in (report.get("regime_split_a_vs_d") or {}).items():
+        flag = " LOW_SAMPLE" if block.get("LOW_SAMPLE") else ""
+        a_m = block.get("A_BASELINE") or {}
+        d_m = block.get(D_RESEARCH_SCENARIO) or {}
+        lines.append(
+            f"- **{reg}**{flag}: A med={a_m.get('median_5d')} (n={a_m.get('observations')}) · "
+            f"D med={d_m.get('median_5d')} (n={d_m.get('observations')})"
+        )
+    lines.append("")
+
     lines.append("## Shadow verdicts")
     for name, v in (report.get("shadow_verdicts") or {}).items():
         lines.append(f"- **{name}**: `{v.get('status')}` {v.get('reason') or ''}")
@@ -2095,6 +2480,9 @@ def render_markdown(report: Dict[str, Any]) -> str:
     for w in report.get("warnings") or []:
         lines.append(f"- **{w.get('type')}**: {w.get('detail')}")
     lines.append("")
+    if hd.get("HISTORICAL_WEIGHT_SEARCH_CLOSED") or hd.get("historical_weight_search") == STATUS_HISTORICAL_WEIGHT_SEARCH_CLOSED:
+        lines.append(f"**{STATUS_HISTORICAL_WEIGHT_SEARCH_CLOSED}**")
+        lines.append("")
     lines.append(str(report.get("recommendation")))
     return "\n".join(lines) + "\n"
 
@@ -2254,6 +2642,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "C_NEW_n": ((report.get("a_vs_c") or {}).get("C_NEW") or {}).get("n"),
         },
         "shadow_verdicts": report.get("shadow_verdicts"),
+        "historical_decision": report.get("historical_decision"),
+        "research_status": report.get("research_status"),
+        "d_thresholds": [
+            {
+                "threshold": b.get("threshold"),
+                "robust_improvement": b.get("robust_improvement"),
+                "validation_median_5d": ((b.get("windows") or {}).get("validation") or {}).get("median_5d"),
+                "validation_avg_daily": ((b.get("windows") or {}).get("validation") or {}).get(
+                    "avg_daily_candidate_count"
+                ),
+            }
+            for b in (report.get("d_threshold_diagnostics") or [])
+        ],
         "warnings": report.get("warnings"),
         "recommendation": report.get("recommendation"),
     }

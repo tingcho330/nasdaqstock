@@ -655,7 +655,19 @@ def test_threshold_grid_for_d_e(tmp_path: Path):
     )
     grid = report.get("threshold_grid") or []
     d_rows = [g for g in grid if g.get("scenario") == "D_TECH_POS_DOWN"]
-    assert len(d_rows) >= 7
+    assert len(d_rows) == 3
+    assert {float(r["threshold"]) for r in d_rows} == {0.38, 0.40, 0.42}
+    diag = report.get("d_threshold_diagnostics") or []
+    assert len(diag) == 3
+    assert report.get("research_status") == "RESEARCH_ONLY"
+    assert (report.get("historical_decision") or {}).get("production_change_recommended") is False
+    assert "HISTORICAL_WEIGHT_SEARCH_CLOSED" in str(
+        (report.get("historical_decision") or {}).get("historical_weight_search")
+        or (report.get("historical_decision") or {})
+    ) or (report.get("historical_decision") or {}).get("historical_weight_search") in (
+        "HISTORICAL_WEIGHT_SEARCH_CLOSED",
+        "OPEN_RESEARCH_ONLY",
+    )
 
 
 def test_missing_outcome_graceful(tmp_path: Path):
