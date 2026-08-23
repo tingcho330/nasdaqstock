@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import logging
 import math
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger("screener_outcomes")
@@ -22,6 +22,15 @@ DEFAULT_QUALITY_POLICY = {
     "outcome_min_10d": 20,
     "policy_review_min_5d": 40,
 }
+
+# Process-local OHLCV cache keyed by ticker (wide window); correctness-preserving.
+_OHLCV_BY_TICKER: Dict[str, Any] = {}
+_OHLCV_META: Dict[str, Tuple[str, str]] = {}  # ticker → (start, end) of cached window
+
+
+def clear_ohlcv_cache() -> None:
+    _OHLCV_BY_TICKER.clear()
+    _OHLCV_META.clear()
 
 
 def _safe_float(v: Any) -> Optional[float]:
@@ -38,29 +47,112 @@ def _safe_float(v: Any) -> Optional[float]:
         return None
 
 
+def normalize_trade_date(value: Any) -> Optional[str]:
+    """Canonical YYYYMMDD from str/date/datetime/pandas timestamps."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        # Use wall-calendar date in the datetime's timezone (do not shift via UTC)
+        return value.strftime("%Y%m%d")
+    if isinstance(value, date) and not isinstance(value, datetime):
+        return value.strftime("%Y%m%d")
+    # pandas Timestamp
+    if hasattr(value, "to_pydatetime"):
+        try:
+            return normalize_trade_date(value.to_pydatetime())
+        except Exception:
+            pass
+    if hasattr(value, "strftime") and not isinstance(value, str):
+        try:
+            return value.strftime("%Y%m%d")
+        except Exception:
+            pass
+    s = str(value).strip()
+    if not s or s.lower() in ("nan", "none", "nat"):
+        return None
+    # ISO with time
+    if "T" in s or " " in s:
+        try:
+            iso = s.replace("Z", "+00:00")
+            return normalize_trade_date(datetime.fromisoformat(iso))
+        except Exception:
+            pass
+    digits = "".join(ch for ch in s if ch.isdigit())
+    if len(digits) >= 8:
+        return digits[:8]
+    return None
+
+
+def ohlcv_to_closes_by_date(df: Any) -> Dict[str, Dict[str, Optional[float]]]:
+    """Extract {YYYYMMDD: {close, high, low}} from KIS-normalized or indexed OHLCV.
+
+    KIS path returns RangeIndex + Date column — must NOT treat the integer index
+    as a calendar date.
+    """
+    out: Dict[str, Dict[str, Optional[float]]] = {}
+    if df is None or getattr(df, "empty", True):
+        return out
+
+    cols = {str(c).strip().lower(): c for c in getattr(df, "columns", [])}
+    date_col = None
+    for cand in ("date", "xymd", "stck_bsop_date", "bsop_date"):
+        if cand in cols:
+            date_col = cols[cand]
+            break
+    close_col = cols.get("close")
+    high_col = cols.get("high")
+    low_col = cols.get("low")
+
+    if date_col is not None and close_col is not None:
+        for _, row in df.iterrows():
+            d = normalize_trade_date(row.get(date_col) if hasattr(row, "get") else row[date_col])
+            if not d:
+                continue
+            c = _safe_float(row.get(close_col) if hasattr(row, "get") else row[close_col])
+            if c is None:
+                continue
+            out[d] = {
+                "close": c,
+                "high": _safe_float(row.get(high_col) if high_col and hasattr(row, "get") else (row[high_col] if high_col else None)),
+                "low": _safe_float(row.get(low_col) if low_col and hasattr(row, "get") else (row[low_col] if low_col else None)),
+            }
+        return out
+
+    # Fallback: DatetimeIndex / date-like index (pykrx/fdr style)
+    if close_col is None:
+        return out
+    for idx, row in df.iterrows():
+        d = normalize_trade_date(idx)
+        if not d:
+            continue
+        c = _safe_float(row.get(close_col) if hasattr(row, "get") else row[close_col])
+        if c is None:
+            continue
+        out[d] = {
+            "close": c,
+            "high": _safe_float(row.get(high_col) if high_col and hasattr(row, "get") else None),
+            "low": _safe_float(row.get(low_col) if low_col and hasattr(row, "get") else None),
+        }
+    return out
+
+
 def get_forward_trading_dates(
-    trade_date: str,
+    trade_date: Any,
     n: int,
     *,
     price_index: Optional[Sequence[Any]] = None,
 ) -> List[str]:
-    """Return the next *n* trading dates after trade_date.
-
-    Prefer the actual price series index (holiday-aware). Fallback walks calendar
-    days excluding weekends only when no index is provided.
-    """
+    """Return the next *n* trading dates after trade_date from sorted OHLCV dates."""
     if n <= 0:
         return []
-    td = str(trade_date).strip()
+    td = normalize_trade_date(trade_date)
+    if not td:
+        return []
     if price_index is not None and len(price_index) > 0:
         dates: List[str] = []
         for raw in price_index:
-            try:
-                if hasattr(raw, "strftime"):
-                    d = raw.strftime("%Y%m%d")
-                else:
-                    d = str(raw).replace("-", "")[:8]
-            except Exception:
+            d = normalize_trade_date(raw)
+            if not d:
                 continue
             if d > td:
                 dates.append(d)
@@ -93,8 +185,10 @@ def calculate_forward_return(
 def calculate_forward_max_drawdown(
     reference_price: float,
     forward_closes: Sequence[float],
+    *,
+    forward_lows: Optional[Sequence[Optional[float]]] = None,
 ) -> Optional[float]:
-    """Max drawdown from reference across forward closes, in percent (≤ 0)."""
+    """Max drawdown from reference across forward path, in percent (≤ 0)."""
     ref = _safe_float(reference_price)
     if ref is None or ref <= 0:
         return None
@@ -103,36 +197,73 @@ def calculate_forward_max_drawdown(
         return None
     peak = ref
     mdd = 0.0
-    for p in closes:
-        peak = max(peak, p)
+    for i, c in enumerate(closes):
+        peak = max(peak, c)
+        trough = c
+        if forward_lows is not None and i < len(forward_lows):
+            lo = _safe_float(forward_lows[i])
+            if lo is not None:
+                trough = lo
         if peak > 0:
-            mdd = min(mdd, (p - peak) / peak * 100.0)
+            mdd = min(mdd, (trough - peak) / peak * 100.0)
     return round(mdd, 6)
 
 
 def calculate_forward_max_runup(
     reference_price: float,
     forward_closes: Sequence[float],
+    *,
+    forward_highs: Optional[Sequence[Optional[float]]] = None,
 ) -> Optional[float]:
     ref = _safe_float(reference_price)
     if ref is None or ref <= 0:
         return None
-    closes = [c for c in (_safe_float(x) for x in forward_closes) if c is not None]
-    if not closes:
-        return None
     best = 0.0
-    for p in closes:
-        best = max(best, (p / ref - 1.0) * 100.0)
+    n = len(forward_closes)
+    if n == 0 and not forward_highs:
+        return None
+    for i in range(max(n, len(forward_highs or []))):
+        hi = None
+        if forward_highs and i < len(forward_highs):
+            hi = _safe_float(forward_highs[i])
+        if hi is None and i < n:
+            hi = _safe_float(forward_closes[i])
+        if hi is None:
+            continue
+        best = max(best, (hi / ref - 1.0) * 100.0)
     return round(best, 6)
 
 
-def _load_close_series(
+def _load_ohlcv_frame(
     ticker: str,
     trade_date: str,
     *,
-    lookforward_calendar_days: int = 40,
+    lookforward_calendar_days: int = 45,
+    lookback_calendar_days: int = 10,
     price_loader: Optional[Callable[..., Any]] = None,
+    use_cache: bool = True,
+    fetch_start: Optional[str] = None,
+    fetch_end: Optional[str] = None,
 ) -> Optional[Any]:
+    td = normalize_trade_date(trade_date)
+    if not td and not (fetch_start and fetch_end):
+        return None
+    tkey = str(ticker).upper()
+    if fetch_start and fetch_end:
+        start_s = normalize_trade_date(fetch_start) or fetch_start
+        end_s = normalize_trade_date(fetch_end) or fetch_end
+    else:
+        assert td is not None
+        start = datetime.strptime(td, "%Y%m%d") - timedelta(days=lookback_calendar_days)
+        end = datetime.strptime(td, "%Y%m%d") + timedelta(days=lookforward_calendar_days)
+        today = datetime.utcnow().date()
+        end_d = min(end.date(), today + timedelta(days=1))
+        start_s = start.strftime("%Y%m%d")
+        end_s = end_d.strftime("%Y%m%d")
+
+    if use_cache and tkey in _OHLCV_BY_TICKER:
+        return _OHLCV_BY_TICKER[tkey]
+
     loader = price_loader
     if loader is None:
         try:
@@ -143,24 +274,93 @@ def _load_close_series(
             logger.debug("price loader unavailable: %s", e)
             return None
     try:
-        start = datetime.strptime(trade_date, "%Y%m%d")
-        end = start + timedelta(days=lookforward_calendar_days)
-        # Include trade_date itself for reference close
-        start_s = (start - timedelta(days=5)).strftime("%Y%m%d")
-        end_s = end.strftime("%Y%m%d")
         df = loader(ticker, start_s, end_s)
         if df is None or getattr(df, "empty", True):
+            if use_cache:
+                _OHLCV_BY_TICKER[tkey] = None
+                _OHLCV_META[tkey] = (start_s, end_s)
             return None
-        if "Close" not in df.columns:
-            # try lowercase
-            cols = {c.lower(): c for c in df.columns}
-            if "close" not in cols:
-                return None
-            df = df.rename(columns={cols["close"]: "Close"})
+        if use_cache:
+            # Merge with existing cache if present
+            prev = _OHLCV_BY_TICKER.get(tkey)
+            if prev is not None and not getattr(prev, "empty", True):
+                try:
+                    import pandas as pd
+
+                    df = pd.concat([prev, df], ignore_index=True)
+                    if "Date" in df.columns:
+                        df = df.drop_duplicates(subset=["Date"], keep="last")
+                        df = df.sort_values("Date").reset_index(drop=True)
+                except Exception:
+                    pass
+            _OHLCV_BY_TICKER[tkey] = df
+            prev_meta = _OHLCV_META.get(tkey)
+            if prev_meta:
+                _OHLCV_META[tkey] = (min(prev_meta[0], start_s), max(prev_meta[1], end_s))
+            else:
+                _OHLCV_META[tkey] = (start_s, end_s)
         return df
     except Exception as e:
-        logger.debug("close series load failed %s %s: %s", ticker, trade_date, e)
+        logger.debug("OHLCV load failed %s %s: %s", ticker, td, e)
         return None
+
+
+def prefetch_ohlcv_for_observations(
+    observations: Sequence[Dict[str, Any]],
+    *,
+    price_loader: Optional[Callable[..., Any]] = None,
+    as_of_trade_date: Optional[str] = None,
+) -> None:
+    """One (or few) KIS fetch(es) per ticker covering all observation dates."""
+    by_ticker: Dict[str, List[str]] = {}
+    for o in observations:
+        t = str(o.get("ticker") or "").upper()
+        td = normalize_trade_date(o.get("trade_date"))
+        if t and td:
+            by_ticker.setdefault(t, []).append(td)
+    as_of = normalize_trade_date(as_of_trade_date)
+    today = datetime.utcnow().strftime("%Y%m%d")
+    end_cap = as_of or today
+    for t, dates in by_ticker.items():
+        d0, d1 = min(dates), max(dates)
+        start = (datetime.strptime(d0, "%Y%m%d") - timedelta(days=10)).strftime("%Y%m%d")
+        # Enough calendar span for 10 trading days past the latest needed end
+        end = (
+            datetime.strptime(max(d1, end_cap), "%Y%m%d") + timedelta(days=25)
+        ).strftime("%Y%m%d")
+        _load_ohlcv_frame(
+            t,
+            d0,
+            price_loader=price_loader,
+            use_cache=True,
+            fetch_start=start,
+            fetch_end=end,
+        )
+
+
+def _load_close_series(
+    ticker: str,
+    trade_date: str,
+    *,
+    lookforward_calendar_days: int = 45,
+    price_loader: Optional[Callable[..., Any]] = None,
+) -> Optional[Any]:
+    """Back-compat alias used by tests."""
+    return _load_ohlcv_frame(
+        ticker,
+        trade_date,
+        lookforward_calendar_days=lookforward_calendar_days,
+        price_loader=price_loader,
+    )
+
+
+def _outcome_status_from_maturity(maturity: Dict[str, bool]) -> str:
+    vals = [bool(maturity.get(k)) for k in ("1d", "3d", "5d", "10d")]
+    if all(vals):
+        return "FULLY_MATURED"
+    if any(vals):
+        return "PARTIALLY_MATURED"
+    return "PENDING"
 
 
 def settle_observation_outcome(
@@ -169,68 +369,103 @@ def settle_observation_outcome(
     as_of_trade_date: Optional[str] = None,
     price_loader: Optional[Callable[..., Any]] = None,
     close_series: Optional[Any] = None,
+    debug: bool = False,
 ) -> Dict[str, Any]:
     """Settle forward returns for one observation (idempotent field merge)."""
     out = dict(obs)
     ticker = str(out.get("ticker") or "").upper()
-    trade_date = str(out.get("trade_date") or "")
+    trade_date = normalize_trade_date(out.get("trade_date"))
+    as_of = normalize_trade_date(as_of_trade_date) if as_of_trade_date else None
+    debug_info: Dict[str, Any] = {}
+
     if not ticker or not trade_date:
         out["outcome_status"] = "DATA_UNAVAILABLE"
+        out["maturity"] = {"1d": False, "3d": False, "5d": False, "10d": False}
         return out
 
-    ref = _safe_float(out.get("reference_price") or out.get("decision_price"))
+    out["trade_date"] = trade_date
+    ref = _safe_float(out.get("reference_price"))
+    if ref is None:
+        ref = _safe_float(out.get("decision_price"))
+    ref_source = "OBSERVATION" if ref is not None else None
+
     df = close_series
     if df is None:
-        df = _load_close_series(ticker, trade_date, price_loader=price_loader)
-    if df is None or getattr(df, "empty", True):
+        df = _load_ohlcv_frame(ticker, trade_date, price_loader=price_loader)
+
+    bars = ohlcv_to_closes_by_date(df) if df is not None else {}
+    sorted_dates = sorted(bars.keys())
+    debug_info.update(
+        {
+            "ticker": ticker,
+            "trade_date": trade_date,
+            "ohlcv_rows": len(sorted_dates),
+            "ohlcv_first_date": sorted_dates[0] if sorted_dates else None,
+            "ohlcv_last_date": sorted_dates[-1] if sorted_dates else None,
+            "candidate_date_present": trade_date in bars,
+        }
+    )
+
+    if not bars:
         out.setdefault("outcome_status", "PENDING")
-        out.setdefault(
-            "maturity",
-            {"1d": False, "3d": False, "5d": False, "10d": False},
-        )
+        out["maturity"] = {"1d": False, "3d": False, "5d": False, "10d": False}
+        out["settlement_note"] = "OHLCV_EMPTY_OR_UNPARSED"
+        if debug:
+            out["_settlement_debug"] = debug_info
         return out
 
-    # Normalize index to YYYYMMDD strings
-    closes_by_date: Dict[str, float] = {}
-    for idx, row in df.iterrows():
-        try:
-            if hasattr(idx, "strftime"):
-                d = idx.strftime("%Y%m%d")
-            else:
-                d = str(idx).replace("-", "")[:8]
-            c = _safe_float(row.get("Close") if hasattr(row, "get") else row["Close"])
-            if c is not None:
-                closes_by_date[d] = c
-        except Exception:
-            continue
-
-    sorted_dates = sorted(closes_by_date.keys())
     if ref is None:
-        # Use trade_date close as reference when available
-        if trade_date in closes_by_date:
-            ref = closes_by_date[trade_date]
+        if trade_date in bars:
+            ref = bars[trade_date]["close"]
+            ref_source = "OHLCV_CLOSE_BACKFILL"
+            out["reference_price_date"] = trade_date
         else:
-            # nearest on-or-before
             prior = [d for d in sorted_dates if d <= trade_date]
             if prior:
-                ref = closes_by_date[prior[-1]]
+                ref = bars[prior[-1]]["close"]
+                ref_source = "OHLCV_CLOSE_BACKFILL"
                 out["reference_price_date"] = prior[-1]
     if ref is None:
         out["outcome_status"] = "DATA_UNAVAILABLE"
+        out["maturity"] = {"1d": False, "3d": False, "5d": False, "10d": False}
+        out["settlement_note"] = "REFERENCE_PRICE_UNAVAILABLE"
+        if debug:
+            out["_settlement_debug"] = debug_info
         return out
 
     out["reference_price"] = ref
     out.setdefault("reference_price_date", trade_date)
+    out["reference_price_source"] = ref_source or "OBSERVATION"
     out["outcome_price_source"] = OUTCOME_PRICE_SOURCE
 
+    # Reference index in sorted trading calendar
+    if trade_date in bars:
+        ref_idx = sorted_dates.index(trade_date)
+    else:
+        prior = [d for d in sorted_dates if d <= trade_date]
+        ref_idx = sorted_dates.index(prior[-1]) if prior else -1
+
     forward_dates = get_forward_trading_dates(trade_date, 10, price_index=sorted_dates)
-    # Cap by as_of if provided (no future leakage beyond known last bar)
-    last_available = sorted_dates[-1] if sorted_dates else trade_date
-    if as_of_trade_date:
-        last_available = min(last_available, str(as_of_trade_date))
+    last_available = sorted_dates[-1]
+    if as_of:
+        last_available = min(last_available, as_of)
+
+    debug_info.update(
+        {
+            "reference_index": ref_idx,
+            "reference_close": ref,
+            "1D_target_date": forward_dates[0] if len(forward_dates) >= 1 else None,
+            "3D_target_date": forward_dates[2] if len(forward_dates) >= 3 else None,
+            "5D_target_date": forward_dates[4] if len(forward_dates) >= 5 else None,
+            "10D_target_date": forward_dates[9] if len(forward_dates) >= 10 else None,
+            "last_available": last_available,
+        }
+    )
 
     maturity = {"1d": False, "3d": False, "5d": False, "10d": False}
-    forward_closes_accum: List[float] = []
+    forward_closes: List[float] = []
+    forward_highs: List[Optional[float]] = []
+    forward_lows: List[Optional[float]] = []
 
     for h in HORIZONS:
         key_r = f"return_{h}d_pct"
@@ -241,40 +476,55 @@ def settle_observation_outcome(
         if fd > last_available:
             out[key_r] = None
             continue
-        fp = closes_by_date.get(fd)
+        bar = bars.get(fd)
+        fp = bar["close"] if bar else None
         out[key_r] = calculate_forward_return(ref, fp)
         if out[key_r] is not None:
             maturity[f"{h}d"] = True
+            if h == 1:
+                debug_info["return_1d"] = out[key_r]
+            elif h == 3:
+                debug_info["return_3d"] = out[key_r]
+            elif h == 5:
+                debug_info["return_5d"] = out[key_r]
 
-    # Build path closes for MDD/runup up to available horizon
     for fd in forward_dates:
         if fd > last_available:
             break
-        c = closes_by_date.get(fd)
-        if c is not None:
-            forward_closes_accum.append(c)
+        bar = bars.get(fd)
+        if not bar or bar.get("close") is None:
+            continue
+        forward_closes.append(float(bar["close"]))
+        forward_highs.append(bar.get("high"))
+        forward_lows.append(bar.get("low"))
 
     for h in (5, 10):
-        path = forward_closes_accum[:h] if len(forward_closes_accum) >= h else []
-        if len(path) >= h:
-            out[f"max_drawdown_{h}d_pct"] = calculate_forward_max_drawdown(ref, path)
-            out[f"max_runup_{h}d_pct"] = calculate_forward_max_runup(ref, path)
+        if len(forward_closes) >= h:
+            path_c = forward_closes[:h]
+            path_h = forward_highs[:h]
+            path_l = forward_lows[:h]
+            # Returns always; MDD/runup need path — use closes if HL missing
+            has_hl = any(v is not None for v in path_h) or any(v is not None for v in path_l)
+            out[f"max_drawdown_{h}d_pct"] = calculate_forward_max_drawdown(
+                ref, path_c, forward_lows=path_l if has_hl else None
+            )
+            out[f"max_runup_{h}d_pct"] = calculate_forward_max_runup(
+                ref, path_c, forward_highs=path_h if has_hl else None
+            )
         else:
             out.setdefault(f"max_drawdown_{h}d_pct", None)
             out.setdefault(f"max_runup_{h}d_pct", None)
 
     out["maturity"] = maturity
-    if maturity["10d"]:
-        out["outcome_status"] = "PARTIALLY_MATURED" if not all(maturity.values()) else "PARTIALLY_MATURED"
-        # All primary horizons matured
-        if maturity["1d"] and maturity["3d"] and maturity["5d"] and maturity["10d"]:
-            out["outcome_status"] = "MATURED"
-        else:
-            out["outcome_status"] = "PARTIALLY_MATURED"
-    elif maturity["1d"] or maturity["3d"] or maturity["5d"]:
-        out["outcome_status"] = "PARTIALLY_MATURED"
-    else:
-        out["outcome_status"] = "PENDING"
+    out["outcome_status"] = _outcome_status_from_maturity(maturity)
+    debug_info["maturity"] = dict(maturity)
+    debug_info["outcome_status"] = out["outcome_status"]
+    if debug:
+        out["_settlement_debug"] = debug_info
+        logger.info(
+            "[SETTLEMENT_DEBUG] %s",
+            {k: debug_info[k] for k in debug_info if not k.startswith("_")},
+        )
     return out
 
 
@@ -283,7 +533,15 @@ def settle_candidate_outcomes(
     *,
     as_of_trade_date: Optional[str] = None,
     price_loader: Optional[Callable[..., Any]] = None,
+    use_cache: bool = True,
 ) -> List[Dict[str, Any]]:
+    if use_cache:
+        prefetch_ohlcv_for_observations(
+            observations,
+            price_loader=price_loader,
+            as_of_trade_date=as_of_trade_date,
+        )
+
     return [
         settle_observation_outcome(
             o, as_of_trade_date=as_of_trade_date, price_loader=price_loader
@@ -298,19 +556,51 @@ def backfill_candidate_outcomes(
     as_of_trade_date: Optional[str] = None,
     price_loader: Optional[Callable[..., Any]] = None,
     only_trusted: bool = True,
+    use_cache: bool = True,
 ) -> List[Dict[str, Any]]:
     """Settle outcomes for ledger rows; skip untrusted when only_trusted."""
-    out: List[Dict[str, Any]] = []
-    for row in ledger_rows:
+    to_settle: List[Dict[str, Any]] = []
+    skipped: List[Tuple[int, Dict[str, Any]]] = []
+    for i, row in enumerate(ledger_rows):
         if only_trusted and row.get("trusted_for_analysis") is False:
-            out.append(dict(row))
+            skipped.append((i, dict(row)))
             continue
-        out.append(
-            settle_observation_outcome(
-                row, as_of_trade_date=as_of_trade_date, price_loader=price_loader
-            )
-        )
+        to_settle.append(dict(row))
+
+    settled_list = settle_candidate_outcomes(
+        to_settle,
+        as_of_trade_date=as_of_trade_date,
+        price_loader=price_loader,
+        use_cache=use_cache,
+    )
+
+    # Reconstruct original order
+    out: List[Dict[str, Any]] = []
+    sit = iter(settled_list)
+    skip_map = {i: r for i, r in skipped}
+    settle_i = 0
+    for i in range(len(ledger_rows)):
+        if i in skip_map:
+            out.append(skip_map[i])
+        else:
+            out.append(next(sit))
+            settle_i += 1
     return out
+
+
+def debug_settle_one(
+    obs: Dict[str, Any],
+    *,
+    as_of_trade_date: Optional[str] = None,
+    price_loader: Optional[Callable[..., Any]] = None,
+) -> Dict[str, Any]:
+    """Settle a single observation with verbose debug payload."""
+    return settle_observation_outcome(
+        obs,
+        as_of_trade_date=as_of_trade_date,
+        price_loader=price_loader,
+        debug=True,
+    )
 
 
 def classify_sample_statuses(
@@ -360,10 +650,32 @@ def classify_sample_statuses(
 def spearman_corr(xs: Sequence[float], ys: Sequence[float]) -> Optional[float]:
     if len(xs) != len(ys) or len(xs) < 3:
         return None
-    try:
-        import pandas as pd
+    n = len(xs)
 
-        return float(pd.Series(xs).corr(pd.Series(ys), method="spearman"))
+    def _ranks(vals: Sequence[float]) -> List[float]:
+        order = sorted(range(n), key=lambda i: vals[i])
+        ranks = [0.0] * n
+        i = 0
+        while i < n:
+            j = i
+            while j + 1 < n and vals[order[j + 1]] == vals[order[i]]:
+                j += 1
+            avg = (i + j) / 2.0 + 1.0
+            for k in range(i, j + 1):
+                ranks[order[k]] = avg
+            i = j + 1
+        return ranks
+
+    try:
+        rx, ry = _ranks(xs), _ranks(ys)
+        mx = sum(rx) / n
+        my = sum(ry) / n
+        num = sum((a - mx) * (b - my) for a, b in zip(rx, ry))
+        denx = sum((a - mx) ** 2 for a in rx) ** 0.5
+        deny = sum((b - my) ** 2 for b in ry) ** 0.5
+        if denx == 0 or deny == 0:
+            return None
+        return float(num / (denx * deny))
     except Exception:
         return None
 

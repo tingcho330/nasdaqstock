@@ -1426,6 +1426,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     parser.add_argument("--config", default=None, help="Optional config path (runtime loader)")
     parser.add_argument("--update-ledger", action="store_true", default=True)
+    parser.add_argument(
+        "--skip-ledger",
+        action="store_true",
+        default=False,
+        help="Skip observation ledger upsert / outcome settlement",
+    )
+    parser.add_argument(
+        "--debug-settle",
+        action="store_true",
+        default=False,
+        help="Pick one old trusted PRODUCTION observation and print settlement debug",
+    )
     args = parser.parse_args(list(argv) if argv is not None else None)
 
     _ = load_runtime_config(Path(args.config) if args.config else None)
@@ -1446,32 +1458,44 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         merged_by_run=discovered.merged_by_run,
         decision_only=decision_only,
     )
-    json_path, md_path = write_quality_report(report, Path(args.output_dir), market=args.market)
-    logger.info(
-        "quality report: %s / %s (days=%s)",
-        json_path,
-        md_path,
-        report.get("trading_days"),
-    )
 
-    if args.update_ledger and discovered.run_dirs:
-        ledger = Path(args.output_dir) / "quality" / "screener_candidate_observations.jsonl"
+    for day in report.get("days") or []:
+        liq = day.get("liquidity_shadow")
+        if isinstance(liq, dict) and day.get("liquidity_shadow_trust") in (
+            TRUSTED,
+            TRUSTED_WITH_WARNING,
+        ):
+            fp = liq.get("fundamental_parity")
+            if not isinstance(fp, dict) or fp.get("suspicious_constant_feature_detected"):
+                day["fundamental_parity_status"] = "LEGACY_UNCORRECTED"
+            else:
+                day["fundamental_parity_status"] = day.get(
+                    "fundamental_parity_status", "CHECK_REQUIRED"
+                )
+
+    update_ledger = bool(args.update_ledger) and not bool(args.skip_ledger)
+    ledger = Path(args.output_dir) / "quality" / "screener_candidate_observations.jsonl"
+
+    if update_ledger and discovered.run_dirs:
         rows: List[Dict[str, Any]] = []
         for rd in discovered.run_dirs:
             rows.extend(
                 build_observation_rows_from_run(rd, output_dir=Path(args.output_dir))
             )
         n = upsert_observation_ledger(ledger, rows)
-        logger.info("observation ledger upserted entries=%d path=%s", n, ledger)
+        logger.info("observation ledger upserted stubs entries=%d path=%s", n, ledger)
         try:
             from screener_outcomes import (
                 backfill_candidate_outcomes,
                 classify_sample_statuses,
+                clear_ohlcv_cache,
+                debug_settle_one,
                 score_calibration_buckets,
                 spearman_corr,
                 summarize_outcome_group,
             )
 
+            clear_ohlcv_cache()
             existing: List[Dict[str, Any]] = []
             if ledger.exists():
                 with open(ledger, "r", encoding="utf-8") as f:
@@ -1484,12 +1508,58 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         except Exception:
                             continue
             as_of = report.get("end_trade_date")
+            logger.info(
+                "outcome settlement start rows=%d as_of=%s",
+                len(existing),
+                as_of,
+            )
             settled = backfill_candidate_outcomes(
                 existing, as_of_trade_date=as_of, only_trusted=False
             )
-            upsert_observation_ledger(ledger, settled)
+            n2 = upsert_observation_ledger(ledger, settled)
+            logger.info(
+                "outcome settlement done persisted=%d matured_1d=%d matured_5d=%d",
+                n2,
+                sum(1 for r in settled if (r.get("maturity") or {}).get("1d")),
+                sum(1 for r in settled if (r.get("maturity") or {}).get("5d")),
+            )
+
+            if args.debug_settle:
+                candidates = [
+                    r
+                    for r in settled
+                    if r.get("trusted_for_analysis") is not False
+                    and r.get("candidate_type") == "PRODUCTION"
+                    and r.get("trade_date")
+                    and r.get("ticker")
+                ]
+                candidates.sort(key=lambda r: str(r.get("trade_date")))
+                if candidates:
+                    pick = candidates[0]
+                    dbg = debug_settle_one(pick, as_of_trade_date=as_of)
+                    print(
+                        json.dumps(
+                            {
+                                "debug_settle": dbg.get("_settlement_debug")
+                                or {
+                                    "ticker": dbg.get("ticker"),
+                                    "trade_date": dbg.get("trade_date"),
+                                    "reference_price": dbg.get("reference_price"),
+                                    "return_1d_pct": dbg.get("return_1d_pct"),
+                                    "return_3d_pct": dbg.get("return_3d_pct"),
+                                    "return_5d_pct": dbg.get("return_5d_pct"),
+                                    "maturity": dbg.get("maturity"),
+                                    "outcome_status": dbg.get("outcome_status"),
+                                }
+                            },
+                            indent=2,
+                            ensure_ascii=False,
+                        )
+                    )
+
             trusted = [r for r in settled if r.get("trusted_for_analysis") is not False]
             m1 = sum(1 for r in trusted if (r.get("maturity") or {}).get("1d"))
+            m3 = sum(1 for r in trusted if (r.get("maturity") or {}).get("3d"))
             m5 = sum(1 for r in trusted if (r.get("maturity") or {}).get("5d"))
             m10 = sum(1 for r in trusted if (r.get("maturity") or {}).get("10d"))
             bits = classify_sample_statuses(
@@ -1505,9 +1575,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             report["outcome_counts"] = {
                 "trusted_rows": len(trusted),
                 "matured_1d": m1,
+                "matured_3d": m3,
                 "matured_5d": m5,
                 "matured_10d": m10,
                 "pending": sum(1 for r in trusted if r.get("outcome_status") == "PENDING"),
+                "partially_matured": sum(
+                    1 for r in trusted if r.get("outcome_status") == "PARTIALLY_MATURED"
+                ),
+                "fully_matured": sum(
+                    1 for r in trusted if r.get("outcome_status") == "FULLY_MATURED"
+                ),
             }
             by_type: Dict[str, List[Dict[str, Any]]] = {}
             for r in trusted:
@@ -1527,9 +1604,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 cand_perf[ctype]["spearman_score_5d"] = spearman_corr(xs, ys)
             report["candidate_performance"] = cand_perf
             report["score_calibration"] = score_calibration_buckets(trusted, horizon=5)
-            write_quality_report(report, Path(args.output_dir), market=args.market)
         except Exception as e:
-            logger.warning("outcome backfill failed: %s", e)
+            logger.exception("outcome backfill failed: %s", e)
+
+    json_path, md_path = write_quality_report(report, Path(args.output_dir), market=args.market)
+    logger.info(
+        "quality report: %s / %s (days=%s outcome=%s)",
+        json_path,
+        md_path,
+        report.get("trading_days"),
+        report.get("outcome_sample_status"),
+    )
 
     payload = {
         "json": str(json_path),
@@ -1539,10 +1624,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "end_trade_date": report.get("end_trade_date"),
         "discovery": report.get("discovery"),
         "sample_status": report.get("sample_status"),
+        "structural_sample_status": report.get("structural_sample_status"),
+        "outcome_sample_status": report.get("outcome_sample_status"),
+        "policy_change_status": report.get("policy_change_status"),
+        "outcome_counts": report.get("outcome_counts"),
     }
     print(json.dumps(payload, indent=2))
 
-    # NO_DATA is a warning report, not a Production pipeline failure.
     if int(report.get("trading_days") or 0) == 0:
         return 2
     return 0
